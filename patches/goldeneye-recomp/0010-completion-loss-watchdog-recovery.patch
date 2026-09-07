@@ -1,0 +1,853 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -9,10 +9,14 @@
+ // fragment's register/memory effect, tail-invokes the continuation function,
+ // and the recompiled source function then returns.
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <cstdint>
+ #include <cstring>
++#include <fstream>
+ 
++#include <rex/filesystem.h>  // freeze flight recorder writes Documents/
++
+ #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
+ #include <rex/cvar.h>  // REXCVAR_* (mouse-look settings)
+ #include <rex/ui/keybinds.h>     // ParseVirtualKey (keyboard rebinding)
+@@ -34,6 +38,44 @@
+     .range(0, 1000)
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_STRING(ge_test_peek, "", "GPU",
++                      "TEST: guest address (hex) to read via the fault-proof watchdog "
++                      "accessors; logs u32 and u8 then clears itself. Remote-debug "
++                      "instrument for frozen specimens (M-087).");
++REXCVAR_DEFINE_STRING(ge_test_poke, "", "GPU",
++                      "TEST: 'ADDR=VV' (hex) one-shot guest byte write via the fault-proof "
++                      "watchdog accessors; clears itself after applying (M-087).");
++
++REXCVAR_DEFINE_INT32(ge_test_vdswap_skip_ms, 0, "GPU",
++                     "TEST (M-072): hold the guest's own VdSwap-skip throttle flag (dev+21516) "
++                     "set for this many ms, then clear it. Real frames flow through the real "
++                     "skip path -- the faithful reproduction of the wedge's entry, unlike "
++                     "ge_test_decredit which fabricates ledger state. One-shot per distinct "
++                     "nonzero value (0 re-arms).")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(ge_test_decredit, 0, "GPU",
++                     "TEST (M-072): subtract this many frames from the guest's credited-complete "
++                     "counter, once per distinct nonzero value (0 re-arms). Manufactures the "
++                     "submit-vs-credited gap of the completion-loss wedge deterministically, so "
++                     "the watchdog recovery can be proven against a real locked state.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(ge_tick_heal, true, "GPU",
++                    "Per-tick wedge heal (M-079): when the guest's submit-vs-credited gap has "
++                    "wedged the frame limiter (ring and fences drained, nothing in flight), "
++                    "credit ONE frame per present-path tick -- the gap closes at frame rate "
++                    "through the guest's own cadence, and real rendering resumes with every "
++                    "downstream ledger consistent. Replaces the bulk recoveries, which each "
++                    "corrupted the next ledger down (M-077, M-079).");
++
++REXCVAR_DEFINE_BOOL(ge_wd_recredit, false, "GPU",
++                    "Watchdog auto-recovery for the completion-loss wedge (M-072): when the ring "
++                    "and fences are drained but the guest's credited-complete counter is pinned "
++                    "below its submit counter, re-issue the credit the skipped render path never "
++                    "wrote. Off = detect and log only (for A/B against the raw freeze).")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_INT32(ge_frame_wait_backoff_us, 100, "GPU",
+                      "Microseconds to sleep between polls once the guest's GPU-completion wait "
+                      "has spun without success. 0 restores the original uncapped spin, which "
+@@ -180,6 +222,8 @@
+ // rexglue CP swap counter sampled at the last guest present (sub_821996F8).
+ // "GPU finished the just-submitted frame" == counter advanced past this.
+ std::atomic<uint32_t> g_present_cpcnt{0};
++// M-072: completion-loss recoveries fired by the watchdog (diagnostics only).
++std::atomic<uint32_t> g_wd_recredits{0};
+ // Guest tick at the last present, for a bounded completion wait.
+ std::atomic<uint32_t> g_present_tb{0};
+ inline rex::graphics::CommandProcessor* ge_cp() {
+@@ -312,8 +356,25 @@
+     return false;
+   }
+   std::memcpy(b + ga, &v, 4);
++  return true;
++}
++bool WDST8(uint8_t* b, uint32_t ga, uint8_t val) {
++  if (vm_write(mach_task_self(), reinterpret_cast<vm_address_t>(b + ga),
++               reinterpret_cast<vm_offset_t>(&val), 1) == KERN_SUCCESS) {
++    return true;
++  }
++  uint8_t probe;  // same probe-then-raw-store fallback as WDST32, same reason
++  if (!ge_wd_read(b, ga, &probe, 1)) {
++    return false;
++  }
++  b[ga] = val;
+   return true;
+ }
++
++// Armed by the frame-loop heal once the guest has demonstrably been alive;
++// read by the watchdog-side stage-2 heal below (atomic: two threads).
++static std::atomic<bool> s_heal_armed{false};
++
+ #else
+ bool ge_wd_read(uint8_t* b, uint32_t ga, void* dst, size_t len) {
+   std::memcpy(dst, b + ga, len);
+@@ -325,6 +386,10 @@
+   ST32(b, ga, val);
+   return true;
+ }
++bool WDST8(uint8_t* b, uint32_t ga, uint8_t val) {
++  b[ga] = val;
++  return true;
++}
+ #endif
+ 
+ // Copy up to `want` bytes of guest memory, stopping at the first unreadable
+@@ -343,6 +408,12 @@
+   return got;
+ }
+ 
++// Exported by the runtime's command processor: the physical address the CP's
++// WAIT_REG_MEM is polling right now (0 = none). See M-072.
++extern "C" uint32_t RexGetWaitRegMemActiveAddr();
++extern "C" void RexGetSwapCadence(uint64_t*, uint32_t*, uint32_t*, uint32_t*);
++extern "C" uint64_t RexGetGuestFrameCount();
++
+ void ge_watchdog_thread() {
+   // The watchdog may be armed at app startup (ge::StartGpuWatchdog), which runs
+   // during window/presenter setup -- BEFORE ConstructRuntime, so kernel_state()
+@@ -363,10 +434,23 @@
+   }
+   uint8_t* base = kernel_state_ptr->memory()->virtual_membase();
+   uint32_t last_wpi = 0xFFFFFFFFu, last_rpi = 0, last_present = 0, last_submit = 0;
++  // M-072: how many consecutive samples the guest's credited-complete counter
++  // has sat still. The true wedge pins it for minutes; a catch-up burst after
++  // a stall moves it every frame -- this is what tells them apart (the lab's
++  // false-positive re-credit fired into a healthy catch-up and broke it).
++  uint32_t last_credited = 0xFFFFFFFFu;
++  uint32_t credited_pinned = 0;
++  // M-076: the square-books stall needs its own pin tracker on the guest's
++  // frame counter -- in that shape submit/credited are equal and pinned, and
++  // the discriminator against a menu or a healthy pause is the frame loop
++  // itself having stopped cycling.
++  uint32_t last_fc = 0xFFFFFFFFu;
++  uint32_t fc_pinned = 0;
+   uint32_t present_at_stall_start = 0, dbg_at_stall_start = 0, submit_at_stall_start = 0;
+   uint32_t stall = 0;
+   bool logged = false;
+   bool recover_fired = false;
++  bool recredit_fired = false;
+   // M-069: the heavy one-shot diagnostics below (guest stack scans, the
+   // lr-samplers) cost most of a core while they run. Whatever the episode
+   // logic does, never run them more than once per two minutes.
+@@ -382,6 +466,20 @@
+     uint32_t dev = g_ge_device.load(std::memory_order_relaxed);
+     uint32_t idblk = g_ge_idblk.load(std::memory_order_relaxed);
+     uint32_t submit = dev ? WD32(base, dev + 16544) : 0;
++    uint32_t credited = dev ? WD32(base, dev + 16552) : 0;
++    if (credited == last_credited) {
++      ++credited_pinned;
++    } else {
++      credited_pinned = 0;
++    }
++    last_credited = credited;
++    uint32_t fc = WD32(base, 0x8308851Cu);
++    if (fc == last_fc) {
++      ++fc_pinned;
++    } else {
++      fc_pinned = 0;
++    }
++    last_fc = fc;
+ 
+     // DIAGNOSTIC (GoldenEye-Recomp-ios overlay): first-frame bring-up. The
+     // watchdog only speaks when its own trigger fires; print the raw state every
+@@ -406,6 +504,144 @@
+             rpi, wpi, present, dbg, dev, idblk, submit, presented, target, sem, render_gate);
+       }
+     }
++    // M-087 remote peek/poke: interactive guest-memory access over the
++    // bridge for live frozen specimens.
++    {
++      std::string peek = REXCVAR_GET(ge_test_peek);
++      if (!peek.empty()) {
++        uint32_t ga = uint32_t(strtoul(peek.c_str(), nullptr, 16));
++        if (ga) {
++          REXKRNL_INFO("GEPEEK {:#x}: u32={:#x} u8={:#x}", ga, WD32(base, ga), WD8(base, ga));
++        }
++        rex::cvar::SetFlagByName("ge_test_peek", "");
++      }
++      std::string poke = REXCVAR_GET(ge_test_poke);
++      if (!poke.empty()) {
++        size_t eq = poke.find('=');
++        if (eq != std::string::npos) {
++          uint32_t ga = uint32_t(strtoul(poke.substr(0, eq).c_str(), nullptr, 16));
++          uint32_t val = uint32_t(strtoul(poke.substr(eq + 1).c_str(), nullptr, 16));
++          if (ga) {
++            uint8_t before = WD8(base, ga);
++            WDST8(base, ga, uint8_t(val));
++            REXKRNL_INFO("GEPOKE {:#x}: {:#x} -> {:#x}", ga, before, val & 0xFFu);
++          }
++        }
++        rex::cvar::SetFlagByName("ge_test_poke", "");
++      }
++    }
++
++    // The coherent cure (M-094). Piecemeal cursor repair buys exactly one
++    // frame per word -- the freeze is the guest's ENTIRE interlocking cursor
++    // set going stale in cascade (credited, progress, consumed cursor,
++    // reclaim, wrap cap, ring rptr) after the onset's lost credit. The .4x
++    // bulk recovery cured on device because it rewrote the whole set in one
++    // pass; its recipe was right and its trigger discipline caused .43/.44.
++    // This is that recipe under the new discipline: armed guest (was alive),
++    // frame loop pinned across samples, ring drained, ONE shot per episode.
++    // With nothing in flight, "everything consumed / everything reclaimable"
++    // is the true state of the machine, and the next real frame's own writes
++    // take over from there (the one-frame-advance experiments proved the
++    // pipeline runs when fed).
++    {
++      static uint32_t s_wd_cure_fired = 0;
++      static uint32_t s_wd_last_submit = 0;
++      static uint64_t s_wd_last_gf = 0;
++      static int s_wd_pinned = 0;
++      uint32_t wd_submit = dev ? WD32(base, dev + 16544) : 0;
++      uint64_t wd_gf = RexGetGuestFrameCount();
++      if (dev && s_heal_armed.load(std::memory_order_relaxed)) {
++        // Pinned = the honest counter is dead. Submit may still crawl (the
++        // pre-park variant) or be pinned too (the deep park); either way the
++        // guest produced no real frame across the window.
++        if (wd_gf == s_wd_last_gf) ++s_wd_pinned; else s_wd_pinned = 0;
++        if (s_wd_pinned >= 3 && s_wd_cure_fired == 0 && rpi == wpi && idblk) {
++          uint32_t tg = WD32(base, dev + 10908);
++          uint32_t pp = WD32(base, dev + 10896);
++          uint32_t buf_limit = WD32(base, dev + 14892);
++          uint8_t sk = WD8(base, dev + 10941);
++          // 1. books square: credited := submit
++          WDST32(base, dev + 16552, wd_submit);
++          // 2. progress semaphore := target
++          if (pp && pp < 0xFFFFFFFEu) WDST32(base, pp, tg);
++          // 3. consumed cursor (the [idblk+4] discovery) := buffer limit
++          if (pp && pp < 0xFFFFFFFEu && buf_limit) WDST32(base, pp + 4, buf_limit);
++          // 4. wrap cap := buffer limit
++          if (buf_limit) WDST32(base, dev + 14912, buf_limit);
++          // 5. reclaim completed := issued
++          WDST32(base, dev + 14904, WD32(base, dev + 13220));
++          // 6. ring rptr write-back (the old recovery's step)
++          WDST32(base, idblk + 60, rpi);
++          // 7. wedge marker off
++          if (sk & 0x02u) WDST8(base, dev + 10941, uint8_t(sk & ~0x02u));
++          s_wd_cure_fired = 1;
++          REXKRNL_INFO(
++              "GEHEAL[wd] COHERENT CURE fired: submit={} target={} limit={:#x} marker={:#x} "
++              "(gf pinned {} samples, ring {:#x})",
++              wd_submit, tg, buf_limit, sk, s_wd_pinned, rpi);
++        }
++      } else {
++        s_wd_pinned = 0;
++      }
++      if (wd_gf != s_wd_last_gf && s_wd_cure_fired) {
++        s_wd_cure_fired = 0;  // guest lives again -> next episode gets its shot
++        REXKRNL_INFO("GEHEAL[wd] guest resumed after cure");
++      }
++      s_wd_last_submit = wd_submit;
++      s_wd_last_gf = wd_gf;
++    }
++
++    // M-072 test instrument: hold the guest's own VdSwap-skip throttle for a
++    // window (see the cvar). Rising edge arms a deadline; the flag is
++    // re-asserted every sample until it passes, then cleared once.
++    {
++      static int32_t s_skip_done = 0;
++      static std::chrono::steady_clock::time_point s_skip_until{};
++      static bool s_skip_holding = false;
++      int32_t skip_want = REXCVAR_GET(ge_test_vdswap_skip_ms);
++      if (skip_want > 0 && skip_want != s_skip_done && dev) {
++        s_skip_done = skip_want;
++        s_skip_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(skip_want);
++        s_skip_holding = true;
++        REXKRNL_INFO("GETESTVDSKIP: holding dev+21516 for {} ms", skip_want);
++      } else if (skip_want == 0) {
++        s_skip_done = 0;
++      }
++      if (s_skip_holding && dev) {
++        if (std::chrono::steady_clock::now() < s_skip_until) {
++          WDST32(base, dev + 21516u, 1u);
++        } else {
++          s_skip_holding = false;
++          WDST32(base, dev + 21516u, 0u);
++          REXKRNL_INFO("GETESTVDSKIP: released dev+21516");
++        }
++      }
++    }
++
++    // M-072 test instrument: manufacture the wedge's submit-vs-credited gap on
++    // demand (see the cvar). Lives here because this thread already holds the
++    // fault-proof guest accessors.
++    {
++      static int32_t s_decredit_done = 0;
++      int32_t decredit_want = REXCVAR_GET(ge_test_decredit);
++      if (decredit_want > 0 && decredit_want != s_decredit_done && dev) {
++        s_decredit_done = decredit_want;
++        uint32_t cur = WD32(base, dev + 16552u);
++        WDST32(base, dev + 16552u, cur - uint32_t(decredit_want));
++        // Plant the second half of the locked state too: +10941 bit 2, the
++        // skip-render bit the wild dumps show stuck set. With the gap in
++        // place the game re-asserts it every frame, so the wait path (and the
++        // heal write inside it) is never reached again -- the actual lock.
++        uint8_t skipbits = WD8(base, dev + 10941u);
++        WDST8(base, dev + 10941u, uint8_t(skipbits | 0x02u));
++        REXKRNL_INFO("GETESTDECREDIT: presented {} -> {} (injected gap {}), +10941 {:#x} -> {:#x}",
++                     cur, cur - uint32_t(decredit_want), decredit_want, skipbits,
++                     skipbits | 0x02u);
++      } else if (decredit_want == 0) {
++        s_decredit_done = 0;  // re-armed
++      }
++    }
++
+     bool present_alive = (present != last_present);
+     bool ring_moved = (wpi != last_wpi) || (rpi != last_rpi);
+     // M-069: only real ring progress ends an episode. The old logic reset on
+@@ -418,6 +654,7 @@
+       stall = 0;
+       logged = false;
+       recover_fired = false;
++      recredit_fired = false;
+     } else {
+       // Ring frozen: an episode, whether or not the guest present counter
+       // still advances. (The boot-4 stall shape had BOTH frozen -- gating on
+@@ -428,6 +665,7 @@
+         dbg_at_stall_start = dbg;
+         submit_at_stall_start = submit;
+         recover_fired = false;
++        recredit_fired = false;
+       }
+       ++stall;
+       // AUTO-RECOVERY for the CPU<->GPU semaphore deadlock. The CP parks in a
+@@ -435,13 +673,213 @@
+       // release the CP). The render is parked waiting on GPU completion ->
+       // deadlock. Write 0 to release the CP: it drains the buffer, delivers the
+       // completion, the render resumes. Memory-only, no interrupt (safe).
+-      if (stall >= 2 && dev && idblk && idblk < 0xFFFFFFFEu) {
++      // BOUNDED (M-072): this used to fire every 250 ms sample for the whole
++      // episode. When the episode is the completion-loss wedge (minutes long,
++      // CP idle, semaphore not the problem) that smashed the guest's arm/release
++      // protocol ~4x/s -- proven in the wedge lab: after the re-credit woke the
++      // guest, its first frame's semaphore handshake was zeroed mid-arm and the
++      // resume died (sem=0x0 in GESTATUS, all counters pinned). The deadlock
++      // this write exists for breaks within a sample or two, so a short burst
++      // keeps the cure and drops the poison.
++      // (And never after the re-credit below has fired: the wedge is then the
++      // diagnosis, the guest is resuming, and its fresh arm must not be hit.
++      // SURGICAL (M-072 lab, round 3): fire ONLY while the CP is provably
++      // parked in a WAIT_REG_MEM on this very address. A blind poke at "ring
++      // quiet 500 ms" lands mid-frame during compile-storm catch-up, zeroes a
++      // freshly armed handshake, and kills the frame it was meant to save --
++      // that was the post-recovery re-freeze both lab rounds hit.)
++      if (stall >= 2 && stall <= 8 && !recredit_fired && dev && idblk &&
++          idblk < 0xFFFFFFFEu &&
++          RexGetWaitRegMemActiveAddr() == ((idblk & 0x1FFFFFFFu) & ~uint32_t(0x3))) {
+         WDST32(base, idblk, 0u);  // release the CP's WAIT_REG_MEM semaphore
+         if (!recover_fired) {
+           recover_fired = true;
+           REXKRNL_INFO("GEWATCHDOG RECOVERY: released CP semaphore (idblk={:#x} := 0)", idblk);
+         }
+       }
++      // AUTO-RECOVERY for the completion-loss wedge (M-072, the residual
++      // freeze). Shape: a long real stall makes the frame limiter skip render;
++      // skipped frames increment the submit counter (dev+16544) but never reach
++      // the GPU-wait poll, so the completion credit (dev+16552) -- which in
++      // this port is written by the poll hook (ge_dbg_now) -- stops advancing;
++      // once submit-presented exceeds the limiter's threshold it skips render
++      // forever and the credit writer is permanently unreachable. The GPU is
++      // innocent: ring drained, every fence retired, CP worker idle.
++      //
++      // The recovery is the poll path's own proven write (presented := submit,
++      // ring RPTR write-back), issued from here because the poll will never run
++      // again on its own. Gated three ways so it can only fire when it is TRUE:
++      // ring drained (rpi==wpi: no packets in flight), guest fences drained
++      // (read==write: nothing awaiting retirement), and the producer alive
++      // (submit advanced this episode -- distinguishes the wedge from a fully
++      // stuck guest, where crediting would be a lie and mask the real fault).
++      // In that state no GPU work exists that the credit could misrepresent.
++      // PATIENCE (M-077, the .43/.44 first-boot menu freezes): both fired at
++      // 750 ms and the resume then parked in the cmd-buffer allocator with a
++      // different downstream ledger broken each time -- while the bench heals
++      // the identical first-boot storm naturally 12/12 with zero recovery
++      // fires, because the poll-path heal repairs any gap the moment ONE
++      // frame completes. Bulk-crediting ~50 fabricated frames advances
++      // bookkeeping that the allocator's position ledgers never matched; the
++      // natural heal credits +1 with a real frame behind it. So: recoveries
++      // are a LAST resort at 10 s (stall >= 40), not a first responder --
++      // every transient stall gets the chance to heal honestly first.
++      // Gates, each one lab-proven necessary: ring drained AND fences drained
++      // (no in-flight GPU work the credit could misrepresent), submit alive
++      // (producer ticking -- the wedge, not a dead guest), credited PINNED for
++      // >=3 samples (a catch-up burst moves it every frame; crediting a
++      // catch-up hands the guest frames that are still in flight and wedges it
++      // one stage later -- the lab's false positive), and a gap floor (the
++      // wedge's gap is 60+ within a second; trivial skew never qualifies).
++      if (stall >= 40 && credited_pinned >= 3 && dev && idblk && idblk < 0xFFFFFFFEu &&
++          rpi == wpi && wpi != 0 && REXCVAR_GET(ge_wd_recredit)) {
++        uint32_t fr = WD32(base, dev + 16684u);          // fence read index
++        uint32_t fw = WD32(base, dev + 16688u);          // fence write index
++        if (fr == fw && submit > credited && submit - credited >= 30 &&
++            submit != submit_at_stall_start) {
++          WDST32(base, dev + 16552u, submit);            // presented := submit
++          WDST32(base, idblk + 60u, rpi);                // ring RPTR write-back
++          // Advance the REAL GPU progress counter too. dev+10896 holds a
++          // pointer to the counter every guest GPU wait compares
++          // (sub_8219D060: spin until *(*(dev+10896)) >= N). Crediting only
++          // the bookkeeping leaves that counter ~gap frames behind, and the
++          // first present after resume parks forever inside sub_8219D060
++          // waiting for progress no GPU work will ever produce (M-072 lab,
++          // round 3: stack frame-loop -> present -> sub_8219D060 -> spin).
++          // With the ring and fences drained there IS no outstanding work, so
++          // declaring the skipped frames complete in both ledgers is the
++          // truth, not a lie. Units: the counter, the wait's N, and
++          // dev+10908 ("target", the wait's wrap anchor) all share units
++          // (~4 per frame; GESTATUS shows the counter tracking target-2..10
++          // in health AND in the lock). Every N handed to sub_8219D060
++          // satisfies N <= target by construction (its r9 = target-N is the
++          // unsigned "remaining"), so counter := target releases any parked
++          // or future wait without overshooting the guest's own arithmetic.
++          uint32_t prog_ptr = WD32(base, dev + 10896u);
++          uint32_t prog_before = 0, prog_target = 0;
++          if (prog_ptr && prog_ptr < 0xFFFFFFFEu) {
++            prog_before = WD32(base, prog_ptr);
++            prog_target = WD32(base, dev + 10908u);
++            WDST32(base, prog_ptr, prog_target);
++          }
++          // Clear the skip-render bit the game asserts while it believes the
++          // GPU is behind (+10941 bit 2). With the gap zeroed the game would
++          // clear it itself next frame in the shapes we've seen, but the lock
++          // is precisely this bit surviving -- clearing it here mimics the
++          // game's own clear and costs nothing when it was already clear.
++          uint8_t skipbits = WD8(base, dev + 10941u);
++          if (skipbits & 0x02u) {
++            WDST8(base, dev + 10941u, uint8_t(skipbits & ~0x02u));
++          }
++          g_wd_recredits.fetch_add(1, std::memory_order_relaxed);
++          // Log the first fire of an episode always; re-fires (shape persists
++          // because one credit round wasn't enough) at most every ~5 s.
++          static uint32_t last_logged_stall = 0;
++          if (!recredit_fired || stall >= last_logged_stall + 20) {
++            last_logged_stall = stall;
++            REXKRNL_INFO(
++                "GEWATCHDOG RECOVERY: re-credited lost completions (presented {} -> {}) "
++                "[ring drained, fences {}=={}, submit alive] progress@{:#x} {} -> {} "
++                "recredits={}",
++                credited, submit, fr, fw, prog_ptr, prog_before, prog_target,
++                g_wd_recredits.load(std::memory_order_relaxed));
++          }
++          recredit_fired = true;
++          // Re-arm the heavy dump: if the resume fails, the NEW stuck shape
++          // deserves its own diagnostics -- `logged` otherwise stays set for
++          // the whole episode and the failure mode goes undumped (lab round 3
++          // had to fall back to an external sampler for exactly this reason).
++          logged = false;
++          next_heavy_dump = std::chrono::steady_clock::now() + std::chrono::seconds(15);
++        }
++      }
++      // AUTO-RECOVERY for the SQUARE-BOOKS stall (M-075/M-076: the grenade
++      // compile-storm freeze, the resign/resume freeze, the macOS boot stall
++      // -- one terminal state, three triggers). Shape: every ledger is
++      // consistent (submit == credited, ring and fences drained) but the
++      // frame loop is parked in the cmd-buffer allocator chain (FRAMEWORK
++      // stack: 8219C8xx/CA60 -> 82198C28) waiting for the GPU progress
++      // counter, which sits short of target and can never advance again:
++      // progress needs completed frames, frames need allocation, allocation
++      // needs progress. A long real stall (grenade pipeline burst, dropped
++      // present at resign, load contention) starts the starvation; nothing
++      // ends it. The M-072 gap-based recovery correctly refuses to fire here
++      // (no gap -- its gates were built to demand one), so this shape gets
++      // its own: books square, frame loop provably parked (fc pinned >= 3
++      // samples), counter behind target sanely. Medicine: counter := target
++      // -- never past it (the guest's compares are unsigned) -- which
++      // satisfies the allocator wait; the resumed REAL frames then advance
++      // progress themselves. Proven to unpark this exact state in the M-072
++      // lab (round 5) and safe when true: with ring+fences drained there is
++      // no GPU work the write could misrepresent.
++      if (stall >= 40 && fc_pinned >= 30 && dev && idblk && idblk < 0xFFFFFFFEu &&
++          rpi == wpi && wpi != 0 && REXCVAR_GET(ge_wd_recredit)) {
++        uint32_t fr2 = WD32(base, dev + 16684u);
++        uint32_t fw2 = WD32(base, dev + 16688u);
++        if (fr2 == fw2 && submit == credited) {
++          uint32_t prog_ptr3 = WD32(base, dev + 10896u);
++          if (prog_ptr3 && prog_ptr3 < 0xFFFFFFFEu) {
++            uint32_t cur3 = WD32(base, prog_ptr3);
++            uint32_t tgt3 = WD32(base, dev + 10908u);
++            if (cur3 != tgt3 && tgt3 - cur3 < 0x10000u) {
++              WDST32(base, prog_ptr3, tgt3);
++              g_wd_recredits.fetch_add(1, std::memory_order_relaxed);
++              static uint32_t sb_last_logged_stall = 0;
++              if (stall < sb_last_logged_stall || stall >= sb_last_logged_stall + 20) {
++                sb_last_logged_stall = stall;
++                REXKRNL_INFO(
++                    "GEWATCHDOG RECOVERY: square-books stall -- progress@{:#x} {} -> {} "
++                    "(target), books {}=={}, frame loop pinned {} samples",
++                    prog_ptr3, cur3, tgt3, submit, credited, fc_pinned);
++              }
++            }
++          }
++          // The reclaim-sequence ledger (M-076, the .43 first-boot menu
++          // freeze's dump): the cmd-buffer allocator refuses to advance past
++          // the armed reclaim boundary (dev+13216) while the completed
++          // sequence (dev+14904) lags the boundary's issue number
++          // (dev+13220) -- 32 vs 33 in the capture, with ring AND fences
++          // drained, i.e. batch 33 provably finished and only its credit got
++          // lost (the same stall the gap recovery healed drops it: that
++          // recovery repairs the counter ledger, not this one). Crediting the
++          // completed sequence up to the issued number is true-making in this
++          // drained state, exactly like the counter top-up above.
++          uint32_t rq_ptr = WD32(base, dev + 13216u);
++          if (rq_ptr) {
++            uint32_t rq_issued = WD32(base, dev + 13220u);
++            uint32_t rq_done = WD32(base, dev + 14904u);
++            if (rq_issued != rq_done && rq_issued - rq_done < 0x100u) {
++              WDST32(base, dev + 14904u, rq_issued);
++              g_wd_recredits.fetch_add(1, std::memory_order_relaxed);
++              REXKRNL_INFO(
++                  "GEWATCHDOG RECOVERY: reclaim-sequence credit {} -> {} "
++                  "(boundary@{:#x}), drained square-books state",
++                  rq_done, rq_issued, rq_ptr);
++            }
++          }
++        }
++      }
++      // RESUME ASSIST (M-072 lab, round 4). One credit buys exactly the frames
++      // it covers: the guest ticks until its pacing wait needs the progress
++      // counter to reach the NEW target (+4/frame moved the goalpost), and no
++      // GPU work exists yet to advance it, so it parks again 8 short. Keep the
++      // counter topped up to target -- never past it, target-current is
++      // computed unsigned and a counter beyond target reads as a huge deficit
++      // -- every sample until the ring moves, i.e. until a frame really
++      // renders and the true mechanism takes over (which also ends the
++      // episode and this assist with it).
++      if (recredit_fired && dev && idblk && idblk < 0xFFFFFFFEu && rpi == wpi &&
++          REXCVAR_GET(ge_wd_recredit)) {
++        uint32_t prog_ptr2 = WD32(base, dev + 10896u);
++        if (prog_ptr2 && prog_ptr2 < 0xFFFFFFFEu) {
++          uint32_t cur = WD32(base, prog_ptr2);
++          uint32_t tgt = WD32(base, dev + 10908u);
++          if (cur != tgt && tgt - cur < 0x10000u) {  // behind, and sanely so
++            WDST32(base, prog_ptr2, tgt);
++            WDST32(base, dev + 16552u, WD32(base, dev + 16544u));  // keep books square
++          }
++        }
++      }
+       if (stall >= 6 && !logged &&
+           std::chrono::steady_clock::now() >= next_heavy_dump) {  // ~1.5s of present-but-no-ring
+         logged = true;
+@@ -492,6 +930,23 @@
+           uint32_t fw = WD32(base, dev + 16688u);    // ctx[4172] fence write idx
+           REXKRNL_INFO("GEWATCHDOG -> vblank ctx[4133]={} | GPU fences read={} write={} [{}]", vbl,
+                        fr, fw, (fr != fw ? "PENDING -- fences NOT retiring" : "drained"));
++          // M-076: the cmd-buffer allocator's state (sub_8219C808 reads all of
++          // these). The square-books stalls park in this allocator's retry
++          // loop; which bound is starved is the open question, so dump them
++          // all: 14892/14912 = limits, 14900/14908 = write positions, 14904 =
++          // a sequence no., 13216/13220 = the reclaim boundary (13216 != 0
++          // arms the boundary check), 10896 -> progress counter, 10908 =
++          // target.
++          REXKRNL_INFO(
++              "GEWATCHDOG -> alloc 14892={:#x} 14900={:#x} 14904={} 14908={:#x} 14912={:#x} | "
++              "reclaim 13216={:#x} 13220={:#x} | progress {}/{} (target)",
++              WD32(base, dev + 14892u), WD32(base, dev + 14900u), WD32(base, dev + 14904u),
++              WD32(base, dev + 14908u), WD32(base, dev + 14912u), WD32(base, dev + 13216u),
++              WD32(base, dev + 13220u),
++              (WD32(base, dev + 10896u) && WD32(base, dev + 10896u) < 0xFFFFFFFEu
++                   ? WD32(base, WD32(base, dev + 10896u))
++                   : 0u),
++              WD32(base, dev + 10908u));
+         }
+         // Frame counter dword_8308851C is updated each frame AFTER the frame-
+         // limiter (0x82189e64). Sample it twice: if FROZEN, the main thread never
+@@ -839,13 +1294,260 @@
+ // (ge_dbg_now) then treats the frame as GPU-complete only once the CP's
+ // counter has moved past this -- i.e. the just-submitted frame was really
+ // drawn -- so the game blocks for the real render (visible) but no longer.
++// Guest base for UI-thread queries. Stashed by the present hook (which runs
++// every guest frame with the base in hand); read by GeInGameplay below on the
++// UIKit main thread through the fault-proof accessors.
++static std::atomic<uint8_t*> g_ui_guest_base{nullptr};
++
++// REFUTED as an in-mission signal (2026-08-08, .53 device report + bench
++// peeks): 0x8272B424 is 3 in the FRONT-END too (it means "not split-screen"),
++// so this returned 1 everywhere and hid the settings gear for good. Nothing
++// cheap discriminates the dossier menus from live play -- the player structs
++// are statically allocated (players[0] = 0x447f07a0 even pre-mission), and
++// pause @0x82F1E70C / watch player+0x2E8 / control-disabled player+0x80 /
++// viewport player+0x904 all read 0 in both states. What IS verified: pause
++// @0x82F1E70C == 1 exactly while the Q-watch pause screen is up (capture-
++// proven). Kept as an export for when static analysis finds the real menu
++// state; nothing calls it for UI decisions today.
++extern "C" int GeInGameplay(void) {
++  uint8_t* base = g_ui_guest_base.load(std::memory_order_relaxed);
++  if (!base) return 0;
++  const uint32_t screen = WD32(base, 0x8272B424u);
++  const uint32_t paused = WD32(base, 0x82F1E70Cu);
++  return (screen == 3u && paused == 0u) ? 1 : 0;
++}
++
+ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
+   PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx; (void)base;
++  g_ui_guest_base.store(base, std::memory_order_relaxed);
+   (void)r30;
+   uint32_t a1 = r31.u32;
+   auto* cpp = ge_cp();
+   uint32_t cpc = cpp ? cpp->counter() : 0;
+   g_present_cpcnt.store(cpc, std::memory_order_relaxed);
++
++  // M-079 per-tick wedge heal. A long stall (first-boot compile storm,
++  // thermal) makes the frame limiter skip renders; skipped frames raise the
++  // submit counter without the credit counter, and past the limiter's
++  // threshold it skips forever (M-072). This hook still runs every tick in
++  // that state ("producer ALIVE" in every wedge dump), so when the gap is
++  // wedge-sized AND the GPU is provably drained (ring caught up, guest
++  // fences retired -- there is genuinely nothing whose completion the credit
++  // could misstate), close the gap by ONE frame per tick. The limiter
++  // re-engages within a couple of seconds and REAL frames resume, retiring
++  // through the guest's own machinery -- unlike the bulk recoveries this
++  // replaces, which skipped that machinery and corrupted a deeper ledger on
++  // every rescue (allocator reclaim boundary left armed behind the write
++  // position, M-079's capture).
++  // Gate on DEAD PRESENTS (M-080): the CP swap counter pinned for >= 30
++  // consecutive ticks. Without this the heal fired continuously in a healthy
++  // menu mode whose natural gap floats ~9 (8,800 fires in one bench session,
++  // fighting the game's own bookkeeping). A true wedge has cpc pinned; any
++  // state that still swaps heals itself.
++  // NEARLY-dead presents (M-083): the guard swaps tick cpc at ~3/s forever,
++  // so "fully pinned" never happens and the .49 gate blocked the heal on a
++  // real wedge (2026-08-07 device, gap 97 -> 2352 unhealed). Live play swaps
++  // ~1 per tick; a wedge crawls at guard rate. Heal when cpc advanced <= 4
++  // over the last 30 ticks.
++  // Liveness source: HOST panel presents, not the CP swap counter -- the
++  // vblank keep-alive bumps that one at 60 Hz even when frozen (M-083's
++  // solved anomaly: it is why frozen sessions read ~60-66 "fps" and live
++  // Facility read 120). Guard presents crawl at ~3/s during a wedge; live
++  // play presents ~60/s.
++  static uint64_t s_heal_hp_hist[30] = {};
++  static uint32_t s_heal_tick = 0;
++  uint64_t host_presents = 0; uint32_t hp_p50 = 0, hp_p95 = 0, hp_max = 0;
++  RexGetSwapCadence(&host_presents, &hp_p50, &hp_p95, &hp_max);
++  uint32_t heal_hist_idx = s_heal_tick % 30u;
++  uint64_t hp_30_ago = s_heal_hp_hist[heal_hist_idx];
++  s_heal_hp_hist[heal_hist_idx] = host_presents;
++  bool presents_nearly_dead = s_heal_tick > 30u && (host_presents - hp_30_ago) <= 4u;
++  // Alive->dead doorbell + budget (M-087). A wedge is a TRANSITION: the guest
++  // was producing real frames and stopped. The heal arms only after a window
++  // of genuine liveness (>=20 unique guest frames / 30 ticks, the honest
++  // counter -- keep-alives can't fake it), so no recovery can fire into a
++  // cold boot's shader-compile crawl, the exact write-into-a-race class that
++  // caused .43/.44 (M-077/M-079). And it spends a bounded budget per death
++  // episode: the natural specimens proved an incurable park just eats writes
++  // forever (334 top-up fires, zero cures) -- close the books, then stand
++  // down until the guest lives again.
++  static uint64_t s_heal_gf_hist[30] = {};
++  static uint32_t s_heal_budget = 0;
++  bool guest_nearly_dead = false;
++  {
++    uint64_t guest_frames = RexGetGuestFrameCount();
++    uint64_t gf_30_ago = s_heal_gf_hist[heal_hist_idx];
++    s_heal_gf_hist[heal_hist_idx] = guest_frames;
++    if (s_heal_tick > 30u && guest_frames - gf_30_ago >= 20u) {
++      if (!s_heal_armed) REXKRNL_INFO("GEHEAL armed (guest live)");
++      s_heal_armed = true;
++      s_heal_budget = 600u;
++    }
++    // The heal's wedge signal comes from THIS counter, not host presents: the
++    // keep-alive repaints stale frames at 60 Hz once a wedge establishes,
++    // which slammed the presents-based gate shut after ONE heal tick (the
++    // injected-wedge validation caught it -- clear+top-up+credit fired once
++    // at 23:59:03.729 and never again). Unique guest frames cannot be faked
++    // by repaints; it is the same source the honest fps reads.
++    guest_nearly_dead = s_heal_tick > 30u && (guest_frames - gf_30_ago) <= 2u;
++  }
++  // The PROPHYLACTIC (M-094 endgame). The onset recording shows the freeze
++  // begins as ONE lost +2 progress credit: the healthy menu runs progress at
++  // target-4, rock-steady across a thousand ticks; the tick before the latch
++  // it slips to target-6, and the next tick the marker sets and the cascade
++  // of stale cursors begins. Every repair attempted after the latch -- pokes,
++  // heals, the full coherent write-set -- buys at most two frames, because
++  // parked-state surgery cannot match what the live pipeline would have
++  // written. So catch the slip at the ONLY moment the state is still simple
++  // and pay back the missing credit before anything latches. Fires only on
++  // the exact 4 -> 6 transition, logs every occurrence.
++  if (a1) {
++    static uint32_t s_prev_offset = 0;
++    uint32_t ph_pp = LD32(base, a1 + 10896);
++    if (ph_pp && ph_pp < 0xFFFFFFFEu) {
++      uint32_t ph_pr = LD32(base, ph_pp);
++      uint32_t ph_tg = LD32(base, a1 + 10908);
++      uint32_t off = ph_tg - ph_pr;
++      if (off == 6u && s_prev_offset == 4u) {
++        ST32(base, ph_pp, ph_pr + 2u);
++        REXKRNL_INFO("GEHEAL onset-catch: progress {} -> {} (offset slipped 4 -> 6; +2 repaid)",
++                     ph_pr, ph_pr + 2u);
++        off = 4u;
++      }
++      s_prev_offset = off;
++    }
++  }
++  ++s_heal_tick;
++  // Freeze flight recorder (M-092). Every dissection so far has read the
++  // PARKED steady state; nobody has ever seen the moment of ENTRY -- which
++  // ledger moved wrong first, and what the counters were doing in the seconds
++  // before. Record every tick into a ring (~17 s at 60 Hz); when a wedge is
++  // detected (nearly-dead presents on an armed, was-alive guest), write the
++  // whole ring to Documents/freeze-flight-<n>.txt once per episode. The file
++  // survives the force-quit, and its tail also lands in the app log for the
++  // bridge.
++  {
++    struct FlightSample {
++      uint32_t tick, submit, credited, progress, target;
++      uint32_t skipbits;
++      uint64_t guest_frames, host_presents;
++    };
++    static FlightSample s_flight[1024];
++    static uint32_t s_flight_n = 0;
++    static bool s_flight_dumped = false;
++    FlightSample& fs = s_flight[s_flight_n++ % 1024u];
++    fs.tick = s_heal_tick;
++    fs.submit = a1 ? LD32(base, a1 + 16544) : 0;
++    fs.credited = a1 ? LD32(base, a1 + 16552) : 0;
++    uint32_t fp = a1 ? LD32(base, a1 + 10896) : 0;
++    fs.progress = (fp && fp < 0xFFFFFFFEu) ? LD32(base, fp) : 0;
++    fs.target = a1 ? LD32(base, a1 + 10908) : 0;
++    fs.skipbits = a1 ? WD8(base, a1 + 10941) : 0;
++    fs.guest_frames = RexGetGuestFrameCount();
++    fs.host_presents = host_presents;
++    if ((guest_nearly_dead || presents_nearly_dead) && s_heal_armed && !s_flight_dumped) {
++      s_flight_dumped = true;  // one dump per episode; re-armed on liveness below
++      const uint32_t n = std::min(s_flight_n, 1024u);
++      const auto dir = rex::filesystem::GetDocumentsFolder();
++      char name[64];
++      std::snprintf(name, sizeof(name), "freeze-flight-%u.txt", s_heal_tick);
++      std::ofstream f(dir / name);
++      f << "tick submit credited progress target skipbits guest_frames host_presents\n";
++      for (uint32_t i = 0; i < n; ++i) {
++        const FlightSample& s = s_flight[(s_flight_n - n + i) % 1024u];
++        f << s.tick << ' ' << s.submit << ' ' << s.credited << ' ' << s.progress << ' '
++          << s.target << ' ' << s.skipbits << ' ' << s.guest_frames << ' ' << s.host_presents
++          << '\n';
++      }
++      f.close();
++      REXKRNL_INFO("GEFLIGHT: wedge onset -- wrote {} samples to {}", n, name);
++      // The last two seconds inline, so a bridge read alone shows the onset.
++      for (uint32_t i = (n > 120u ? n - 120u : 0u); i < n; i += 8) {
++        const FlightSample& s = s_flight[(s_flight_n - n + i) % 1024u];
++        REXKRNL_INFO("GEFLIGHT t{} sub={} cred={} prog={} tgt={} skip={:#x} gf={} hp={}", s.tick,
++                     s.submit, s.credited, s.progress, s.target, s.skipbits, s.guest_frames,
++                     s.host_presents);
++      }
++    }
++    if (!guest_nearly_dead && !presents_nearly_dead && s_flight_dumped && s_heal_armed) {
++      s_flight_dumped = false;  // guest lives again -> next episode gets its own dump
++    }
++  }
++  if (guest_nearly_dead && s_heal_armed && s_heal_budget) {
++    if (--s_heal_budget == 0) {
++      REXKRNL_INFO("GEHEAL budget exhausted -- standing down until the guest lives again");
++    }
++  }
++  if (REXCVAR_GET(ge_tick_heal) && a1 && guest_nearly_dead && s_heal_armed &&
++      s_heal_budget > 0) {
++    uint32_t heal_submit = LD32(base, a1 + 16544);
++    uint32_t heal_credited = LD32(base, a1 + 16552);
++    // Menu-race unpark (M-085/M-086): in the menu freeze the frame loop RUNS
++    // (this hook ticks) while rendering is skipped; the tick-heal holds the
++    // books square, and the ONE ledger left short is the progress counter --
++    // the menu's wait parks 2 short of target (every dump: progress N/N+2).
++    // With presents nearly dead, ring drained, and fences retired, top it up
++    // to target (never past -- unsigned target arithmetic), at most once per
++    // 32 ticks. The 2026-08-08 remote-rescue attempt failed only because the
++    // shipped top-up was gated on a PINNED frame loop, the wrong doorbell
++    // for this variant.
++    if (cpp) {
++      auto* heal_probe = static_cast<CPProbe*>(cpp);
++      if (heal_probe->rpi() == heal_probe->wpi() &&
++          LD32(base, a1 + 16684) == LD32(base, a1 + 16688)) {
++        // The wedge MARKER (M-093, the first onset recording): healthy menus
++        // run dev+10941 at 0x14; at the wedge tick it flips to 0x16 -- the
++        // wedge bit is VALUE 0x02, set once at entry and never re-asserted.
++        // (Every earlier "bit-2 clear" experiment wrote 0x02 -- clearing the
++        // WRONG bit and keeping this one; the refutations tested nothing.)
++        // The old .4x bulk recovery cleared it alongside the ledger repair
++        // and cured on device; the tick-heal does the same now, inside the
++        // same drained-ring/fences gate as the rest of the repair.
++        uint8_t heal_skip = WD8(base, a1 + 10941);
++        if (heal_skip & 0x02u) {
++          WDST8(base, a1 + 10941, uint8_t(heal_skip & ~0x02u));
++          REXKRNL_INFO("GEHEAL cleared wedge marker: {:#x} -> {:#x}", heal_skip,
++                       heal_skip & ~0x02u);
++        }
++        uint32_t heal_prog_ptr = LD32(base, a1 + 10896);
++        if (heal_prog_ptr && heal_prog_ptr < 0xFFFFFFFEu) {
++          uint32_t heal_prog = LD32(base, heal_prog_ptr);
++          uint32_t heal_tgt = LD32(base, a1 + 10908);
++          if (heal_prog != heal_tgt && heal_tgt - heal_prog < 16u) {
++            static std::atomic<uint32_t> s_prog_topup_tick{0};
++            uint32_t pt = s_prog_topup_tick.fetch_add(1, std::memory_order_relaxed);
++            if ((pt & 0x1F) == 0) {
++              ST32(base, heal_prog_ptr, heal_tgt);
++              REXKRNL_INFO("GEHEAL progress top-up: {} -> {} (menu-race unpark)", heal_prog,
++                           heal_tgt);
++            }
++          }
++        }
++      }
++    }
++    // gap>2, down from >8: the onset recording (M-093) shows the healthy menu
++    // runs the books DEAD EVEN (gap 0); >8 was leaving every healed wedge
++    // parked 8 frames short of square. 2 allows genuinely in-flight frames.
++    if (heal_submit - heal_credited > 2 && heal_submit - heal_credited < 0x10000u && cpp) {
++      auto* probe = static_cast<CPProbe*>(cpp);
++      if (probe->rpi() == probe->wpi() &&
++          LD32(base, a1 + 16684) == LD32(base, a1 + 16688)) {
++        // Coarse+fine: submit advances one per tick, so +2 nets one frame of
++        // closure -- which meant a gap-50 wedge needed ~50 s and the 600-tick
++        // budget expired first (the gate-fix validation caught it). Deep gaps
++        // close at +8/tick (net +7), the last stretch at +2, and the gap>2
++        // floor still keeps the heal out of the live window.
++        uint32_t heal_step = (heal_submit - heal_credited > 16u) ? 8u : 2u;
++        ST32(base, a1 + 16552, heal_credited + heal_step);
++        static std::atomic<uint32_t> s_heal_logged{0};
++        uint32_t healed = s_heal_logged.fetch_add(1, std::memory_order_relaxed);
++        if ((healed & 0x3F) == 0) {
++          REXKRNL_INFO("GEHEAL tick-heal: credited {} -> {} (gap {})", heal_credited,
++                       heal_credited + heal_step, heal_submit - heal_credited);
++        }
++      }
++    }
++  }
+   // Publish and reset the per-frame phase accounting.
+   g_frame_wait_cycles.store(g_wait_cycles.exchange(0, std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+@@ -1266,6 +1968,25 @@
+   if (out_presented) *out_presented = LD32(base, dev + 16552);
+ }
+ 
++// HUD/fps variant (M-081): the credit counter above can detach from reality
++// (pinned while the game plays, or advanced by the heal while it doesn't),
++// which made both the on-screen readout and the console fps lie. The CP's
++// swap counter counts frames the GPU actually swapped -- the number a person
++// watching the screen would count.
++void GetGpuSwapHudCounters(uint64_t* out_submitted, uint64_t* out_swaps) {
++  if (out_submitted) *out_submitted = 0;
++  if (out_swaps) *out_swaps = 0;
++  auto* memory = rex::Runtime::instance() ? rex::Runtime::instance()->memory() : nullptr;
++  if (!memory) return;
++  uint8_t* base = memory->virtual_membase();
++  uint32_t dev = g_ge_device.load(std::memory_order_relaxed);
++  if (base && dev && out_submitted) *out_submitted = LD32(base, dev + 16544);
++  // Unique guest frames handed to the presenter -- the one counter that
++  // means "game fps" (host paints double-count at 2x; the CP swap counter is
++  // keep-alive-poisoned; both burned us -- M-083).
++  if (out_swaps) *out_swaps = RexGetGuestFrameCount();
++}
++
+ // Start the raw-mouse + cursor-capture thread once, at app startup, so capture
+ // works regardless of whether the guest look hooks have fired yet.
+ void InitMouseLook() {

@@ -1,0 +1,22 @@
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -551,10 +551,19 @@
+   }
+ }
+ 
++// One increment per NEW guest frame handed to the presenter -- the only
++// counter that means "game frames per second" (M-083: the CP swap counter is
++// vblank-keep-alive-poisoned; host panel presents double-count paints).
++static std::atomic<uint64_t> g_guest_frames_refreshed{0};
++extern "C" uint64_t RexGetGuestFrameCount() {
++  return g_guest_frames_refreshed.load(std::memory_order_relaxed);
++}
++
+ bool Presenter::RefreshGuestOutput(
+     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
+     uint32_t display_aspect_ratio_y,
+     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
++  g_guest_frames_refreshed.fetch_add(1, std::memory_order_relaxed);
+   GuestOutputProperties& writable_properties =
+       guest_output_properties_[guest_output_mailbox_writable_];
+   writable_properties.frontbuffer_width = frontbuffer_width;

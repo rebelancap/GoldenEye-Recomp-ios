@@ -1,0 +1,10 @@
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -72,6 +72,7 @@
+             windowed_app_context_uikit.mm
+             sdl_ios_device_idiom.mm
+             onboarding_uikit.mm
++            settings_uikit.mm
+             touch_controls.cpp
+             touch_overlay_uikit.mm
+         )

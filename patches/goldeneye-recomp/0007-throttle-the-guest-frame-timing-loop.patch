@@ -1,0 +1,109 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -25,6 +25,15 @@
+ 
+ // Backing off this spin is the single change M-049 identified as highest
+ // leverage; exposed as a cvar so its effect is measured rather than asserted.
++REXCVAR_DEFINE_INT32(
++    ge_dbg_now_idle_sleep_us, 25, "GPU",
++    "Sleep, in microseconds, when the guest re-enters its frame-timing loop with the frame "
++    "already drawn. sub_82198C28 spins until the tick this hook feeds it has advanced by 5000 "
++    "(~100 us): a pure wall-clock delay, free on a 360's six hardware threads and a whole core "
++    "on a phone. Sleeping turns thousands of iterations into four. 0 restores the busy-wait.")
++    .range(0, 1000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_INT32(ge_frame_wait_backoff_us, 100, "GPU",
+                      "Microseconds to sleep between polls once the guest's GPU-completion wait "
+                      "has spun without success. 0 restores the original uncapped spin, which "
+@@ -231,6 +240,11 @@
+ std::atomic<uint32_t> g_ge_device{0};   // device struct (dev) seen by ge_dbg_now
+ std::atomic<uint32_t> g_ge_idblk{0};    // id-block (idblk) seen by ge_dbg_now
+ std::atomic<uint32_t> g_dbgnow_calls{0};  // increments each ge_dbg_now (guest polling sub_82198C28)
++// Same count, but 64-bit and reported as a rate: how hard the guest is polling
++// this routine is the whole question for its cost, and a rate is the only form
++// of that number worth reading.
++std::atomic<uint64_t> g_dbgnow_total{0};
++std::atomic<uint64_t> g_dbgnow_slept{0};
+ 
+ // Frame-phase accounting (Fable round 5 / M-049 item 1). The claim to test is
+ // that a displayed frame is not one long wait but six to eight short
+@@ -579,6 +593,7 @@
+   g_ge_device.store(dev, std::memory_order_relaxed);
+   g_ge_idblk.store(idblk, std::memory_order_relaxed);
+   g_dbgnow_calls.fetch_add(1, std::memory_order_relaxed);
++  g_dbgnow_total.fetch_add(1, std::memory_order_relaxed);
+   ge_start_watchdog_once();
+   auto* cpp = ge_cp();
+   uint32_t cpc = cpp ? cpp->counter() : 0;
+@@ -630,6 +645,9 @@
+   // this stays a one-shot "proceed past this stall", not a permanent skip.
+   static thread_local uint32_t s_wait_start = 0;
+   static thread_local bool s_waiting = false;
++  // Guest timebase ticks in sub_82198C28's delay window (0x1388 @ 49.875 MHz).
++  static constexpr uint32_t kGuestTimingLoopTicks = 0x1388;
++  static thread_local uint32_t t_last_call = 0;
+   // Poll iterations spent spinning before backing off. ~200 at a few hundred
+   // nanoseconds each is roughly the 200 us fast path Fable specified.
+   static constexpr uint32_t kFrameWaitSpinPolls = 200;
+@@ -684,8 +702,25 @@
+       g_wait_cycles.fetch_add(1, std::memory_order_relaxed);
+       g_wait_ticks.fetch_add(uint32_t(t - s_wait_start), std::memory_order_relaxed);
+       t_last_wait_end = t;
++    }
++    // The frame is drawn, so this is the guest's OWN timing loop rather than a
++    // GPU wait: sub_82198C28 spins until the tick fed in above has advanced by
++    // 0x1388 (~100 us at 49.875 MHz). Being re-entered inside that window means
++    // the guest is busy-waiting, and every iteration costs a host clock read --
++    // which after M-057 is essentially all the CPU this port still uses.
++    //
++    // Sleeping here is closer to the console than spinning is, not further from
++    // it: on a 360 the delay costs one of six hardware threads and starves
++    // nothing. Here it occupies the core the command processor needs.
++    if (t_last_call) {
++      const int32_t idle_us = REXCVAR_GET(ge_dbg_now_idle_sleep_us);
++      if (idle_us > 0 && uint32_t(t - t_last_call) < kGuestTimingLoopTicks) {
++        g_dbgnow_slept.fetch_add(1, std::memory_order_relaxed);
++        rex::thread::Sleep(std::chrono::microseconds(idle_us));
++      }
+     }
+   }
++  t_last_call = t;
+ 
+   if (dev && idblk && idblk < 0xFFFFFFFEu && drawn) {
+     // DO NOT write idblk+0 here. idblk+0 is the CPU<->GPU semaphore the CP polls
+@@ -1116,6 +1151,13 @@
+         uint64_t(double(g_frame_between_ticks.load(std::memory_order_relaxed)) / kTicksPerUs);
+ }
+ 
++void GetDbgNowCalls(uint64_t* out_total, uint64_t* out_slept) {
++  // exchange: the console reports the interval since it last looked, so the
++  // number reads as a rate rather than as an ever-growing total.
++  if (out_total) *out_total = g_dbgnow_total.exchange(0, std::memory_order_relaxed);
++  if (out_slept) *out_slept = g_dbgnow_slept.exchange(0, std::memory_order_relaxed);
++}
++
+ void GetGpuSubmitPresentCounts(uint64_t* out_submitted, uint64_t* out_presented) {
+   if (out_submitted) *out_submitted = 0;
+   if (out_presented) *out_presented = 0;
+--- a/src/ge_app.h
++++ b/src/ge_app.h
+@@ -50,6 +50,9 @@
+ // The guest's own submit/present counters, for the remote console. Implemented
+ // in ge_hooks.cpp, which owns the device-struct offsets.
+ void GetGpuSubmitPresentCounts(uint64_t* out_submitted, uint64_t* out_presented);
++// Per-frame phase accounting for the console (M-049 item 1).
++void GetFramePhases(uint32_t* out_cycles, uint64_t* out_wait_us, uint64_t* out_between_us);
++void GetDbgNowCalls(uint64_t* out_total, uint64_t* out_slept);
+ }
+ 
+ class GeApp : public rex::ReXApp {
+@@ -142,6 +145,8 @@
+     rex::console::Start(8773, [this]() {
+       rex::console::BridgeStats out;
+       ge::GetGpuSubmitPresentCounts(&out.submitted, &out.presented);
++      ge::GetFramePhases(&out.wait_cycles, &out.wait_us, &out.between_us);
++      ge::GetDbgNowCalls(&out.dbgnow_calls, &out.dbgnow_sleeps);
+       // Frame rate is derived here from the guest's present counter rather than
+       // taken from the renderer: it is the number that corresponds to what the
+       // player sees, and it stays meaningful when the two diverge.

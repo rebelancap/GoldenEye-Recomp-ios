@@ -1,0 +1,40 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -961,6 +961,15 @@
+ }  // namespace
+ 
+ namespace ge {
++// Arm the GPU freeze watchdog at app startup.
++//
++// Upstream only reaches ge_start_watchdog_once() from the ge_dbg_now midasm
++// hook at 0x82198C94. If the guest stalls BEFORE that hook fires -- which is
++// exactly what happens on the first macOS boot -- the watchdog never runs and
++// the stall is silent. Arming it at startup costs one sleeping thread and makes
++// the diagnostics available from the first frame onward.
++void StartGpuWatchdog() { ge_start_watchdog_once(); }
++
+ // Start the raw-mouse + cursor-capture thread once, at app startup, so capture
+ // works regardless of whether the guest look hooks have fired yet.
+ void InitMouseLook() {
+--- a/src/ge_app.h
++++ b/src/ge_app.h
+@@ -28,6 +28,9 @@
+ // Start the raw-mouse + cursor-capture thread at startup. Implemented in
+ // ge_hooks.cpp.
+ void InitMouseLook();
++// Arm the GPU freeze watchdog at startup rather than waiting for the ge_dbg_now
++// hook to fire. Implemented in ge_hooks.cpp.
++void StartGpuWatchdog();
+ // Suppress mouse-look while the pause menu is open (cursor is needed for the
+ // menu, and motion shouldn't turn into look). Implemented in ge_hooks.cpp.
+ void SetMouselookSuppressed(bool suppressed);
+@@ -74,7 +77,8 @@
+     if (window()) window()->SetTitle("GoldenEye");
+     rex::ui::RegisterBind("bind_pause_menu", "Escape", "Pause menu",
+                           [this] { TogglePauseMenu(); });
+-    ge::InitMouseLook();  // start raw-mouse capture/look thread
++    ge::InitMouseLook();     // start raw-mouse capture/look thread
++    ge::StartGpuWatchdog();  // arm the freeze watchdog from the first frame
+     postfx_ = std::make_unique<ge::PostFxOverlay>(drawer);
+     // Username/server are set in the ONLINE pause-menu tab now -- no first-boot
+     // prompt. They apply on the Save & Restart the ONLINE tab triggers.

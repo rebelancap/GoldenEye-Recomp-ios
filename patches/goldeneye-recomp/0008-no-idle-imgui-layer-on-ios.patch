@@ -1,0 +1,35 @@
+--- a/src/ge_app.h
++++ b/src/ge_app.h
+@@ -36,6 +36,8 @@
+ // ge_hooks.cpp, which owns the Win32 includes). Used by the ONLINE menu's
+ // "Save & Restart" so username/server/enable changes take effect on a clean
+ // boot -- they are read at startup (UserProfile ctor, online client start).
++REXCVAR_DECLARE(bool, postfx_enabled);
++
+ namespace ge {
+ void LaunchSelfDetached();
+ // Start the raw-mouse + cursor-capture thread at startup. Implemented in
+@@ -164,7 +166,23 @@
+       return out;
+     });
+ #endif
++    // Creating the overlay REGISTERS the ImGui drawer with the presenter, which
++    // then paints a UI layer every frame -- even though PostFxOverlay::OnDraw
++    // returns immediately while postfx_enabled is false, which is its default
++    // and the only state a phone can be in (the ImGui menus need a mouse). On a
++    // tile-based GPU an extra full-screen layer per frame is not free, so on
++    // iOS the dialog only exists if the filter is actually wanted.
++    //
++    // Consequence, deliberately accepted: turning postfx on from ge.toml takes
++    // effect at the next launch on iOS. It is a niche filter with no on-device
++    // UI, and paying for it every frame to avoid a relaunch is the wrong trade.
++#if REX_PLATFORM_IOS
++    if (REXCVAR_GET(postfx_enabled)) {
++      postfx_ = std::make_unique<ge::PostFxOverlay>(drawer);
++    }
++#else
+     postfx_ = std::make_unique<ge::PostFxOverlay>(drawer);
++#endif
+     // Username/server are set in the ONLINE pause-menu tab now -- no first-boot
+     // prompt. They apply on the Save & Restart the ONLINE tab triggers.
+   }

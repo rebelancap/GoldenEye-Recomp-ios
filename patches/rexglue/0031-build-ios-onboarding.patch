@@ -1,0 +1,10 @@
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -71,6 +71,7 @@
+             window_uikit.mm
+             windowed_app_context_uikit.mm
+             sdl_ios_device_idiom.mm
++            onboarding_uikit.mm
+         )
+     else()
+         set(REXUI_PLATFORM_SOURCES

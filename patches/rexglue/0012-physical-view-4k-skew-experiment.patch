@@ -1,0 +1,85 @@
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -1622,7 +1622,16 @@
+                               VirtualHeap* parent_heap) {
+   uint32_t host_address_offset;
+   if (heap_base >= 0xE0000000 && rex::memory::allocation_granularity() > 0x1000) {
+-    host_address_offset = 0x1000;
++    // EXPERIMENT (GoldenEye-Recomp-ios): 0x1000 here makes KERNEL access via
++    // TranslateVirtual land on the true physical address, but recompiled guest
++    // code addresses memory as membase + guest_address with no offset -- so the
++    // two disagree by 4 KB for this view (M-013). Forcing 0 makes them agree;
++    // both are then uniformly 4 KB off from true physical, which is harmless for
++    // structures only the CPU touches (kernel variable exports such as
++    // VdHSIOCalibrationLock) and is the cheapest way to test the diagnosis.
++    // NOT a shipping fix: anything whose PHYSICAL address matters to the GPU
++    // would still be wrong. See M-013's three candidates.
++    host_address_offset = 0;
+   } else {
+     host_address_offset = 0;
+   }
+--- a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
+@@ -399,7 +399,28 @@
+ 
+   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
+     // Create a full waiter.
+-    xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
++    //
++    // Diagnostic (GoldenEye-Recomp-ios overlay): wait in bounded slices instead
++    // of forever, so a critical section that is never released names itself and
++    // its owner in the log. Semantics are unchanged -- it still waits
++    // indefinitely, just noisily. Costs one log line per stuck lock per 5 s.
++    const uint64_t deadline_slice = 5000;  // ms
++    uint64_t waited_ms = 0;
++    for (;;) {
++      uint64_t timeout_100ns = uint64_t(deadline_slice) * 10000ull;
++      int64_t relative = -int64_t(timeout_100ns);
++      X_STATUS status = xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0,
++                                                reinterpret_cast<uint64_t*>(&relative));
++      if (status != X_STATUS_TIMEOUT) {
++        break;
++      }
++      waited_ms += deadline_slice;
++      REXKRNL_WARN(
++          "RtlEnterCriticalSection: thread {:08X} has waited {} ms for CS at {:08X} "
++          "(owner={:08X} lock_count={} recursion={})",
++          cur_thread, waited_ms, cs.guest_address(), uint32_t(cs->owning_thread),
++          int32_t(cs->lock_count), uint32_t(cs->recursion_count));
++    }
+   }
+ 
+   assert_true(cs->owning_thread == 0);
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -546,6 +546,30 @@
+   export_resolver->SetVariableMapping("xboxkrnl.exe", 0x01C1, pVdHSIOCalibrationLock);
+   auto hsio_lock = memory->TranslateVirtual<X_RTL_CRITICAL_SECTION*>(pVdHSIOCalibrationLock);
+   xeRtlInitializeCriticalSectionAndSpinCount(hsio_lock, pVdHSIOCalibrationLock, 10000);
++  {
++    // DIAGNOSTIC (GoldenEye-Recomp-ios overlay): does the kernel's view of this
++    // guest address agree with the recompiled code's view? TranslateVirtual adds
++    // PhysicalHeap::host_address_offset (0x1000 when the host allocation
++    // granularity exceeds 4 KB -- true on Apple Silicon's 16 KB pages), whereas
++    // generated PPC code addresses memory as membase + guest_address with no
++    // such offset. If those disagree, every guest access to the 0xE0000000
++    // physical view reads 4 KB away from where the kernel wrote.
++    const uint8_t* kernel_view = reinterpret_cast<const uint8_t*>(hsio_lock);
++    const uint8_t* guest_view = memory->virtual_membase() + pVdHSIOCalibrationLock;
++    // lock_count sits at byte offset 8 of X_RTL_CRITICAL_SECTION; read it
++    // rawly from both views rather than through the (incomplete here) type.
++    int32_t kernel_lock_count = 0;
++    int32_t guest_lock_count = 0;
++    std::memcpy(&kernel_lock_count, kernel_view + 8, 4);
++    std::memcpy(&guest_lock_count, guest_view + 8, 4);
++    REXLOG_INFO(
++        "HSIO lock diag: guest_addr={:08X} kernel_view={} guest_view={} delta={} "
++        "kernel_lock_count={} raw_at_guest_view(+8)={:08X} granularity={:#x}",
++        pVdHSIOCalibrationLock, static_cast<const void*>(kernel_view),
++        static_cast<const void*>(guest_view),
++        int64_t(kernel_view - guest_view), kernel_lock_count,
++        uint32_t(guest_lock_count), rex::memory::allocation_granularity());
++  }
+ }
+ 
+ }  // namespace rex::kernel::xboxkrnl

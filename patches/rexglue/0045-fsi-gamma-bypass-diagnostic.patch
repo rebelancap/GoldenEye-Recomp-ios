@@ -1,0 +1,55 @@
+--- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+@@ -16,10 +16,19 @@
+ #include <SPIRV/GLSL.std.450.h>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/graphics/pipeline/render_target/cache.h>
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/graphics/util/draw.h>
+ #include <rex/math.h>
++
++REXCVAR_DEFINE_BOOL(fsi_gamma_bypass_diag, false, "GPU/Shader",
++                    "DIAGNOSTIC (round 8): on the FSI render-target path, skip the PWL gamma "
++                    "encode when packing k_8_8_8_8_GAMMA into EDRAM and the decode when "
++                    "unpacking, so gamma data passes through raw. Bisects the FSI two-stops-dark "
++                    "fault between the shader gamma round-trip and everything downstream "
++                    "(clears/resolve/present). Translation-time flag: wipe the shader cache and "
++                    "restart after flipping. Never ship enabled.");
+ 
+ namespace rex::graphics {
+ 
+@@ -2386,10 +2395,19 @@
+     uint_vector_temp_.push_back(2);
+     spv::Id color_rgb = builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_, color_float4,
+                                                       uint_vector_temp_);
+-    spv::Id rgb_gamma =
+-        LinearToPWLGamma(builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_, color_float4,
+-                                                       uint_vector_temp_),
+-                         false);
++    spv::Id rgb_gamma;
++    if (REXCVAR_GET(fsi_gamma_bypass_diag)) {
++      // Diagnostic bypass: saturate only (the encode normally saturates).
++      rgb_gamma = builder_->createTriBuiltinCall(
++          type_float3_, ext_inst_glsl_std_450_, GLSLstd450NClamp, color_rgb,
++          const_float_vectors_0_[2], SpirvSmearScalarResultOrConstant(
++                                         builder_->makeFloatConstant(1.0f), type_float3_));
++    } else {
++      rgb_gamma = LinearToPWLGamma(
++          builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_, color_float4,
++                                        uint_vector_temp_),
++          false);
++    }
+     spv::Id alpha_clamped = builder_->createTriBuiltinCall(
+         type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
+         builder_->createCompositeExtract(color_float4, type_float_, 3), const_float_0_,
+@@ -2728,7 +2746,7 @@
+                 builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_, color_packed[0],
+                                       builder_->makeUintConstant(8 * j), component_width)),
+             component_scale);
+-        if (i && j <= 2) {
++        if (i && j <= 2 && !REXCVAR_GET(fsi_gamma_bypass_diag)) {
+           component = PWLGammaToLinear(component, true);
+         }
+         unpacked_8_8_8_8_and_gamma[i][j] = component;

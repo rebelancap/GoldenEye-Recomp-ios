@@ -1,0 +1,85 @@
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -1368,16 +1368,31 @@
+   current_thread_ = thread;
+   current_thread_condition_ = &thread->handle_;
+   {
++    // One critical section, deliberately. Publishing the state is what releases
++    // Resume()'s WaitStarted(), so suspend_count_ must already be set by the
++    // time that happens -- otherwise Resume() can run in the gap, observe a
++    // count of 0, return false without doing anything, and leave this thread to
++    // set the count to 1 and wait for a wakeup that will never come.
++    //
++    // Nothing checks Resume()'s return value, so the result is a thread that
++    // was "created successfully" and simply never runs. It is timing-dependent:
++    // rare on a desktop, common on a phone, where the new thread is likely to
++    // start on an efficiency core and take much longer to get here. That is how
++    // this presented -- a different GPU or audio worker missing on each launch
++    // (M-046).
+     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
+     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
+-    thread->handle_.state_signal_.notify_all();
+-  }
++    if (create_suspended) {
++      thread->handle_.suspend_count_ = 1;
++    }
++    thread->handle_.state_signal_.notify_all();
+ 
+-  if (create_suspended) {
+-    std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
+-    thread->handle_.suspend_count_ = 1;
+-    thread->handle_.state_signal_.wait(lock,
+-                                       [thread] { return thread->handle_.suspend_count_ == 0; });
++    if (create_suspended) {
++      // Re-checks the predicate on entry, so a Resume() that lands between the
++      // notify above and this wait is honoured rather than lost.
++      thread->handle_.state_signal_.wait(lock,
++                                         [thread] { return thread->handle_.suspend_count_ == 0; });
++    }
+   }
+ 
+   start_routine();
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -286,6 +286,14 @@
+                         memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                         memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false,
+                         &address)) {
++    // Loud, because the only caller returns NO_MEMORY and its caller ignores
++    // that: a silent failure here shows up as a thread that simply never runs,
++    // with a successful-looking "GPU system initialized" right above it.
++    REXSYS_ERROR(
++        "XThread::AllocateStack: no room for a {} KB stack (with guard pages, {} KB aligned to "
++        "{} KB) in the guest stack range {:08X}-{:08X}",
++        size / 1024, actual_size / 1024, alignment / 1024, kStackAddressRangeBegin,
++        kStackAddressRangeEnd);
+     return false;
+   }
+ 
+@@ -423,6 +431,11 @@
+   params.stack_size = 16_MiB;  // Allocate a big host stack.
+   params.create_suspended = true;
+   thread_ = rex::thread::Thread::Create(params, [this]() {
++    // Before anything else, including the per-thread exception setup. The gap
++    // between "thread created" and XThread::Execute's own line is several calls
++    // wide, and telling "never started" apart from "started and hung in that
++    // gap" is otherwise impossible from a log alone.
++    REXSYS_INFO("XThread host thread entered for '{}'", thread_name_);
+     rex::initialize_seh_thread();
+     runtime::ThreadState::Bind(thread_state_.get());
+ 
+@@ -472,7 +485,13 @@
+ 
+   if ((creation_params_.creation_flags & X_CREATE_SUSPENDED) == 0) {
+     // Start the thread now that we're all setup.
+-    thread_->Resume();
++    if (!thread_->Resume()) {
++      // This return was silently discarded before. False means the thread is
++      // still parked and nothing else is going to wake it, so the caller would
++      // be handed a thread that never runs -- report it as the failure it is.
++      REXSYS_ERROR("XThread::Create: failed to resume '{}' after creation", thread_name_);
++      return X_STATUS_UNSUCCESSFUL;
++    }
+   }
+ 
+   return X_STATUS_SUCCESS;

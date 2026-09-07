@@ -1,0 +1,18 @@
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -2075,7 +2075,14 @@
+   assert_true(address >= heap_base_);
+   address -= heap_base_;
+   assert_true(address < heap_size_);
+-  if (heap_base_ >= 0xE0000000) {
++  if (heap_base_ >= 0xE0000000 && rex::memory::allocation_granularity() <= 0x1000) {
++    // EXPERIMENT (GoldenEye-Recomp-ios), completes patch 0012: on hosts whose
++    // allocation granularity exceeds 4 KB the 0xE0000000 view is mapped WITHOUT
++    // its hardware 4 KB offset (MapViews rounds it away), and patch 0012 makes
++    // kernel and guest agree on that offset-less view. This conversion must
++    // agree too, or every virtual->physical->host round trip (e.g. XFile::Read
++    // into texture memory) lands 4 KB high — measured as the CAFF loader's
++    // .data section head arriving at +0x1000 (M-022).
+     address += 0x1000;
+   }
+   return address;

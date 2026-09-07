@@ -1,0 +1,96 @@
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -227,16 +227,37 @@
+ //   * A 4 KB guard page cannot be isolated; its 16 KB host page may stay
+ //     accessible because a neighbour is committed.
+ // See docs/memory-math.md. Revisit if either shows up in a Phase 3 measurement.
+-static inline void ClampToHostPages(void*& base_address, size_t& length) {
++// grant == true  -> the caller is making memory MORE accessible. Rounding the
++//                    range outward is safe: neighbours only gain access.
++// grant == false -> the caller is REVOKING access. Rounding outward here is a
++//                    correctness bug (M-020): it strips the three neighbouring
++//                    4 KB guest pages, which the guest legitimately committed
++//                    and which nothing will ever restore. Round INWARD instead,
++//                    to whole host pages entirely inside the request; if nothing
++//                    remains, do nothing at all. The protection is then not
++//                    enforced by the host for that page -- guest-visible state
++//                    stays exact in BaseHeap::page_table_ -- but no page is ever
++//                    wrongly revoked.
++static inline bool ClampToHostPages(void*& base_address, size_t& length, bool grant) {
+   if (!base_address) {
+-    return;
++    return true;
+   }
+   const uintptr_t page = uintptr_t(page_size());
+   const uintptr_t addr = reinterpret_cast<uintptr_t>(base_address);
+-  const uintptr_t begin = addr & ~(page - 1);
+-  const uintptr_t end = (addr + length + page - 1) & ~(page - 1);
++  uintptr_t begin, end;
++  if (grant) {
++    begin = addr & ~(page - 1);
++    end = (addr + length + page - 1) & ~(page - 1);
++  } else {
++    begin = (addr + page - 1) & ~(page - 1);
++    end = (addr + length) & ~(page - 1);
++    if (end <= begin) {
++      return false;  // sub-host-page revoke: skip it rather than over-revoke
++    }
++  }
+   base_address = reinterpret_cast<void*>(begin);
+   length = size_t(end - begin);
++  return true;
+ }
+ #endif
+ 
+@@ -244,7 +265,8 @@
+                  PageAccess access) {
+ #if defined(__APPLE__)
+   void* const requested_address = base_address;
+-  ClampToHostPages(base_address, length);
++  // Allocation/commit only ever grants access, so outward rounding is correct.
++  ClampToHostPages(base_address, length, /*grant=*/true);
+ #endif
+   // Emulates Windows VirtualAlloc behavior:
+   // - Reserve: create PROT_NONE mapping to hold address space
+@@ -364,7 +386,12 @@
+ 
+   uint32_t prot = ToPosixProtectFlags(access);
+ #if defined(__APPLE__)
+-  ClampToHostPages(base_address, length);  // 16 KB host pages -- see AllocFixed
++  // 16 KB host pages -- see ClampToHostPages. Revoking is the dangerous
++  // direction, so it rounds inward and may become a no-op.
++  const bool grants_access = access != PageAccess::kNoAccess;
++  if (!ClampToHostPages(base_address, length, grants_access)) {
++    return true;  // nothing safely revocable at host-page granularity
++  }
+ #endif
+   return mprotect(base_address, length, prot) == 0;
+ }
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -417,6 +417,25 @@
+     // The address is not found within any range, so either a write watch or an
+     // actual access violation.
+     if (access_violation_callback_) {
++      // DIAGNOSTIC (GoldenEye-Recomp-ios overlay): is the same address faulting
++      // over and over? On a 16 KB-page host a write-watch unprotect cannot cover
++      // exactly one 4 KB guest page, so a fault that is never actually cleared
++      // would re-enter here forever. Report the first few and any address seen
++      // repeatedly.
++      {
++        static std::atomic<uint64_t> fault_total{0};
++        static std::atomic<uint64_t> last_addr{0};
++        static std::atomic<uint32_t> same_addr_run{0};
++        const uint64_t n = fault_total.fetch_add(1) + 1;
++        const uint64_t addr = uint64_t(fault_host_address);
++        const uint64_t prev = last_addr.exchange(addr);
++        const uint32_t run = (prev == addr) ? same_addr_run.fetch_add(1) + 1
++                                            : (same_addr_run.store(0), 0u);
++        if (n <= 5 || run == 50 || (n % 5000) == 0) {
++          REXLOG_INFO("MMIO write-watch fault #{} addr={:#x} write={} same_addr_run={}", n, addr,
++                      is_write, run);
++        }
++      }
+       return access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                         fault_host_address, is_write);
+     }

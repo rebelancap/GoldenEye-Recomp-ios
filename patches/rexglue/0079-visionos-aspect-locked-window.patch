@@ -1,0 +1,92 @@
+--- a/src/ui/window_uikit.mm
++++ b/src/ui/window_uikit.mm
+@@ -16,6 +16,7 @@
+ #include <rex/ui/window_uikit.h>
+ 
+ #include <algorithm>
++#include <cmath>
+ 
+ #include <rex/cvar.h>
+ #include <rex/graphics/video_mode_util.h>
+@@ -62,6 +63,45 @@
+     }
+   }
+   return fallback;
++}
++#endif
++
++#if TARGET_OS_VISION
++// The guest renders 16:9 and the presenter letterboxes anything else, so a
++// window the user has dragged into a different shape gets black bars. Ask the
++// system for 16:9 and for UNIFORM resizing, which keeps the aspect ratio while
++// the user drags the corner -- so the window can be any size and the game
++// always fills it (the user, headset, 0.1.0.70: "force it to stay a certain
++// aspect ratio so there's no letterboxing, and FILL the window"). D-025.
++//
++// 1280x720 points is the initial size; at the Vision Pro's 2x display scale
++// that is 2560x1440 pixels, which is also what resolution_scale 2 renders.
++void RexApplyVisionSceneGeometry(UIWindowScene* scene) {
++  if (!scene) return;
++  // Belt: the scene-level restrictions, which the system consults when it
++  // proposes a size of its own.
++  UISceneSizeRestrictions* restrictions = scene.sizeRestrictions;
++  if (restrictions) {
++    restrictions.minimumSize = CGSizeMake(640, 360);
++    restrictions.maximumSize = CGSizeMake(3840, 2160);
++  }
++  // Braces: the actual geometry request, which is the only thing that sets the
++  // resizing restriction.
++  if (@available(visionOS 1.0, *)) {
++    UIWindowSceneGeometryPreferencesVision* prefs =
++        [[UIWindowSceneGeometryPreferencesVision alloc] initWithSize:CGSizeMake(1280, 720)];
++    prefs.minimumSize = CGSizeMake(640, 360);
++    prefs.maximumSize = CGSizeMake(3840, 2160);
++    prefs.resizingRestrictions = UIWindowSceneResizingRestrictionsUniform;
++    [scene requestGeometryUpdateWithPreferences:prefs
++                                   errorHandler:^(NSError* error) {
++                                     REXLOG_ERROR("visionOS: geometry request refused: {}",
++                                                  error.localizedDescription.UTF8String
++                                                      ? error.localizedDescription.UTF8String
++                                                      : "(no description)");
++                                   }];
++    REXLOG_INFO("visionOS: requested 1280x720 with uniform (aspect-locked) resizing");
++  }
+ }
+ #endif
+ 
+@@ -219,6 +259,23 @@
+ 
+ - (void)viewDidLayoutSubviews {
+   [super viewDidLayoutSubviews];
++#if TARGET_OS_VISION
++  // The aspect lock is a REQUEST; the system can refuse or round it. Log what
++  // the scene actually became, once per distinct size, so "no bars" is a
++  // number in the log and not a hope. 16:9 is 1.7778; the presenter's letterbox
++  // is what fills the difference when this drifts.
++  {
++    static CGSize last = CGSizeZero;
++    const CGSize now = self.view.bounds.size;
++    if (!CGSizeEqualToSize(now, last)) {
++      last = now;
++      const double aspect = now.height > 0 ? double(now.width) / double(now.height) : 0.0;
++      REXLOG_INFO("visionOS: scene geometry {:.0f}x{:.0f} points, aspect {:.4f} ({}16:9)",
++                  now.width, now.height, aspect,
++                  std::abs(aspect - 16.0 / 9.0) < 0.005 ? "== " : "!= ");
++    }
++  }
++#endif
+   if (self.owner) {
+     self.owner->HandleResize();
+   }
+@@ -311,6 +368,11 @@
+     controller.owner = this;
+     window.rootViewController = controller;
+     [window makeKeyAndVisible];
++#if TARGET_OS_VISION
++    // After the window exists: a geometry request on a scene with no visible
++    // window is not honoured.
++    RexApplyVisionSceneGeometry(scene);
++#endif
+ 
+     ui_window_ = (__bridge_retained void*)window;
+     view_controller_ = (__bridge_retained void*)controller;

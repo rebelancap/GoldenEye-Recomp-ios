@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# LEGAL: this repository never contains game data, the XEX, or recompiled game
+# code. See CLAUDE.md "Legal posture". These rules are load-bearing, not tidy-up.
+# ---------------------------------------------------------------------------
+work/gamedata/
+work/oracle/
+assets/
+generated/
+*.xex
+*.xwb
+*.xsb
+*.xgs
+*.ipa
+*.dSYM/
+
+# Build + vendor working trees
+build/
+vendor/*/
+DerivedData/
+*.xcodeproj/
+*.xcworkspace/
+
+# OTA staging (IPAs live on the private install server, never in git)
+ota/**/*.ipa
+ota/**/manifest-*.plist
+
+# macOS / editor
+.DS_Store
+*.swp
+compile_commands.json
+.cache/
+
+# Signed IPAs and staged bundles. Build outputs; the hub is where they live.
+dist/
+
+# Instruments traces are hundreds of MB; keep locally, reference from MEASUREMENTS.md
+artifacts/traces/
+
+# Local scratch (oracle installs, toolchains, game data) -- never tracked
+work/
+
+# Personal signing identity for make-ipa.sh -- never committed
+scripts/signing.local.sh

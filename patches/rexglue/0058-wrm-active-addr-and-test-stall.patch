@@ -1,0 +1,82 @@
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -53,6 +53,17 @@
+                      "emulated GPU cannot outrun the render thread (0 = off)")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// TEST INSTRUMENT (M-072): deterministically reproduce the completion-loss
++// wedge. A real thermal/compile stall of ~0.5 s+ makes the guest's frame
++// limiter skip renders until its submit-vs-credited gap can never close (the
++// residual freeze). Setting this sleeps the CP worker ONCE for that many
++// milliseconds -- the same delivery outage, on demand. One-shot per distinct
++// nonzero value; set 0 first to re-arm the same value.
++REXCVAR_DEFINE_INT32(gpu_test_stall_ms, 0, "GPU",
++                     "TEST: sleep the CP worker once for this many ms (one-shot per distinct "
++                     "nonzero value) to provoke the guest's skip-render wedge")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+@@ -142,6 +153,13 @@
+ std::atomic<uint32_t> g_wrm_worst_ref{0};
+ std::atomic<uint32_t> g_wrm_worst_op{0};
+ std::atomic<uint32_t> g_wrm_worst_is_mem{0};
++// The physical memory address a WAIT_REG_MEM is polling RIGHT NOW (0 = no
++// blocked memory wait; 0xFFFFFFFF = blocked on a register). The watchdog's
++// semaphore release keys on this: poking the semaphore is only safe while the
++// CP is provably parked on it -- the M-072 lab showed a blind poke landing
++// during an active guest frame zeroes a freshly armed handshake and kills the
++// frame it was meant to save.
++std::atomic<uint32_t> g_wrm_active_addr{0};
+ // Offset from the preceding vblank at which each wait cleared. Clustered near
+ // zero means the vblank ISR is the writer; uniformly spread means it is not.
+ std::atomic<uint64_t> g_wrm_since_vblank_sum{0};
+@@ -186,6 +204,9 @@
+ }
+ extern "C" void RexGetWaitRegMemVblankPhase(uint64_t* mean_us, uint64_t* max_us, uint64_t* n) {
+   rex::graphics::GetWaitRegMemVblankPhase(mean_us, max_us, n);
++}
++extern "C" uint32_t RexGetWaitRegMemActiveAddr() {
++  return g_wrm_active_addr.load(std::memory_order_relaxed);
+ }
+ 
+ namespace rex::graphics {
+@@ -402,6 +423,20 @@
+       auto fn = std::move(pending_fns_.front());
+       pending_fns_.pop();
+       fn();
++    }
++
++    // M-072 test instrument: an injected delivery outage (see the cvar).
++    {
++      static int32_t s_stall_done = 0;
++      int32_t stall_want = REXCVAR_GET(gpu_test_stall_ms);
++      if (stall_want > 0 && stall_want != s_stall_done) {
++        s_stall_done = stall_want;
++        REXGPU_INFO("GETESTSTALL: CP worker sleeping {} ms (injected)", stall_want);
++        rex::thread::Sleep(std::chrono::milliseconds(stall_want));
++        REXGPU_INFO("GETESTSTALL: CP worker resumed");
++      } else if (stall_want == 0) {
++        s_stall_done = 0;  // re-armed
++      }
+     }
+ 
+     uint32_t write_ptr_index = write_ptr_index_.load();
+@@ -1360,6 +1395,8 @@
+       if (!wrm_timing_started) {
+         wrm_timing_started = true;
+         wrm_started_at = std::chrono::steady_clock::now();
++        g_wrm_active_addr.store(is_memory ? (poll_reg_addr & ~uint32_t(0x3)) : 0xFFFFFFFFu,
++                                std::memory_order_relaxed);
+       }
+       if (std::chrono::steady_clock::now() >= wait_deadline) {
+         // EXPERIMENT (M-027): rather than merely proceeding -- which walks into
+@@ -1412,6 +1449,7 @@
+     }
+   } while (!matched);
+ 
++  g_wrm_active_addr.store(0, std::memory_order_relaxed);
+   if (wrm_timing_started) {
+     const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - wrm_started_at)

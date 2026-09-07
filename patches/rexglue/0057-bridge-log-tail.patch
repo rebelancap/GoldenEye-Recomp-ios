@@ -1,0 +1,129 @@
+--- a/src/system/console_bridge.cpp
++++ b/src/system/console_bridge.cpp
+@@ -14,8 +14,10 @@
+ #include <rex/ui/settings_uikit.h>
+ #endif
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <cstring>
++#include <fstream>
+ #include <sstream>
+ #include <string>
+ #include <thread>
+@@ -93,6 +95,18 @@
+       reinterpret_cast<WrmVblankFn>(dlsym(RTLD_DEFAULT, "RexGetWaitRegMemVblankPhase"));
+   return fn;
+ }
++// The live log file, for remote diagnosis of a device nobody can plug in.
++// Lives in rexcore's logging; same dlsym treatment as everything above.
++using LogPathFn = const char* (*)();
++using LogFlushFn = void (*)();
++static LogPathFn CurrentLogPath() {
++  static auto fn = reinterpret_cast<LogPathFn>(dlsym(RTLD_DEFAULT, "RexGetCurrentLogPath"));
++  return fn;
++}
++static LogFlushFn FlushLogs() {
++  static auto fn = reinterpret_cast<LogFlushFn>(dlsym(RTLD_DEFAULT, "RexFlushLogs"));
++  return fn;
++}
+ 
+ namespace rex {
+ namespace console {
+@@ -125,6 +139,7 @@
+       "  info <name>       type, category, default and description\n"
+       "  reset <name>      restore a cvar's default\n"
+       "  edramdump <dir> [n]  dump raw pre-resolve EDRAM (+ register sidecar) at the next n resolves\n"
++      "  log [n]           last n lines (default 40) of the app's own log file\n"
+ #if REX_PLATFORM_IOS
+       "  settings [close]  open (or close) the native settings page\n"
+ #endif
+@@ -272,6 +287,46 @@
+     return out.str();
+   }
+ 
++  if (cmd == "log") {
++    // Tail of the app's own log file. This exists for the device case: when a
++    // freeze or recovery fires on a phone, the evidence lands in a file only
++    // the Files app can reach -- this makes it readable over the bridge.
++    int want = 40;
++    in >> want;
++    // 2000, up from 400: boot-time lines (the saved-layout dump above all)
++    // scrolled out of reach within minutes of play, and the whole point of
++    // logging them was reading them back over this bridge.
++    want = std::max(1, std::min(want, 2000));
++    auto* path_fn = CurrentLogPath();
++    const char* path = path_fn ? path_fn() : nullptr;
++    if (!path) return "error: no log file (logging not initialized or console-only)\n";
++    if (auto* flush_fn = FlushLogs()) flush_fn();  // push queued async lines to disk first
++    std::ifstream f(path, std::ios::binary | std::ios::ate);
++    if (!f) return std::string("error: cannot open ") + path + "\n";
++    // Read a bounded chunk off the end rather than the whole file: logs grow
++    // to tens of MB in a long session and the bridge reply is a socket write.
++    const std::streamoff size = f.tellg();
++    const std::streamoff chunk = std::min<std::streamoff>(size, 256 * 1024);
++    f.seekg(size - chunk);
++    std::string buf(size_t(chunk), '\0');
++    f.read(buf.data(), chunk);
++    buf.resize(size_t(f.gcount()));
++    size_t pos = buf.size();
++    int lines = 0;
++    while (pos > 0 && lines <= want) {
++      size_t nl = buf.rfind('\n', pos - 1);
++      if (nl == std::string::npos) { pos = 0; break; }
++      ++lines;
++      pos = nl;
++    }
++    // pos sits on the newline BEFORE the oldest wanted line (or 0).
++    std::ostringstream out;
++    out << path << " (last " << std::min(lines, want) << " lines):\n";
++    out << buf.substr(pos ? pos + 1 : 0);
++    if (buf.empty() || buf.back() != '\n') out << "\n";
++    return out.str();
++  }
++
+   if (cmd == "perf") {
+     // Every counter, named, in one shot. Which of them are actually populated
+     // is itself information: a counter reading zero during play means nothing
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -63,6 +63,8 @@
+ std::vector<LogCategoryEntry> g_registry;
+ spdlog::sink_ptr g_console_sink;
+ spdlog::sink_ptr g_file_sink;
++// Path of the live log file, for remote diagnosis (console bridge `log`).
++std::string g_log_file_path;
+ spdlog::sink_ptr g_early_sink;
+ std::vector<spdlog::sink_ptr> g_extra_sinks;
+ bool g_early_initialized = false;
+@@ -246,6 +248,7 @@
+     sink->set_level(spdlog::level::trace);
+     sink->set_pattern(config.file_pattern);
+     g_file_sink = sink;
++    g_log_file_path = resolved_path;
+   }
+ 
+   g_extra_sinks = config.extra_sinks;
+@@ -291,6 +294,22 @@
+   InitLogging(config);
+ }
+ 
++// Remote log access (console bridge `log [n]`). C linkage so the bridge can
++// dlsym them, matching how it reaches every other optional facility. The path
++// is stable after InitLogging; the flush pushes queued async lines to disk so
++// a tail taken immediately after reads current, not seconds-stale, output.
++extern "C" const char* RexGetCurrentLogPath() {
++  std::lock_guard lock(g_mutex);
++  return g_log_file_path.empty() ? nullptr : g_log_file_path.c_str();
++}
++
++extern "C" void RexFlushLogs() {
++  std::lock_guard lock(g_mutex);
++  for (auto& entry : g_registry)
++    if (entry.logger)
++      entry.logger->flush();
++}
++
+ void ShutdownLogging() {
+   std::lock_guard lock(g_mutex);
+   if (!g_initialized && !g_early_initialized)

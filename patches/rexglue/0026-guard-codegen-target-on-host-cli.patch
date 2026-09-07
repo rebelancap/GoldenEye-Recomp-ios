@@ -1,0 +1,27 @@
+--- a/resources/templates/init/rexglue_cmake.inja
++++ b/resources/templates/init/rexglue_cmake.inja
+@@ -58,11 +58,16 @@
+     include({{ entrypoint_out_dir }}/dll_targets.cmake)
+ endif()
+ 
+-# Codegen target - run 'cmake --build . --target {{ names.snake_case }}_codegen'
+-# Uses the manifest to drive codegen for all modules (entrypoint + DLLs).
+-add_custom_target({{ names.snake_case }}_codegen
+-    COMMAND $<TARGET_FILE:rex::rexglue> codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
+-    WORKING_DIRECTORY {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
+-    COMMENT "Generating recompiled code for {{ names.snake_case }}"
+-    VERBATIM
+-)
++# The codegen target needs the HOST recompiler CLI. Device builds
++# (iOS/visionOS) configure with REXGLUE_HOST_TOOLS_OFF, so rex::rexglue does not
++# exist there -- generated/ is produced by a host build beforehand.
++if(TARGET rex::rexglue)
++    # Codegen target - run 'cmake --build . --target {{ names.snake_case }}_codegen'
++    # Uses the manifest to drive codegen for all modules (entrypoint + DLLs).
++    add_custom_target({{ names.snake_case }}_codegen
++        COMMAND $<TARGET_FILE:rex::rexglue> codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
++        WORKING_DIRECTORY {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
++        COMMENT "Generating recompiled code for {{ names.snake_case }}"
++        VERBATIM
++    )
++endif()

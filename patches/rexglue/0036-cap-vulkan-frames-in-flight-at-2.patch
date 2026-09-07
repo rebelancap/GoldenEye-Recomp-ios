@@ -1,0 +1,16 @@
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -536,7 +536,12 @@
+   std::vector<VkFence> submissions_in_flight_fences_;
+   std::deque<std::pair<uint64_t, VkSemaphore>> submissions_in_flight_semaphores_;
+ 
+-  static constexpr uint32_t kMaxFramesInFlight = 3;
++  // 2, not upstream's 3: on a mobile TBDR GPU under thermal clamp, three full
++  // frames of interleaved render passes time-slice so heavily that per-frame
++  // GPU cost multiplies ~6x and throughput collapses instead of degrading
++  // (measured on device, M-054). Two frames keeps CPU/GPU overlap without
++  // that amplification.
++  static constexpr uint32_t kMaxFramesInFlight = 2;
+   bool frame_open_ = false;
+   // Tracks whether any draw in the current frame used an async placeholder
+   // graphics pipeline and may have produced incomplete output.

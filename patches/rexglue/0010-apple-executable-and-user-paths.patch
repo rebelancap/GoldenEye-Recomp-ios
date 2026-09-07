@@ -1,0 +1,61 @@
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -31,6 +31,9 @@
+ #include <pwd.h>
+ 
+ #if defined(__APPLE__)
++#include <mach-o/dyld.h>  // _NSGetExecutablePath
++#include <climits>        // PATH_MAX
++#include <vector>
+ // Darwin is large-file-native: off_t is already 64-bit and the glibc *64
+ // aliases do not exist. Map them onto the plain entry points.
+ #define off64_t off_t
+@@ -60,10 +63,30 @@
+ namespace filesystem {
+ 
+ std::filesystem::path GetExecutablePath() {
++#if defined(__APPLE__)
++  // Darwin has no /proc. _NSGetExecutablePath may hand back a non-canonical
++  // path (symlinks, "./"), and everything downstream derives the assets folder
++  // from parent_path(), so canonicalise it.
++  uint32_t size = 0;
++  _NSGetExecutablePath(nullptr, &size);  // query the required buffer length
++  std::vector<char> buffer(size + 1, '\0');
++  if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
++    return {};
++  }
++  char resolved[PATH_MAX];
++  if (realpath(buffer.data(), resolved)) {
++    return std::filesystem::path(resolved);
++  }
++  return std::filesystem::path(buffer.data());
++#else
+   char buff[FILENAME_MAX] = "";
+-  readlink("/proc/self/exe", buff, FILENAME_MAX);
+-  std::string s(buff);
+-  return s;
++  const ssize_t n = readlink("/proc/self/exe", buff, FILENAME_MAX - 1);
++  if (n <= 0) {
++    return {};
++  }
++  buff[n] = '\0';
++  return std::filesystem::path(buff);
++#endif
+ }
+ 
+ std::filesystem::path GetExecutableFolder() {
+@@ -71,6 +94,14 @@
+ }
+ 
+ std::filesystem::path GetUserFolder() {
++#if defined(__APPLE__)
++  // Apple platforms keep per-app data in ~/Library/Application Support, not in
++  // XDG directories. On iOS/visionOS the sandbox rewrites HOME to the app
++  // container, so the same expression lands inside the container there.
++  if (const char* home = std::getenv("HOME")) {
++    return std::filesystem::path(home) / "Library" / "Application Support";
++  }
++#endif
+   // get preferred data home
+   char* home = std::getenv("XDG_DATA_HOME");
+   if (home) {

@@ -1,0 +1,42 @@
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -114,8 +114,39 @@
+ }  // namespace chrono
+ }  // namespace rex
+ 
++// libc++ (Apple's C++ standard library) still reports __cpp_lib_chrono ==
++// 201611: it has not implemented the C++20 clock-conversion machinery
++// (clock_time_conversion / clock_cast) that libstdc++ provides and that the
++// specializations below extend. Supply the minimum the runtime uses. The
++// feature-test guard makes this vanish the moment libc++ ships its own.
++#if !defined(__cpp_lib_chrono) || __cpp_lib_chrono < 201907L
++#define REX_PROVIDES_CLOCK_CAST_SHIM 1
+ namespace std::chrono {
+ 
++// Primary template: intentionally empty, so an unsupported pair is a compile
++// error at the call site rather than a silently wrong conversion.
++template <class Dest, class Source>
++struct clock_time_conversion {};
++
++// Identity.
++template <class Clock>
++struct clock_time_conversion<Clock, Clock> {
++  template <class Duration>
++  time_point<Clock, Duration> operator()(const time_point<Clock, Duration>& t) const {
++    return t;
++  }
++};
++
++template <class Dest, class Source, class Duration>
++auto clock_cast(const time_point<Source, Duration>& t) {
++  return clock_time_conversion<Dest, Source>{}(t);
++}
++
++}  // namespace std::chrono
++#endif  // clock_cast shim
++
++namespace std::chrono {
++
+ template <>
+ struct clock_time_conversion<::rex::chrono::WinSystemClock, ::rex::chrono::XSystemClock> {
+   using WClock_ = ::rex::chrono::WinSystemClock;

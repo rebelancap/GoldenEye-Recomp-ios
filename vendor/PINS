@@ -1,0 +1,6 @@
+# Upstream pins. One line per vendored tree: <name> <url> <commit>
+# Bumping a pin is: edit this file, run scripts/bootstrap.sh, rebuild.
+# vendor/ trees are PRISTINE. Never hand-edit them; every local change is an
+# overlay patch under patches/<name>/.
+GoldenEye-Recomp https://github.com/SunJaycy/GoldenEye-Recomp.git fdee4d1f750aff4c3b5c6ba3d60f20281c21447d
+rexglue https://github.com/SunJaycy/GoldenEye-Recomp-rexglue.git 2824a80ecaa541084e1e1fa3e16c77b0d2f6d9e4

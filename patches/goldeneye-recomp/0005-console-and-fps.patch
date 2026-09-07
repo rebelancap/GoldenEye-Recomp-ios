@@ -1,0 +1,108 @@
+--- a/src/ge_app.h
++++ b/src/ge_app.h
+@@ -11,8 +11,12 @@
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/rex_app.h>
++#if REX_CONSOLE_BRIDGE
++#include <rex/console_bridge.h>
++#endif
+ #if REX_PLATFORM_IOS
+ #include <rex/ui/onboarding_uikit.h>
++#include <rex/ui/touch_controls.h>
+ #endif
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/user_profile.h>
+@@ -20,6 +24,7 @@
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++#include <chrono>
+ #include <functional>
+ #include <optional>
+ #include <string>
+@@ -42,6 +47,9 @@
+ // Suppress mouse-look while the pause menu is open (cursor is needed for the
+ // menu, and motion shouldn't turn into look). Implemented in ge_hooks.cpp.
+ void SetMouselookSuppressed(bool suppressed);
++// The guest's own submit/present counters, for the remote console. Implemented
++// in ge_hooks.cpp, which owns the device-struct offsets.
++void GetGpuSubmitPresentCounts(uint64_t* out_submitted, uint64_t* out_presented);
+ }
+ 
+ class GeApp : public rex::ReXApp {
+@@ -121,6 +129,36 @@
+                           [this] { TogglePauseMenu(); });
+     ge::InitMouseLook();     // start raw-mouse capture/look thread
+     ge::StartGpuWatchdog();  // arm the freeze watchdog from the first frame
++
++#if REX_PLATFORM_IOS
++    // Feed the on-screen frame-rate readout (show_fps) the guest's own counters.
++    rex::ui::SetGuestFrameCounters(&ge::GetGpuSubmitPresentCounts);
++#endif
++
++#if REX_CONSOLE_BRIDGE
++    // Remote console (see rex/console_bridge.h). Started here because the
++    // drawer exists by now, so frame stats are meaningful, and because this
++    // runs once per launch. Compiled out of public builds.
++    rex::console::Start(8773, [this]() {
++      rex::console::BridgeStats out;
++      ge::GetGpuSubmitPresentCounts(&out.submitted, &out.presented);
++      // Frame rate is derived here from the guest's present counter rather than
++      // taken from the renderer: it is the number that corresponds to what the
++      // player sees, and it stays meaningful when the two diverge.
++      out.frame_count = out.presented;
++      const auto now = std::chrono::steady_clock::now();
++      const double dt = std::chrono::duration<double>(now - console_stats_last_).count();
++      if (dt >= 0.25) {
++        const uint64_t delta = out.presented - console_stats_last_presented_;
++        console_stats_fps_ = double(delta) / dt;
++        console_stats_last_ = now;
++        console_stats_last_presented_ = out.presented;
++      }
++      out.fps = console_stats_fps_;
++      out.frame_time_ms = console_stats_fps_ > 0.0 ? 1000.0 / console_stats_fps_ : 0.0;
++      return out;
++    });
++#endif
+     postfx_ = std::make_unique<ge::PostFxOverlay>(drawer);
+     // Username/server are set in the ONLINE pause-menu tab now -- no first-boot
+     // prompt. They apply on the Save & Restart the ONLINE tab triggers.
+@@ -139,6 +177,12 @@
+   }
+ 
+  private:
++#if REX_CONSOLE_BRIDGE
++  std::chrono::steady_clock::time_point console_stats_last_ = std::chrono::steady_clock::now();
++  uint64_t console_stats_last_presented_ = 0;
++  double console_stats_fps_ = 0.0;
++#endif
++
+   // ESC handler: open or close the menu. The game keeps running underneath.
+   void TogglePauseMenu() {
+     if (menu_) {
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -1013,6 +1013,22 @@
+ // the stall is silent. Arming it at startup costs one sleeping thread and makes
+ // the diagnostics available from the first frame onward.
+ void StartGpuWatchdog() { ge_start_watchdog_once(); }
++
++// Read the guest's own frame counters -- the same words the GESTATUS line
++// reports. These live in the guest's device struct, so they describe what the
++// *game* believes about its frame pacing rather than what the host renderer is
++// doing, which is the number that matters when asking why it feels slow.
++void GetGpuSubmitPresentCounts(uint64_t* out_submitted, uint64_t* out_presented) {
++  if (out_submitted) *out_submitted = 0;
++  if (out_presented) *out_presented = 0;
++  auto* memory = rex::Runtime::instance() ? rex::Runtime::instance()->memory() : nullptr;
++  if (!memory) return;
++  uint8_t* base = memory->virtual_membase();
++  uint32_t dev = g_ge_device.load(std::memory_order_relaxed);
++  if (!base || !dev) return;
++  if (out_submitted) *out_submitted = LD32(base, dev + 16544);
++  if (out_presented) *out_presented = LD32(base, dev + 16552);
++}
+ 
+ // Start the raw-mouse + cursor-capture thread once, at app startup, so capture
+ // works regardless of whether the guest look hooks have fired yet.

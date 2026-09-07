@@ -1,0 +1,304 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -60,6 +60,8 @@
+ #include <vector>
+ #if defined(__APPLE__)
+ #include <mach-o/dyld.h>  // _NSGetExecutablePath
++#include <mach/mach.h>    // vm_read_overwrite / vm_write (fault-proof watchdog access)
++#include <mach/vm_map.h>
+ #endif
+ extern char** environ;
+ #endif
+@@ -264,7 +266,83 @@
+ std::atomic<uint32_t> g_frame_wait_cycles{0};
+ std::atomic<uint64_t> g_frame_wait_ticks{0};
+ std::atomic<uint64_t> g_frame_between_ticks{0};
++
++// M-069: fault-proof guest access for the watchdog thread ONLY. The runtime
++// protects guest pages at will (MMIO ranges, texture-cache write-watches), and
++// a raw host-thread read of a protected page cannot be resolved by the MMIO
++// exception machinery the way a guest-code access can -- it re-faults forever.
++// Profiled live: 19.2M faults, ~18M consecutive on one address, the watchdog
++// 79% of a core inside _sigtramp, and every legitimate guest write-watch fault
++// serialized behind the same MMIO-handler lock -> presents frozen. That is the
++// device hard freeze ("68.8% busy in libsystem_platform" == _sigtramp).
++// vm_read_overwrite copies in the kernel and returns an error on protected or
++// unmapped pages: no signal, no handler, no loop -- by construction.
++#if defined(__APPLE__)
++bool ge_wd_read(uint8_t* b, uint32_t ga, void* dst, size_t len) {
++  vm_size_t out = 0;
++  return vm_read_overwrite(mach_task_self(), reinterpret_cast<vm_address_t>(b + ga), len,
++                           reinterpret_cast<vm_address_t>(dst), &out) == KERN_SUCCESS &&
++         out == len;
++}
++uint32_t WD32(uint8_t* b, uint32_t ga) {
++  uint32_t v = 0;
++  if (!ge_wd_read(b, ga, &v, 4)) return 0;
++  return __builtin_bswap32(v);
++}
++uint8_t WD8(uint8_t* b, uint32_t ga) {
++  uint8_t v = 0;
++  ge_wd_read(b, ga, &v, 1);
++  return v;
++}
++bool WDST32(uint8_t* b, uint32_t ga, uint32_t val) {
++  uint32_t v = __builtin_bswap32(val);
++  if (vm_write(mach_task_self(), reinterpret_cast<vm_address_t>(b + ga),
++               reinterpret_cast<vm_offset_t>(&v), 4) == KERN_SUCCESS) {
++    return true;
++  }
++  // vm_write refuses write-watched pages (KERN_PROTECTION_FAILURE) -- but a
++  // direct store to a READABLE page faults at most once and the MMIO handler
++  // resolves it, exactly like every legitimate host-side write to watched
++  // memory. Only unreadable (PROT_NONE / MMIO) pages risk the fault loop, so
++  // probe with a read first. Without this fallback the CP-semaphore
++  // auto-recovery silently stopped working (M-070: freezes went from 1-in-15
++  // boots to 2-in-4 when the recovery poke started failing).
++  uint32_t probe;
++  if (!ge_wd_read(b, ga, &probe, 4)) {
++    return false;
++  }
++  std::memcpy(b + ga, &v, 4);
++  return true;
++}
++#else
++bool ge_wd_read(uint8_t* b, uint32_t ga, void* dst, size_t len) {
++  std::memcpy(dst, b + ga, len);
++  return true;
++}
++uint32_t WD32(uint8_t* b, uint32_t ga) { return LD32(b, ga); }
++uint8_t WD8(uint8_t* b, uint32_t ga) { return b[ga]; }
++bool WDST32(uint8_t* b, uint32_t ga, uint32_t val) {
++  ST32(b, ga, val);
++  return true;
++}
++#endif
+ 
++// Copy up to `want` bytes of guest memory, stopping at the first unreadable
++// page. Returns bytes copied.
++size_t ge_wd_read_run(uint8_t* b, uint32_t ga, void* dst, size_t want) {
++  const size_t page = size_t(getpagesize());
++  size_t got = 0;
++  while (got < want) {
++    size_t to_page = page - (reinterpret_cast<uintptr_t>(b + ga + got) & (page - 1));
++    size_t chunk = (want - got < to_page) ? want - got : to_page;
++    if (!ge_wd_read(b, ga + uint32_t(got), static_cast<uint8_t*>(dst) + got, chunk)) {
++      break;
++    }
++    got += chunk;
++  }
++  return got;
++}
++
+ void ge_watchdog_thread() {
+   // The watchdog may be armed at app startup (ge::StartGpuWatchdog), which runs
+   // during window/presenter setup -- BEFORE ConstructRuntime, so kernel_state()
+@@ -289,6 +367,10 @@
+   uint32_t stall = 0;
+   bool logged = false;
+   bool recover_fired = false;
++  // M-069: the heavy one-shot diagnostics below (guest stack scans, the
++  // lr-samplers) cost most of a core while they run. Whatever the episode
++  // logic does, never run them more than once per two minutes.
++  auto next_heavy_dump = std::chrono::steady_clock::time_point::min();
+   for (;;) {
+     std::this_thread::sleep_for(std::chrono::milliseconds(250));
+     auto* cp = ge_cp();
+@@ -299,7 +381,7 @@
+     uint32_t dbg = g_dbgnow_calls.load(std::memory_order_relaxed);
+     uint32_t dev = g_ge_device.load(std::memory_order_relaxed);
+     uint32_t idblk = g_ge_idblk.load(std::memory_order_relaxed);
+-    uint32_t submit = dev ? LD32(base, dev + 16544) : 0;
++    uint32_t submit = dev ? WD32(base, dev + 16544) : 0;
+ 
+     // DIAGNOSTIC (GoldenEye-Recomp-ios overlay): first-frame bring-up. The
+     // watchdog only speaks when its own trigger fires; print the raw state every
+@@ -308,16 +390,16 @@
+     {
+       static int tick = 0;
+       if ((tick++ % 20) == 0) {
+-        uint32_t render_gate = LD32(base, 0x8242043C);
++        uint32_t render_gate = WD32(base, 0x8242043C);
+         // The three the guest's frame limiter actually compares (offsets from
+         // upstream's own watchdog): what it has submitted, what the GPU has
+         // reported complete, and what it is waiting for.
+-        uint32_t presented = dev ? LD32(base, dev + 16552) : 0;
+-        uint32_t target = dev ? LD32(base, dev + 10908) : 0;
++        uint32_t presented = dev ? WD32(base, dev + 16552) : 0;
++        uint32_t target = dev ? WD32(base, dev + 10908) : 0;
+         // The semaphore the CP parks on (guest-virtual 0xFFC9C000 == physical
+         // 0x1FC9C000). Armed to 4 by the guest; the release writes 0. If this
+         // reads 4 forever, the guest never issues the release at all.
+-        uint32_t sem = idblk ? LD32(base, idblk) : 0;
++        uint32_t sem = idblk ? WD32(base, idblk) : 0;
+         REXKRNL_INFO(
+             "GESTATUS ring rpi={:#x} wpi={:#x} | present={} dbgnow={} | dev={:#x} idblk={:#x} "
+             "submit={} presented={} target={} sem={:#x} | render_gate(8242043C)={}",
+@@ -326,7 +408,21 @@
+     }
+     bool present_alive = (present != last_present);
+     bool ring_moved = (wpi != last_wpi) || (rpi != last_rpi);
+-    if (present_alive && !ring_moved) {
++    // M-069: only real ring progress ends an episode. The old logic reset on
++    // any sample where the present count sat still -- which flapped against
++    // the IssueSwap skip guard's ~3 Hz presents: `logged` cleared every other
++    // sample and the heavy one-shot diagnostics re-fired continuously, the
++    // profiled 68%-of-a-core watchdog spin that starved the very
++    // pipeline-creation threads the stall was waiting on.
++    if (ring_moved) {
++      stall = 0;
++      logged = false;
++      recover_fired = false;
++    } else {
++      // Ring frozen: an episode, whether or not the guest present counter
++      // still advances. (The boot-4 stall shape had BOTH frozen -- gating on
++      // present_alive left it with no dump and no recovery.)
++      (void)present_alive;
+       if (stall == 0) {
+         present_at_stall_start = present;
+         dbg_at_stall_start = dbg;
+@@ -340,22 +436,24 @@
+       // deadlock. Write 0 to release the CP: it drains the buffer, delivers the
+       // completion, the render resumes. Memory-only, no interrupt (safe).
+       if (stall >= 2 && dev && idblk && idblk < 0xFFFFFFFEu) {
+-        ST32(base, idblk, 0u);  // release the CP's WAIT_REG_MEM semaphore
++        WDST32(base, idblk, 0u);  // release the CP's WAIT_REG_MEM semaphore
+         if (!recover_fired) {
+           recover_fired = true;
+           REXKRNL_INFO("GEWATCHDOG RECOVERY: released CP semaphore (idblk={:#x} := 0)", idblk);
+         }
+       }
+-      if (stall >= 6 && !logged) {  // ~1.5s of present-but-no-ring
++      if (stall >= 6 && !logged &&
++          std::chrono::steady_clock::now() >= next_heavy_dump) {  // ~1.5s of present-but-no-ring
+         logged = true;
+-        uint32_t presented = dev ? LD32(base, dev + 16552) : 0;
+-        uint32_t target = dev ? LD32(base, dev + 10908) : 0;
++        next_heavy_dump = std::chrono::steady_clock::now() + std::chrono::seconds(120);
++        uint32_t presented = dev ? WD32(base, dev + 16552) : 0;
++        uint32_t target = dev ? WD32(base, dev + 10908) : 0;
+         // The semaphore the CP parks on (guest-virtual 0xFFC9C000 == physical
+         // 0x1FC9C000). Armed to 4 by the guest; the release writes 0. If this
+         // reads 4 forever, the guest never issues the release at all.
+-        uint32_t sem = idblk ? LD32(base, idblk) : 0;
+-        uint32_t completed = idblk ? LD32(base, idblk + 0) : 0;
+-        uint32_t skip = dev ? (base[dev + 10941] & 2) : 0;
++        uint32_t sem = idblk ? WD32(base, idblk) : 0;
++        uint32_t completed = idblk ? WD32(base, idblk + 0) : 0;
++        uint32_t skip = dev ? (WD8(base, dev + 10941) & 2) : 0;
+         REXKRNL_INFO(
+             "GEWATCHDOG STALL: ring rpi={:#x} wpi={:#x} [{}] | present#={} (+{}/stall) | "
+             "dbgnow_polls={} (+{}/stall) | submit={} completed={} target={} presented={} skipbit={} "
+@@ -371,27 +469,27 @@
+         // Render gate: frame loop runs render+present only when dword_8242043C&2
+         // (sub_8209E1C0). Set by sub_8209E1D0(mode): mode 3 at init (enabled),
+         // mode 1 = bit clear = render skipped every frame = freeze.
+-        uint32_t rg = LD32(base, 0x8242043Cu);
++        uint32_t rg = WD32(base, 0x8242043Cu);
+         REXKRNL_INFO("GEWATCHDOG -> render-gate dword_8242043C={} -> render+present {}", rg,
+                      (rg & 2u) ? "ENABLED" : "DISABLED (frame loop skips render = FREEZE)");
+         // Device flags gating the present/submit (a1 = dev). +21516 != 0 => the
+         // present SKIPS VdSwap (no screen update) and sub_821A4D50 takes its alt
+         // path; +22280&4 gates the GPU-completion wait; +10941/+10943 = skip bits.
+         if (dev) {
+-          uint32_t f21516 = LD32(base, dev + 21516u);
+-          uint32_t f22280 = LD32(base, dev + 22280u);
+-          uint32_t f22276 = LD32(base, dev + 22276u);
+-          uint32_t f21604 = LD32(base, dev + 21604u);
+-          uint32_t f21600 = LD32(base, dev + 21600u);
+-          uint32_t b10941 = base[dev + 10941u];
+-          uint32_t b10943 = base[dev + 10943u];
++          uint32_t f21516 = WD32(base, dev + 21516u);
++          uint32_t f22280 = WD32(base, dev + 22280u);
++          uint32_t f22276 = WD32(base, dev + 22276u);
++          uint32_t f21604 = WD32(base, dev + 21604u);
++          uint32_t f21600 = WD32(base, dev + 21600u);
++          uint32_t b10941 = WD8(base, dev + 10941u);
++          uint32_t b10943 = WD8(base, dev + 10943u);
+           REXKRNL_INFO(
+               "GEWATCHDOG -> devflags +21516(VdSwap-skip if !=0)={:#x} | +22280&4(gpu-wait)={} | "
+               "+22276={:#x} | +21604={} +21600={} (ring) | +10941={:#x} +10943={:#x}",
+               f21516, (f22280 & 4u), f22276, f21604, f21600, b10941, b10943);
+-          uint32_t vbl = LD32(base, dev + 16532u);   // ctx[4133] vblank count
+-          uint32_t fr = LD32(base, dev + 16684u);    // ctx[4171] fence read idx
+-          uint32_t fw = LD32(base, dev + 16688u);    // ctx[4172] fence write idx
++          uint32_t vbl = WD32(base, dev + 16532u);   // ctx[4133] vblank count
++          uint32_t fr = WD32(base, dev + 16684u);    // ctx[4171] fence read idx
++          uint32_t fw = WD32(base, dev + 16688u);    // ctx[4172] fence write idx
+           REXKRNL_INFO("GEWATCHDOG -> vblank ctx[4133]={} | GPU fences read={} write={} [{}]", vbl,
+                        fr, fw, (fr != fw ? "PENDING -- fences NOT retiring" : "drained"));
+         }
+@@ -399,10 +497,10 @@
+         // limiter (0x82189e64). Sample it twice: if FROZEN, the main thread never
+         // exits the frame-limiter (clock/timebase not advancing for it); if it
+         // ADVANCES, the main thread cycles and the render is skipped after.
+-        uint32_t fc1 = LD32(base, 0x8308851Cu);
++        uint32_t fc1 = WD32(base, 0x8308851Cu);
+         uint32_t tb1 = (uint32_t)REX_QUERY_TIMEBASE();
+         std::this_thread::sleep_for(std::chrono::milliseconds(120));
+-        uint32_t fc2 = LD32(base, 0x8308851Cu);
++        uint32_t fc2 = WD32(base, 0x8308851Cu);
+         uint32_t tb2 = (uint32_t)REX_QUERY_TIMEBASE();
+         REXKRNL_INFO(
+             "GEWATCHDOG -> frameCounter 0x8308851C {}->{} [{}] | guestTimebase {}->{} [{}]", fc1, fc2,
+@@ -435,15 +533,17 @@
+             {
+               uint32_t sp = c->r1.u32;
+               if (sp >= 0x10000u && sp < 0xC0000000u) {
+-                uint8_t* hsp = base + sp;
+-                uint8_t* send = ge_readable_end(hsp, 0x2400u);  // never read past the mapping
+-                if (send) {
++                // M-069: block-copy through the fault-proof reader, then
++                // scan the local copy -- never dereference guest pages raw.
++                static uint8_t wbuf[0x2400];
++                size_t wgot = ge_wd_read_run(base, sp, wbuf, sizeof(wbuf));
++                if (wgot >= 4) {
+                   char sbuf[500];
+                   int soff = 0;
+                   sbuf[0] = 0;
+-                  for (uint8_t* pp = hsp; pp + 4 <= send && soff < 460; pp += 4) {
++                  for (size_t off = 0; off + 4 <= wgot && soff < 460; off += 4) {
+                     uint32_t val;
+-                    std::memcpy(&val, pp, 4);
++                    std::memcpy(&val, wbuf + off, 4);
+                     val = __builtin_bswap32(val);
+                     if (val >= 0x82000000u && val < 0x84000000u) {
+                       int n = std::snprintf(sbuf + soff, sizeof(sbuf) - soff, "%x ", val);
+@@ -460,7 +560,7 @@
+               // wait is INFINITE when a1->SignalState(a1+4) != *(v3+368), v3 = *a1.
+               uint32_t bw = c->r28.u32;
+               auto sLD = [&](uint32_t ga) -> uint32_t {
+-                return (ga >= 0x1000u && ga < 0x50000000u) ? LD32(base, ga) : 0xDEADBEEFu;
++                return (ga >= 0x1000u && ga < 0x50000000u) ? WD32(base, ga) : 0xDEADBEEFu;
+               };
+               uint32_t v3 = sLD(bw);
+               uint32_t sig = sLD(bw + 4);
+@@ -522,12 +622,12 @@
+                   char fb[620];
+                   int fo = std::snprintf(fb, sizeof(fb), "lr=%x | ", pc);
+                   if (sp >= 0x10000u && sp < 0xC0000000u) {
+-                    uint8_t* hsp = base + sp;
+-                    uint8_t* send = ge_readable_end(hsp, 0x2800u);
+-                    if (send) {
+-                      for (uint8_t* pp = hsp; pp + 4 <= send && fo < 580; pp += 4) {
++                    static uint8_t fbuf[0x2800];
++                    size_t fgot = ge_wd_read_run(base, sp, fbuf, sizeof(fbuf));
++                    if (fgot >= 4) {
++                      for (size_t off = 0; off + 4 <= fgot && fo < 580; off += 4) {
+                         uint32_t v;
+-                        std::memcpy(&v, pp, 4);
++                        std::memcpy(&v, fbuf + off, 4);
+                         v = __builtin_bswap32(v);
+                         if (v >= 0x82000000u && v < 0x84000000u) {
+                           int n = std::snprintf(fb + fo, sizeof(fb) - fo, "%x ", v);
+@@ -546,10 +646,6 @@
+           }
+         }
+       }
+-    } else {
+-      stall = 0;
+-      logged = false;
+-      recover_fired = false;
+     }
+     last_wpi = wpi; last_rpi = rpi; last_present = present; last_submit = submit;
+   }

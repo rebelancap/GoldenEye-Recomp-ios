@@ -1,0 +1,37 @@
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -2394,6 +2394,34 @@
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+                                             frame_used_async_placeholder_pipeline_;
++  // M-069 guard: a pipeline whose real compilation never lands (a failed
++  // vkCreateGraphicsPipelines leaves its placeholder in place forever) makes
++  // this skip fire on every subsequent frame -- picture frozen, game still
++  // running. That is the device freeze from the first 0.1.0.35 session and
++  // this morning's macOS legal-card hang; both logs carry exactly one
++  // "Skipping Vulkan frame presentation" line at onset. Bound the episode:
++  // after ~a third of a second of consecutive skips, present anyway. A
++  // briefly wrong or missing material is strictly better than a dead screen,
++  // and it makes the culprit visible instead of invisible.
++  {
++    static uint32_t consecutive_placeholder_skips = 0;
++    if (skip_present_due_async_placeholder) {
++      if (consecutive_placeholder_skips < UINT32_MAX) {
++        ++consecutive_placeholder_skips;
++      }
++      if (consecutive_placeholder_skips == 21) {
++        REXGPU_WARN(
++            "M-069 guard: 20 consecutive frames skipped waiting on placeholder "
++            "pipelines; presenting anyway from here. If a material looks wrong "
++            "from now on, a pipeline compilation failed - check the log above.");
++      }
++      if (consecutive_placeholder_skips > 20) {
++        skip_present_due_async_placeholder = false;
++      }
++    } else {
++      consecutive_placeholder_skips = 0;
++    }
++  }
+   if (skip_present_due_async_placeholder) {
+     static bool skipped_incomplete_frame_logged = false;
+     if (!skipped_incomplete_frame_logged) {

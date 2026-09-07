@@ -1,0 +1,76 @@
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -31,6 +31,7 @@
+ #include <rex/graphics/util/draw.h>
+ #include <rex/graphics/vulkan/command_processor.h>
+ #include <rex/graphics/vulkan/deferred_command_buffer.h>
++#include <rex/graphics/gpu_dispatch_stats.h>
+ #include <rex/graphics/vulkan/render_target_cache.h>
+ #include <rex/graphics/xenos.h>
+ #include <rex/logging.h>
+@@ -1487,6 +1488,7 @@
+                 sizeof(copy_shader_constants), &copy_shader_constants);
+           }
+           command_processor_.SubmitBarriers(true);
++          CountGpuDispatch(DispatchKind::kResolveCopy);
+           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
+ 
+           // Invalidate textures and mark the range as scaled if needed.
+@@ -1546,6 +1548,7 @@
+                                             VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(depth_clear_constants), &depth_clear_constants);
+           command_processor_.SubmitBarriers(true);
++          CountGpuDispatch(DispatchKind::kResolveClearDepth);
+           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
+         }
+         if (clear_color) {
+@@ -1566,6 +1569,7 @@
+                 sizeof(color_clear_constants), &color_clear_constants);
+           }
+           command_processor_.SubmitBarriers(true);
++          CountGpuDispatch(DispatchKind::kResolveClearColor);
+           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
+         }
+         MarkEdramBufferModified();
+@@ -4853,6 +4857,7 @@
+             uint32_t(offsetof(HostDepthStoreConstants, rectangle)),
+             sizeof(host_depth_store_rectangle_constant), &host_depth_store_rectangle_constant);
+         command_processor_.SubmitBarriers(true);
++        CountGpuDispatch(DispatchKind::kHostDepthStore);
+         command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
+         MarkEdramBufferModified();
+       }
+@@ -6340,6 +6345,7 @@
+                                           sizeof(last_offsets), &last_offsets);
+       }
+       command_processor_.SubmitBarriers(true);
++      CountGpuDispatch(DispatchKind::kRenderTargetDump);
+       command_buffer.CmdVkDispatch(
+           (draw_resolution_scale_x() *
+                (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -26,6 +26,7 @@
+ #include <rex/graphics/pipeline/texture/util.h>
+ #include <rex/graphics/vulkan/command_processor.h>
+ #include <rex/graphics/vulkan/deferred_command_buffer.h>
++#include <rex/graphics/gpu_dispatch_stats.h>
+ #include <rex/graphics/vulkan/texture_cache.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -1605,6 +1606,7 @@
+                                           &load_constants.host_offset);
+       }
+       command_processor_.SubmitBarriers(true);
++      CountGpuDispatch(DispatchKind::kTextureLoad);
+       command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2]);
+       load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
+       load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
+@@ -1705,6 +1707,7 @@
+                                             &load_constants_float_convert.host_offset);
+         }
+         command_processor_.SubmitBarriers(true);
++        CountGpuDispatch(DispatchKind::kTextureLoadFloatConvert);
+         command_buffer.CmdVkDispatch(group_count_x, group_count_y,
+                                      load_constants_float_convert.size_blocks[2]);
+         load_constants_float_convert.guest_offset += level_array_slice_stride_bytes;

@@ -1,0 +1,38 @@
+--- a/src/ui/settings_uikit.mm
++++ b/src/ui/settings_uikit.mm
+@@ -344,16 +344,34 @@
+                                      cvar:@"host_msaa_downgrade"
+                                    labels:@[ @"Off (60 fps)", @"Game (4x MSAA)" ]
+                                    values:@[ @"true", @"false" ]];
++
++  // Render scale. The guest always renders 1280x720; this multiplies every
++  // render target, opaquely to the game (Xenia's integer resolution scaling).
++  // 2 is exactly the Vision Pro window's pixel count (1280x720 points at 2x),
++  // which is why it is the visionOS default and 1 is the iOS one -- the
++  // defaults live in the cvar definitions (cache.cpp), so whichever value is
++  // NOT the platform default is the one written to ge.toml, and the player's
++  // choice survives relaunch. Restart-required, exactly like the row above:
++  // render targets, the EDRAM bookkeeping and the pipeline cache are all keyed
++  // on the scale.
++  RexSettingsRow* res = [self segmentedRow:@"Resolution"
++                                      cvar:@"resolution_scale"
++                                    labels:@[ @"720p (native)", @"1440p (2x)" ]
++                                    values:@[ @"1", @"2" ]];
+ 
+   [self addSection:@"Graphics"
+             footer:@"The graphics switch is instant and works mid-game -- the same flip the "
+                    @"controller's RB shortcut does. (Flipping with RB directly can leave "
+                    @"this switch out of step until it is toggled again.)\n"
+                    @"Antialiasing off trades smooth edges for frame rate; it takes effect "
+-                   @"the next time the app is launched."
++                   @"the next time the app is launched.\n"
++                   @"Resolution 1440p renders the whole game at four times the pixels -- "
++                   @"sharper, and four times the fragment work. It also takes effect the "
++                   @"next time the app is launched."
+               rows:@[
+                 vtoggle,
+                 aa,
++                res,
+               ]];
+ 
+   // --- Controls ---

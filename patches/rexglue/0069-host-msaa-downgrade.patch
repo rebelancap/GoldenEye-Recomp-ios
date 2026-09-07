@@ -1,0 +1,444 @@
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -194,6 +194,21 @@
+                                    : msaa_2x_no_attachments_supported_;
+   }
+ 
++  // Host MSAA downgrade (cvar host_msaa_downgrade, restart-required, M-101):
++  // guest 2x/4x render targets are backed by SINGLE-SAMPLE host images, render
++  // passes and pipelines. Every EDRAM-side guest quantity - tile pitches, base
++  // tiles, resolve and ownership-transfer rectangles, sample<->pixel address
++  // math - keeps using the guest MSAA mode exactly as the guest specified it;
++  // only host image sample counts and the per-sample fetches that read those
++  // images change. The guest never learns about it. Host-render-target path
++  // only (the FSI path derives EDRAM addresses from the host sample id, so it
++  // must not be downgraded).
++  bool IsHostMsaaDowngraded() const { return msaa_downgrade_; }
++  // The host sample count backing a guest MSAA mode.
++  xenos::MsaaSamples HostMsaaSamples(xenos::MsaaSamples guest_msaa_samples) const {
++    return msaa_downgrade_ ? xenos::MsaaSamples::k1X : guest_msaa_samples;
++  }
++
+   // Returns the render pass object, or VK_NULL_HANDLE if failed to create.
+   // A render pass managed by the render target cache may be ended and resumed
+   // at any time (to allow for things like copying and texture loading).
+@@ -886,6 +901,8 @@
+ 
+   bool msaa_2x_attachments_supported_ = false;
+   bool msaa_2x_no_attachments_supported_ = false;
++  // host_msaa_downgrade, resolved once at initialization (restart-required).
++  bool msaa_downgrade_ = false;
+   bool color_16bit_transfer_uint_formats_supported_ = true;
+   bool color_32bit_transfer_uint_formats_supported_ = true;
+   bool color_rg16_draw_format_fallback_to_float_ = false;
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -50,6 +50,18 @@
+                     "Off = every resolve takes the stock dump path. Hot-reloadable, for live "
+                     "A/B over the bridge.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(host_msaa_downgrade, true, "GPU",  // default ON since 0.1.0.67 (D-020, M-101)
++                    "Antialiasing off: back the game's 2x/4x MSAA render targets with "
++                    "single-sample host images, render passes and pipelines. The guest is not "
++                    "told - every EDRAM quantity (tile pitch, base tile, resolve and ownership "
++                    "transfer rectangles, sample<->pixel addressing) still uses the guest MSAA "
++                    "mode; only the host sample count and the fetches that read host render "
++                    "target images change. Costs antialiasing (bean renders the campaign at 4x, "
++                    "M-100), buys the largest remaining fragment-side saving. Host render "
++                    "target path only. Requires an app restart; the shader/pipeline cache is "
++                    "keyed on this flag.")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ REXCVAR_DEFINE_BOOL(direct_resolve_depth, true, "GPU/Vulkan",
+                     "Include DEPTH resolves in the fused direct path (the final EDRAM stage). "
+@@ -440,6 +452,23 @@
+           "transfers require UINT transfer formats and integer sampled-image "
+           "MSAA support, and fragment shader interlock fallback is unavailable");
+       return false;
++    }
++  }
++
++  // Host MSAA downgrade - resolved once, after the path is final. The FSI path
++  // derives EDRAM addresses from the host sample id, so it can never be
++  // downgraded; only the host-render-target path can.
++  msaa_downgrade_ =
++      REXCVAR_GET(host_msaa_downgrade) && path_ == Path::kHostRenderTargets;
++  if (REXCVAR_GET(host_msaa_downgrade)) {
++    if (msaa_downgrade_) {
++      REXGPU_INFO(
++          "VulkanRenderTargetCache: host_msaa_downgrade is ON - guest MSAA render targets are "
++          "backed by single-sample host images (antialiasing off)");
++    } else {
++      REXGPU_WARN(
++          "VulkanRenderTargetCache: host_msaa_downgrade is ignored on the fragment shader "
++          "interlock path");
+     }
+   }
+ 
+@@ -2038,7 +2067,10 @@
+   }
+ 
+   VkSampleCountFlagBits samples;
+-  switch (key.msaa_samples) {
++  // The host sample count, which is 1 for every guest mode under
++  // host_msaa_downgrade. key.msaa_samples itself stays the guest mode - it is
++  // part of the render pass key and of every EDRAM address computation.
++  switch (HostMsaaSamples(key.msaa_samples)) {
+     case xenos::MsaaSamples::k1X:
+       samples = VK_SAMPLE_COUNT_1_BIT;
+       break;
+@@ -2230,6 +2262,9 @@
+   if (is_integer_out) {
+     *is_integer_out = true;
+   }
++  // The transfer format is a property of the HOST image, so it follows the
++  // host sample count (1 for every guest mode under host_msaa_downgrade).
++  msaa_samples = HostMsaaSamples(msaa_samples);
+   VkSampleCountFlagBits transfer_sample_count =
+       VkSampleCountFlagBits(uint32_t(1) << uint32_t(msaa_samples));
+   if (transfer_sample_count == VK_SAMPLE_COUNT_2_BIT && !msaa_2x_attachments_supported_) {
+@@ -2344,10 +2379,13 @@
+   image_create_info.extent.depth = 1;
+   image_create_info.mipLevels = 1;
+   image_create_info.arrayLayers = 1;
+-  if (key.msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_) {
++  // Host sample count only - the extent above is in guest pixels either way,
++  // so downgrading changes nothing about EDRAM addressing.
++  xenos::MsaaSamples host_msaa_samples = HostMsaaSamples(key.msaa_samples);
++  if (host_msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_) {
+     image_create_info.samples = VK_SAMPLE_COUNT_4_BIT;
+   } else {
+-    image_create_info.samples = VkSampleCountFlagBits(uint32_t(1) << uint32_t(key.msaa_samples));
++    image_create_info.samples = VkSampleCountFlagBits(uint32_t(1) << uint32_t(host_msaa_samples));
+   }
+   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+   image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+@@ -2549,6 +2587,15 @@
+ 
+ bool VulkanRenderTargetCache::IsHostDepthEncodingDifferent(
+     xenos::DepthRenderTargetFormat format) const {
++  if (msaa_downgrade_) {
++    // Host depth preservation is driven by the prebuilt host_depth_store_*msaa
++    // compute shaders, which declare a MULTISAMPLED source image; there is no
++    // single-sample-source variant to bind a downgraded depth image to. Report
++    // the host encoding as equivalent so no host depth source is ever attached
++    // and the store dispatch never runs: depth then round-trips through the
++    // guest's own EDRAM encoding, which is the guest's own precision.
++    return false;
++  }
+   switch (format) {
+     case xenos::DepthRenderTargetFormat::kD24S8:
+       return !depth_unorm24_vulkan_format_supported();
+@@ -2906,7 +2953,12 @@
+   // Generating SPIR-V 1.0, no need to add bindings to the entry point's
+   // interface until SPIR-V 1.4.
+   // Color source.
+-  bool source_is_multisampled = key.source_msaa_samples != xenos::MsaaSamples::k1X;
++  // Host image declarations follow the HOST sample count: under
++  // host_msaa_downgrade the source image is single-sampled even though
++  // key.source_msaa_samples (which drives all EDRAM address math below) is
++  // still the guest mode.
++  bool source_is_multisampled =
++      HostMsaaSamples(key.source_msaa_samples) != xenos::MsaaSamples::k1X;
+   spv::Id source_color_texture = spv::NoResult;
+   if (pipeline_layout_info.used_descriptor_sets & kTransferUsedDescriptorSetColorTextureBit) {
+     source_color_texture = builder.createVariable(
+@@ -2983,9 +3035,10 @@
+       kTransferUsedDescriptorSetHostDepthStencilTexturesBit) {
+     host_depth_source_texture = builder.createVariable(
+         spv::NoPrecision, spv::StorageClassUniformConstant,
+-        builder.makeImageType(type_float, spv::Dim2D, false, false,
+-                              key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X, 1,
+-                              spv::ImageFormatUnknown),
++        builder.makeImageType(
++            type_float, spv::Dim2D, false, false,
++            HostMsaaSamples(key.host_depth_source_msaa_samples) != xenos::MsaaSamples::k1X, 1,
++            spv::ImageFormatUnknown),
+         "xe_transfer_host_depth");
+     builder.addDecoration(
+         host_depth_source_texture, spv::DecorationDescriptorSet,
+@@ -3056,7 +3109,12 @@
+   main_interface.push_back(input_fragment_coord);
+   spv::Id input_sample_id = spv::NoResult;
+   spv::Id spec_const_sample_id = spv::NoResult;
+-  if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
++  // Under host_msaa_downgrade the destination render pass is single-sampled,
++  // so there is no per-sample invocation and no gl_SampleID; the fragment
++  // stands for guest sample 0 of its pixel (see the dest_sample_id load).
++  bool dest_is_host_multisampled =
++      HostMsaaSamples(key.dest_msaa_samples) != xenos::MsaaSamples::k1X;
++  if (dest_is_host_multisampled) {
+     if (device_properties.sampleRateShading) {
+       // One draw for all samples.
+       builder.addCapability(spv::CapabilitySampleRateShading);
+@@ -3138,7 +3196,12 @@
+ 
+   // Load the destination sample index.
+   spv::Id dest_sample_id = spv::NoResult;
+-  if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
++  if (key.dest_msaa_samples != xenos::MsaaSamples::k1X && !dest_is_host_multisampled) {
++    // Downgraded: one host texel per guest pixel. Every guest sample of the
++    // pixel is represented by that texel, and guest sample 0 is the
++    // representative used for all the EDRAM address math below.
++    dest_sample_id = builder.makeUintConstant(0);
++  } else if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
+     if (device_properties.sampleRateShading) {
+       assert_true(input_sample_id != spv::NoResult);
+       dest_sample_id = builder.createUnaryOp(spv::OpBitcast, type_uint,
+@@ -3513,9 +3576,11 @@
+       builder.createCompositeConstruct(type_int2, id_vector_temp),
+   };
+   spv::Id source_sample_ids_int[2] = {};
+-  if (key.source_msaa_samples != xenos::MsaaSamples::k1X) {
++  if (source_is_multisampled) {
+     source_sample_ids_int[0] = builder.createUnaryOp(spv::OpBitcast, type_int, source_sample_id);
+   } else {
++    // Single-sample host image (natively 1x, or downgraded): the pixel's one
++    // texel stands for every guest sample of that pixel.
+     source_texture_parameters.lod = builder.makeIntConstant(0);
+   }
+   // Go to the next sample or pixel along X if need to load two dwords.
+@@ -4519,7 +4584,8 @@
+             id_vector_temp.push_back(host_depth_source_pixel_y_int);
+             host_depth_source_texture_parameters.coords =
+                 builder.createCompositeConstruct(type_int2, id_vector_temp);
+-            if (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X) {
++            if (HostMsaaSamples(key.host_depth_source_msaa_samples) !=
++                xenos::MsaaSamples::k1X) {
+               host_depth_source_texture_parameters.sample =
+                   builder.createUnaryOp(spv::OpBitcast, type_int, host_depth_source_sample_id);
+             } else {
+@@ -4768,7 +4834,10 @@
+     return nullptr;
+   }
+ 
+-  uint32_t dest_sample_count = uint32_t(1) << uint32_t(key.shader_key.dest_msaa_samples);
++  // The HOST sample count of the destination attachments - the render pass the
++  // pipeline is created against uses the same value.
++  uint32_t dest_sample_count =
++      uint32_t(1) << uint32_t(HostMsaaSamples(key.shader_key.dest_msaa_samples));
+   bool dest_is_masked_sample = dest_sample_count > 1 && !device_properties.sampleRateShading;
+ 
+   VkPipelineShaderStageCreateInfo shader_stages[2];
+@@ -5526,10 +5595,10 @@
+             transfer_mode_info.pipeline_layout;
+         const TransferPipelineLayoutInfo& transfer_pipeline_layout_info =
+             kTransferPipelineLayoutInfos[size_t(transfer_pipeline_layout_index)];
+-        uint32_t transfer_sample_pipeline_count = vulkan_device->properties().sampleRateShading
+-                                                      ? 1
+-                                                      : uint32_t(1)
+-                                                            << uint32_t(dest_rt_key.msaa_samples);
++        uint32_t transfer_sample_pipeline_count =
++            vulkan_device->properties().sampleRateShading
++                ? 1
++                : uint32_t(1) << uint32_t(HostMsaaSamples(dest_rt_key.msaa_samples));
+         bool transfer_is_stencil_bit = (transfer_pipeline_layout_info.used_push_constant_dwords &
+                                         kTransferUsedPushConstantDwordStencilMaskBit) != 0;
+ 
+@@ -5923,7 +5992,14 @@
+   builder.addDecoration(edram_buffer, spv::DecorationDescriptorSet, kDumpDescriptorSetEdram);
+   builder.addDecoration(edram_buffer, spv::DecorationBinding, 0);
+   // Color or depth source.
++  // Guest MSAA mode - drives the EDRAM sample -> (pixel, sample) decomposition.
+   bool source_is_multisampled = key.msaa_samples != xenos::MsaaSamples::k1X;
++  // Host sample count - drives the image declaration and the fetch. Under
++  // host_msaa_downgrade the host image is single-sampled, so the pixel's one
++  // texel stands for every guest sample of that pixel; the decomposition above
++  // is untouched, so EDRAM addressing is bit-identical to the stock path.
++  bool source_is_host_multisampled =
++      HostMsaaSamples(key.msaa_samples) != xenos::MsaaSamples::k1X;
+   bool source_is_uint;
+   if (key.is_depth) {
+     source_is_uint = false;
+@@ -5933,8 +6009,8 @@
+   spv::Id source_component_type = source_is_uint ? type_uint : type_float;
+   spv::Id source_texture = builder.createVariable(
+       spv::NoPrecision, spv::StorageClassUniformConstant,
+-      builder.makeImageType(source_component_type, spv::Dim2D, false, false, source_is_multisampled,
+-                            1, spv::ImageFormatUnknown),
++      builder.makeImageType(source_component_type, spv::Dim2D, false, false,
++                            source_is_host_multisampled, 1, spv::ImageFormatUnknown),
+       "xe_edram_dump_source");
+   builder.addDecoration(source_texture, spv::DecorationDescriptorSet, kDumpDescriptorSetSource);
+   builder.addDecoration(source_texture, spv::DecorationBinding, 0);
+@@ -5943,7 +6019,7 @@
+   if (key.is_depth) {
+     source_stencil_texture = builder.createVariable(
+         spv::NoPrecision, spv::StorageClassUniformConstant,
+-        builder.makeImageType(type_uint, spv::Dim2D, false, false, source_is_multisampled, 1,
++        builder.makeImageType(type_uint, spv::Dim2D, false, false, source_is_host_multisampled, 1,
+                               spv::ImageFormatUnknown),
+         "xe_edram_dump_stencil");
+     builder.addDecoration(source_stencil_texture, spv::DecorationDescriptorSet,
+@@ -6133,7 +6209,7 @@
+   id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, source_pixel_x));
+   id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, source_pixel_y));
+   source_texture_parameters.coords = builder.createCompositeConstruct(type_int2, id_vector_temp);
+-  if (source_is_multisampled) {
++  if (source_is_host_multisampled) {
+     source_texture_parameters.sample =
+         builder.createUnaryOp(spv::OpBitcast, type_int, source_sample_id);
+   } else {
+@@ -6472,7 +6548,11 @@
+     direct_resolve_pipelines_.emplace(key, VK_NULL_HANDLE);
+     return VK_NULL_HANDLE;
+   }
++  // Guest MSAA mode for the EDRAM sample -> (pixel, sample) mapping; host
++  // sample count for the image declaration, the fetch and the kFull average.
+   bool source_is_multisampled = dump_key.msaa_samples != xenos::MsaaSamples::k1X;
++  bool source_is_host_multisampled =
++      HostMsaaSamples(dump_key.msaa_samples) != xenos::MsaaSamples::k1X;
+   bool full_shape = key.copy_shader == draw_util::ResolveCopyShaderIndex::kFull32bpp;
+   uint32_t pixels_per_invocation = full_shape ? 4u : 8u;
+   uint32_t pixel_base_shift = full_shape ? 2u : 3u;
+@@ -6514,7 +6594,7 @@
+   // layout's sampled-image set).
+   spv::Id source_texture = builder.createVariable(
+       spv::NoPrecision, spv::StorageClassUniformConstant,
+-      builder.makeImageType(type_float, spv::Dim2D, false, false, source_is_multisampled, 1,
++      builder.makeImageType(type_float, spv::Dim2D, false, false, source_is_host_multisampled, 1,
+                             spv::ImageFormatUnknown),
+       "xe_direct_resolve_source");
+   builder.addDecoration(source_texture, spv::DecorationDescriptorSet, 1);
+@@ -6523,7 +6603,7 @@
+   if (dump_key.is_depth) {
+     source_stencil_texture = builder.createVariable(
+         spv::NoPrecision, spv::StorageClassUniformConstant,
+-        builder.makeImageType(type_uint, spv::Dim2D, false, false, source_is_multisampled, 1,
++        builder.makeImageType(type_uint, spv::Dim2D, false, false, source_is_host_multisampled, 1,
+                               spv::ImageFormatUnknown),
+         "xe_direct_resolve_stencil");
+     builder.addDecoration(source_stencil_texture, spv::DecorationDescriptorSet, 1);
+@@ -6810,9 +6890,10 @@
+     spv::Builder::TextureParameters fetch_params = {};
+     fetch_params.sampler = builder.createLoad(source_texture, spv::NoPrecision);
+     fetch_params.coords = builder.createCompositeConstruct(type_int2, id_vector_temp);
+-    if (source_is_multisampled) {
++    if (source_is_host_multisampled) {
+       fetch_params.sample = builder.createUnaryOp(spv::OpBitcast, type_int, fetch_sample_id);
+     } else {
++      // Single-sample host image: the one texel IS the pixel's resolved value.
+       fetch_params.lod = builder.makeIntConstant(0);
+     }
+     spv::Id texel_vec4 = builder.createTextureCall(spv::NoPrecision, type_float4, false, true,
+@@ -6822,7 +6903,9 @@
+     // (the fast class and the plain path select one -- the census delta that
+     // caught this). Fetch the remaining samples and average; order is
+     // permutation-invariant so guest->Vulkan sample remaps don't matter.
+-    if (full_shape && source_is_multisampled) {
++    // kFull averages every sample of the pixel; with a single-sample host image
++    // the pixel has exactly one sample, so the fetched texel is the average.
++    if (full_shape && source_is_host_multisampled) {
+       uint32_t sample_count = dump_key.msaa_samples >= xenos::MsaaSamples::k4X ? 4u : 2u;
+       spv::Id acc = spv::NoResult;
+       for (uint32_t si = 0; si < sample_count; ++si) {
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -59,6 +59,7 @@
+ // so the persistent shader/pipeline storage must be keyed on it (the storage
+ // headers below fold it in, invalidating the cache when the flag flips).
+ REXCVAR_DECLARE(bool, texture_flat_lod);
++REXCVAR_DECLARE(bool, host_msaa_downgrade);
+ 
+ REXCVAR_DEFINE_INT32(
+     vulkan_pipeline_creation_threads, -1, "GPU/Vulkan",
+@@ -504,8 +505,11 @@
+   const uint32_t pipeline_storage_magic = 0x53504558;
+   // Bit 0: render-target path. Bit 1: texture_flat_lod - translation
+   // output depends on it, so a flip must invalidate the stored pipelines.
++  // Bit 2: host_msaa_downgrade - stored pipelines carry the host sample count
++  // of the run that created them, so a flip must invalidate them.
+   const uint32_t pipeline_storage_magic_api = (edram_fragment_shader_interlock ? 1u : 0u) |
+-                                              (REXCVAR_GET(texture_flat_lod) ? 2u : 0u);
++                                              (REXCVAR_GET(texture_flat_lod) ? 2u : 0u) |
++                                              (REXCVAR_GET(host_msaa_downgrade) ? 4u : 0u);
+   const uint32_t pipeline_storage_version_swapped = rex::byte_swap(
+       std::max(PipelineDescription::kVersion, SpirvShaderTranslator::Modification::kVersion));
+   struct {
+@@ -598,7 +602,8 @@
+   // Fold translation-affecting flags into the version so a flip rebuilds the
+   // storage instead of replaying translations made under the other setting.
+   const uint32_t shader_storage_version =
+-      ShaderStoredHeader::kVersion ^ (REXCVAR_GET(texture_flat_lod) ? 0x40000000u : 0u);
++      ShaderStoredHeader::kVersion ^ (REXCVAR_GET(texture_flat_lod) ? 0x40000000u : 0u) ^
++      (REXCVAR_GET(host_msaa_downgrade) ? 0x20000000u : 0u);
+   if (fread(&shader_storage_file_header, sizeof(shader_storage_file_header), 1,
+             shader_storage_file_) &&
+       shader_storage_file_header.magic == shader_storage_magic &&
+@@ -3438,6 +3443,12 @@
+     // Keep parity with D3D12 host-render-target path, where draws without
+     // color/depth attachments must run at 1x sample count.
+     multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++  } else if (!edram_fragment_shader_interlock && render_target_cache_.IsHostMsaaDowngraded()) {
++    // host_msaa_downgrade: the host render targets and their render pass are
++    // single-sampled, so the pipeline must rasterize at 1x to match. The guest
++    // MSAA mode in the render pass key is untouched - it still selects EDRAM
++    // tile geometry everywhere else.
++    multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+   } else if (description.render_pass_key.msaa_samples == xenos::MsaaSamples::k2X &&
+              !render_target_cache_.IsMsaa2xSupported(subpass_has_attachments)) {
+     // Using sample 0 as 0 and 3 as 1 for 2x instead (not exactly the same
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3481,8 +3481,11 @@
+         }
+       }
+     }
++    // The HOST sample count (1 for every guest mode under
++    // host_msaa_downgrade) - the census exists to report what the GPU runs.
+     const uint32_t samples =
+-        uint32_t(1) << uint32_t(render_target_cache_->last_update_render_pass_key().msaa_samples);
++        uint32_t(1) << uint32_t(render_target_cache_->HostMsaaSamples(
++            render_target_cache_->last_update_render_pass_key().msaa_samples));
+     CensusBeginPass(0, framebuffer->host_extent.width, framebuffer->host_extent.height, samples,
+                     color_count, rt_keys, vk_formats, pitch_tiles);
+   }
+@@ -6517,8 +6520,13 @@
+   if (draw_util::IsPrimitiveLine(regs)) {
+     flags |= SpirvShaderTranslator::kSysFlag_PrimitiveLine;
+   }
+-  // MSAA sample count.
+-  flags |= uint32_t(rb_surface_info.msaa_samples)
++  // MSAA sample count. In the host render target path this flag only feeds
++  // HOST-side per-sample logic in the translated pixel shader (alpha to
++  // coverage's sample mask, and the memexport preferred-sample choice), so
++  // under host_msaa_downgrade it must report the host count - the pipelines
++  // rasterize at 1x and gl_SampleID is always 0. EDRAM addressing never reads
++  // this flag outside the FSI path, which is never downgraded.
++  flags |= uint32_t(render_target_cache_->HostMsaaSamples(rb_surface_info.msaa_samples))
+            << SpirvShaderTranslator::kSysFlag_MsaaSamples_Shift;
+   // Depth format.
+   if (rb_depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
+--- a/src/ui/settings_uikit.mm
++++ b/src/ui/settings_uikit.mm
+@@ -333,15 +333,28 @@
+     pulse((uint16_t)CvarDouble(@"ge_graphics_toggle_mask"), 250);
+   };
+ 
++  // Antialiasing: the game renders the campaign into 4x MSAA render targets
++  // (M-100), which is the largest remaining fragment-side cost. Turning it off
++  // backs those targets with single-sample host images -- the game is not told,
++  // so nothing else about the frame changes. Restart-required, exactly like
++  // the flat-LOD row's cvar: the shader/pipeline cache is keyed on it.
++  RexSettingsRow* aa = [self segmentedRow:@"Antialiasing"
++                                     cvar:@"host_msaa_downgrade"
++                                   labels:@[ @"Off (60 fps)", @"Game (4x MSAA)" ]
++                                   values:@[ @"true", @"false" ]];
++
+   [self addSection:@"Graphics"
+             footer:@"The graphics switch is instant and works mid-game -- the same flip the "
+                    @"controller's RB shortcut does. (Flipping with RB directly can leave "
+                    @"this switch out of step until it is toggled again.)\n"
+                    @"Distance filtering is off by default: it sharpens distant surfaces but "
+-                   @"draws dark seams on character faces (a known bug, M-056)."
++                   @"draws dark seams on character faces (a known bug, M-056).\n"
++                   @"Antialiasing off trades smooth edges for frame rate; it takes effect "
++                   @"the next time the app is launched."
+               rows:@[
+                 vtoggle,
+                 mip,
++                aa,
+               ]];
+ 
+   // --- Controls ---

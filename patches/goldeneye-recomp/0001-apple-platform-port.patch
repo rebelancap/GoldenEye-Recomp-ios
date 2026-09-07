@@ -1,0 +1,235 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -7,6 +7,15 @@
+ cmake_minimum_required(VERSION 3.25)
+ project(ge LANGUAGES CXX)
+ 
++# The SDK's Apple host backend (window/surface/app context, and the process
++# entry point rexglue_setup_target adds to this target) is Objective-C++.
++# enable_language must happen in the top-level project, not the subdirectory.
++if(APPLE)
++    enable_language(OBJCXX)
++    set(CMAKE_OBJCXX_STANDARD 23)
++    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
++endif()
++
+ set(CMAKE_CXX_STANDARD 23)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -25,6 +25,7 @@
+ #include <rex/system/xthread.h>
+ #include <rex/system/kernel_state.h>
+ #include <cstdio>
++#if defined(_WIN32)
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+ #endif
+@@ -33,14 +34,70 @@
+ #endif
+ #include <windows.h>
+ #include <shellapi.h>  // ShellExecuteW (WIN32_LEAN_AND_MEAN excludes it)
++#else
++#include <spawn.h>      // posix_spawn
++#include <sys/mman.h>   // mincore
++#include <unistd.h>
++#include <vector>
++#if defined(__APPLE__)
++#include <mach-o/dyld.h>  // _NSGetExecutablePath
++#endif
++extern char** environ;
++#endif
+ #include <string>
+ 
++namespace {
++// The watchdog walks guest stacks defensively: it needs to know how far it can
++// read from a host pointer before hitting an unmapped page. Windows answers with
++// VirtualQuery; POSIX answers with mincore, which returns ENOMEM precisely when
++// a page in the range is unmapped. Returns the end of the readable run (capped
++// at p + want), or nullptr if p itself is not readable.
++#if !defined(_WIN32)
++bool ge_page_mapped(const void* addr) {
++  const size_t page = size_t(getpagesize());
++  void* aligned =
++      reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & ~uintptr_t(page - 1));
++  char resident = 0;
++  return mincore(aligned, page, &resident) == 0;
++}
++#endif
++
++uint8_t* ge_readable_end(uint8_t* p, size_t want) {
++#if defined(_WIN32)
++  MEMORY_BASIC_INFORMATION mbi;
++  if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT ||
++      (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
++                      PAGE_EXECUTE_READWRITE)) == 0) {
++    return nullptr;
++  }
++  uint8_t* region_end = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
++  uint8_t* want_end = p + want;
++  return want_end < region_end ? want_end : region_end;
++#else
++  const size_t page = size_t(getpagesize());
++  if (!ge_page_mapped(p)) {
++    return nullptr;
++  }
++  uint8_t* want_end = p + want;
++  uint8_t* q = reinterpret_cast<uint8_t*>(
++      (reinterpret_cast<uintptr_t>(p) & ~uintptr_t(page - 1)) + page);
++  for (; q < want_end; q += page) {
++    if (!ge_page_mapped(q)) {
++      return q;  // first unmapped page bounds the run
++    }
++  }
++  return want_end;
++#endif
++}
++}  // namespace
++
+ namespace ge {
+ // Relaunch this same executable as a fresh, detached process. Used by the ONLINE
+ // pause-menu tab's "Save & Restart": the new instance reads the just-written
+ // ge.toml (new username / server / online-enable) at boot, then the caller tears
+ // the current process down. Launching a second instance of a running exe is fine
+ // on Windows -- the image file is opened share-read.
++#if defined(_WIN32)
+ void LaunchSelfDetached() {
+   wchar_t exe_path[MAX_PATH];
+   DWORD n = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+@@ -54,6 +111,40 @@
+   ShellExecuteW(nullptr, L"open", exe_path, nullptr,
+                 workdir.empty() ? nullptr : workdir.c_str(), SW_SHOWNORMAL);
+ }
++#else
++// POSIX/Apple: resolve our own image path and posix_spawn a detached copy.
++// _NSGetExecutablePath may return a non-canonical path (symlinks, "./"), so it
++// is passed through realpath before exec.
++void LaunchSelfDetached() {
++  std::string exe_path;
++#if defined(__APPLE__)
++  uint32_t size = 0;
++  _NSGetExecutablePath(nullptr, &size);      // query the required length
++  std::vector<char> buf(size + 1, '\0');
++  if (_NSGetExecutablePath(buf.data(), &size) != 0) {
++    REXKRNL_INFO("GE LaunchSelfDetached: could not resolve the executable path");
++    return;
++  }
++  char resolved[PATH_MAX];
++  exe_path = realpath(buf.data(), resolved) ? resolved : buf.data();
++#else
++  char resolved[PATH_MAX];
++  ssize_t n = readlink("/proc/self/exe", resolved, sizeof(resolved) - 1);
++  if (n <= 0) {
++    REXKRNL_INFO("GE LaunchSelfDetached: could not resolve the executable path");
++    return;
++  }
++  resolved[n] = '\0';
++  exe_path = resolved;
++#endif
++  char* argv[] = {const_cast<char*>(exe_path.c_str()), nullptr};
++  pid_t pid = 0;
++  const int rc = posix_spawn(&pid, exe_path.c_str(), nullptr, nullptr, argv, environ);
++  if (rc != 0) {
++    REXKRNL_INFO("GE LaunchSelfDetached: posix_spawn failed ({})", rc);
++  }
++}
++#endif
+ }  // namespace ge
+ 
+ // Probe to read CommandProcessor's protected ring read pointer (legal: a
+@@ -258,14 +349,8 @@
+               uint32_t sp = c->r1.u32;
+               if (sp >= 0x10000u && sp < 0xC0000000u) {
+                 uint8_t* hsp = base + sp;
+-                MEMORY_BASIC_INFORMATION mbi;
+-                if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+-                    mbi.State == MEM_COMMIT &&
+-                    (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+-                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) {
+-                  uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+-                  uint8_t* send = hsp + 0x2400u;
+-                  if (send > rend) send = rend;  // never read past the committed page
++                uint8_t* send = ge_readable_end(hsp, 0x2400u);  // never read past the mapping
++                if (send) {
+                   char sbuf[500];
+                   int soff = 0;
+                   sbuf[0] = 0;
+@@ -351,12 +436,8 @@
+                   int fo = std::snprintf(fb, sizeof(fb), "lr=%x | ", pc);
+                   if (sp >= 0x10000u && sp < 0xC0000000u) {
+                     uint8_t* hsp = base + sp;
+-                    MEMORY_BASIC_INFORMATION mbi;
+-                    if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+-                        mbi.State == MEM_COMMIT) {
+-                      uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+-                      uint8_t* send = hsp + 0x2800u;
+-                      if (send > rend) send = rend;
++                    uint8_t* send = ge_readable_end(hsp, 0x2800u);
++                    if (send) {
+                       for (uint8_t* pp = hsp; pp + 4 <= send && fo < 580; pp += 4) {
+                         uint32_t v;
+                         std::memcpy(&v, pp, 4);
+@@ -712,13 +793,16 @@
+ std::atomic<bool> g_rebind_capturing{false};
+ 
+ // Cursor-capture state (touched from the mouse thread + SetMouselookSuppressed).
++#if defined(_WIN32)
+ HWND g_game_hwnd = nullptr;
+ HCURSOR g_arrow_cursor = nullptr;
+ HCURSOR g_blank_cursor = nullptr;
+ bool g_captured = false;
++#endif
+ 
+ bool ge_mouselook_on() { return REXCVAR_GET(ge_mouselook_enable); }
+ 
++#if defined(_WIN32)
+ bool ge_game_has_focus() {
+   HWND fg = GetForegroundWindow();
+   if (!fg) return false;
+@@ -851,6 +935,27 @@
+   }
+ }
+ 
++#else
++// ---------------------------------------------------------------------------
++// Apple / POSIX: raw mouse-look and cursor capture are not wired up.
++//
++// This is deliberate, not an oversight. The Win32 implementation above is a
++// desktop-only mechanism (a hidden message-only window receiving WM_INPUT, plus
++// class-cursor swapping and ClipCursor). This port is controller-first by
++// charter, with touch and gyro as the mobile look channels; when those land they
++// feed the SAME pipeline as the mouse hook -- ge_take_mouse_dx/dy below -- so
++// nothing downstream needs to change. See CLAUDE.md Phase 1 "Input".
++//
++// The state atomics still exist and SetMouselookSuppressed still works, so the
++// pause-menu bookkeeping stays consistent on every platform.
++// ---------------------------------------------------------------------------
++bool ge_game_has_focus() { return true; }
++bool ge_mouse_active() {
++  return ge_mouselook_on() && !g_mouselook_suppressed.load(std::memory_order_relaxed);
++}
++void ge_update_mouse_capture() {}
++void ge_start_mouse_once() {}
++#endif
+ int ge_take_mouse_dx() { return g_mouse_dx.exchange(0, std::memory_order_relaxed); }
+ int ge_take_mouse_dy() { return g_mouse_dy.exchange(0, std::memory_order_relaxed); }
+ }  // namespace
+@@ -1133,9 +1238,17 @@
+     while (!one.empty() && (one.back() == ' ' || one.back() == '\t')) one.pop_back();
+     if (!one.empty()) {
+       rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(one);
++#if defined(_WIN32)
+       if (vk != rex::ui::VirtualKey::kNone &&
+           (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0)
+         return true;
++#else
++      // No global keyboard polling off Windows: GetAsyncKeyState has no
++      // portable equivalent, and this port drives binds from the gamepad and
++      // the touch overlay. The bind strings are still parsed so the settings
++      // round-trip unchanged.
++      (void)vk;
++#endif
+     }
+     if (comma == std::string::npos) break;
+     start = comma + 1;

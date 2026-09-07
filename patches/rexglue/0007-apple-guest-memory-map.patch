@@ -1,0 +1,124 @@
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -209,8 +209,42 @@
+ }  // namespace
+ #endif  // REX_PLATFORM_LINUX
+ 
++#if defined(__APPLE__)
++// Apple Silicon (macOS, iOS and visionOS alike) uses a 16 KB host page. The
++// guest's memory model is the Xbox 360's, whose smallest heaps are 4 KB-paged,
++// so mprotect/mmap get 4 KB-aligned addresses and lengths and reject them with
++// EINVAL. Round the request out to the enclosing host pages.
++//
++// CONSEQUENCE, and it is not free: host protection becomes 16 KB-granular. Four
++// adjacent 4 KB guest pages share one host page, so protecting one of them
++// protects all four. Guest-visible protection state stays exact -- BaseHeap's
++// page_table_ is the authority for anything the guest queries -- but anything
++// that depends on the HOST enforcing 4 KB precision is now coarser:
++//   * GPU write-watch (graphics/shared_memory.cpp) will see false invalidations
++//     from writes to neighbouring guest pages. A perf cost, not a correctness
++//     one -- it re-uploads data that did not change.
++//   * A 4 KB guard page cannot be isolated; its 16 KB host page may stay
++//     accessible because a neighbour is committed.
++// See docs/memory-math.md. Revisit if either shows up in a Phase 3 measurement.
++static inline void ClampToHostPages(void*& base_address, size_t& length) {
++  if (!base_address) {
++    return;
++  }
++  const uintptr_t page = uintptr_t(page_size());
++  const uintptr_t addr = reinterpret_cast<uintptr_t>(base_address);
++  const uintptr_t begin = addr & ~(page - 1);
++  const uintptr_t end = (addr + length + page - 1) & ~(page - 1);
++  base_address = reinterpret_cast<void*>(begin);
++  length = size_t(end - begin);
++}
++#endif
++
+ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,
+                  PageAccess access) {
++#if defined(__APPLE__)
++  void* const requested_address = base_address;
++  ClampToHostPages(base_address, length);
++#endif
+   // Emulates Windows VirtualAlloc behavior:
+   // - Reserve: create PROT_NONE mapping to hold address space
+   // - Commit on existing reservation: mprotect to enable access (EEXIST path)
+@@ -230,6 +264,28 @@
+       break;
+   }
+ 
++#if defined(__APPLE__)
++  // Darwin has no MAP_FIXED_NOREPLACE, and plain MAP_FIXED would SILENTLY
++  // replace whatever is already there. That is catastrophic here: Memory::
++  // MapViews() pre-maps the whole guest address space as MAP_SHARED views of
++  // one shm object, deliberately aliasing 0xA0000000 / 0xC0000000 / 0xE0000000
++  // / 0x100000000 onto the same physical pages. Dropping a fresh
++  // MAP_PRIVATE|MAP_ANONYMOUS mapping over a commit would break that aliasing
++  // and quietly corrupt the CPU<->GPU shared-memory model.
++  //
++  // So reproduce the Linux EEXIST path's semantics: if the range is already
++  // mapped, this is a commit-on-existing-reservation and mprotect is the whole
++  // operation. mprotect returns ENOMEM when any page in the range is unmapped,
++  // which makes it both the test and the action. Only a genuinely unmapped
++  // fixed range falls through to mmap().
++  if (base_address) {
++    if (mprotect(base_address, length, prot_initial) == 0) {
++      // Hand back the address the caller asked for, not the host-page floor.
++      return requested_address;
++    }
++  }
++#endif
++
+   // Build flags - always use MAP_FIXED_NOREPLACE for fixed addresses
+   int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+ #if defined(MAP_FIXED_NOREPLACE)
+@@ -306,6 +362,9 @@
+ #endif
+ 
+   uint32_t prot = ToPosixProtectFlags(access);
++#if defined(__APPLE__)
++  ClampToHostPages(base_address, length);  // 16 KB host pages -- see AllocFixed
++#endif
+   return mprotect(base_address, length, prot) == 0;
+ }
+ 
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -145,6 +145,29 @@
+   // Attempt to create our views. This may fail at the first address
+   // we pick, so try a few times.
+   mapping_base_ = 0;
++#if REX_PLATFORM_MAC
++  // Probing 1<<32 .. 1<<63 does not work on Darwin: most of those bases are
++  // already claimed (1<<32 is past __PAGEZERO where the main image lands;
++  // 1<<33 / 1<<36..1<<38 are dyld's shared-cache regions -> EACCES; 1<<47 is
++  // beyond the 47-bit user VA limit -> ENOMEM). Ask the kernel for one
++  // contiguous PROT_NONE reservation of the whole 4 GB + 512 MB instead, then
++  // drop the shared views into it with MAP_FIXED. Measured working; the
++  // aliasing the views depend on survives (verified: writes through
++  // 0xA0000000 are visible at 0xC0000000).
++  {
++    void* reservation = rex::memory::AllocFixed(nullptr, size_t(0x11FFFFFFFull),
++                                                rex::memory::AllocationType::kReserve,
++                                                rex::memory::PageAccess::kNoAccess);
++    if (reservation) {
++      auto mapping_base = reinterpret_cast<uint8_t*>(reservation);
++      if (!MapViews(mapping_base)) {
++        mapping_base_ = mapping_base;
++      } else {
++        REXSYS_ERROR("Guest views failed to map into the reserved range at {}", reservation);
++      }
++    }
++  }
++#else
+   for (size_t n = 32; n < 64; n++) {
+     auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
+     if (!MapViews(mapping_base)) {
+@@ -152,6 +175,7 @@
+       break;
+     }
+   }
++#endif
+   if (!mapping_base_) {
+     REXSYS_ERROR("Unable to find a continuous block in the 64bit address space.");
+     assert_always();

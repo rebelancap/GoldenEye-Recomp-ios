@@ -1,0 +1,187 @@
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -49,6 +49,19 @@
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++#if defined(__APPLE__)
++// os_proc_available_memory() -- the only number on iOS/visionOS that predicts
++// jetsam (patch 0083, M-108). It is declared unavailable on macOS (there is no
++// per-process limit there), so it is gated on TARGET_OS_IPHONE, which covers
++// iOS and visionOS. sysctl hw.memsize is logged alongside it purely as
++// context and works everywhere.
++#include <TargetConditionals.h>
++#include <sys/sysctl.h>
++#if TARGET_OS_IPHONE
++#include <os/proc.h>
++#endif
++#endif
++
+ // Legacy backend compatibility aliases for shared readback controls.
+ REXCVAR_DEFINE_BOOL(ge_edram_alias_clip, false, "GPU",
+                     "M-100 experiment: clip every draw's scissor to the rows of its render "
+@@ -1171,44 +1184,103 @@
+         "emulator, reducing to {}x{}",
+         draw_resolution_scale_x, draw_resolution_scale_y);
+   }
+-  // Memory guard for scaled rendering (D-025 / M-105). MoltenVK has no sparse
+-  // buffer residency, so the scaled-resolve buffer is COMMITTED in full --
++  // Host memory probe (D-025 / M-105 / M-108). Three different numbers get
++  // called "available memory" on an Apple platform and only one of them is the
++  // one that kills the process:
++  //
++  //  * os_proc_available_memory() -- the bytes THIS process may still allocate
++  //    before jetsam kills it. On iOS/visionOS that is the real ceiling. It
++  //    returns 0 on macOS, where there is no per-process limit.
++  //  * VK_EXT_memory_budget's heapBudget -- what MoltenVK reports. It is NOT
++  //    the jetsam limit: on Apple platforms MoltenVK derives it from physical
++  //    RAM (two thirds of it), so a 16 GB headset reports ~10.9 GB while the
++  //    app may only be allowed ~2-3 GB. Believing it is exactly how
++  //    resolution_scale=3 (a 4608 MB scaled-resolve buffer) passed the 0080
++  //    guard and got the app jetsammed 150 ms into GPU init, leaving a player
++  //    with an app that no longer launches and no way back to the settings
++  //    page (M-108). The 0080 comment claiming otherwise was wrong.
++  //  * physical RAM -- context for reading a log, never a budget.
++  //
++  // Log all three every boot (the headset's real number is only knowable from
++  // the device) and guard against the SMALLER of the first two.
++  uint64_t proc_available_bytes = 0;
++  uint64_t physical_bytes = 0;
++#if defined(__APPLE__)
++#if TARGET_OS_IPHONE
++  proc_available_bytes = uint64_t(os_proc_available_memory());
++#endif
++  {
++    uint64_t memsize = 0;
++    size_t memsize_len = sizeof(memsize);
++    if (sysctlbyname("hw.memsize", &memsize, &memsize_len, nullptr, 0) == 0) {
++      physical_bytes = memsize;
++    }
++  }
++#endif
++  VkDeviceSize device_local_budget = 0;
++  const bool have_physical_device_properties2 =
++      vulkan_device->vulkan_instance()->extensions().ext_1_1_KHR_get_physical_device_properties2;
++  if (vulkan_device->extensions().ext_EXT_memory_budget && have_physical_device_properties2) {
++    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_properties = {};
++    budget_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
++    VkPhysicalDeviceMemoryProperties2 memory_properties2 = {};
++    memory_properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
++    memory_properties2.pNext = &budget_properties;
++    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceMemoryProperties2(
++        vulkan_device->physical_device(), &memory_properties2);
++    const VkPhysicalDeviceMemoryProperties& mp = memory_properties2.memoryProperties;
++    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
++      if (!(mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
++        continue;
++      }
++      device_local_budget =
++          std::max(device_local_budget, budget_properties.heapBudget[mp.memoryTypes[i].heapIndex]);
++    }
++  }
++  // A buffer larger than maxBufferSize fails creation however much memory is
++  // free, so it is a hard ceiling on the scaled-resolve buffer independent of
++  // the budget. VK_KHR_maintenance4 carries it; the device wrapper tracks the
++  // extension but not this property, so query it directly.
++  uint64_t max_buffer_size = 0;
++  if (vulkan_device->extensions().ext_1_3_KHR_maintenance4 && have_physical_device_properties2) {
++    VkPhysicalDeviceMaintenance4Properties maintenance4_properties = {};
++    maintenance4_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES;
++    VkPhysicalDeviceProperties2 physical_device_properties2 = {};
++    physical_device_properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
++    physical_device_properties2.pNext = &maintenance4_properties;
++    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties2(
++        vulkan_device->physical_device(), &physical_device_properties2);
++    max_buffer_size = uint64_t(maintenance4_properties.maxBufferSize);
++  }
++  REXGPU_INFO(
++      "memory: os_proc_available_memory={} MB, vk device-local budget={} MB, physical={} MB, "
++      "vk maxBufferSize={} MB (0 = not reported on this platform)",
++      proc_available_bytes >> 20, uint64_t(device_local_budget) >> 20, physical_bytes >> 20,
++      max_buffer_size >> 20);
++
++  // Memory guard for scaled rendering. MoltenVK has no sparse buffer
++  // residency, so the scaled-resolve buffer is COMMITTED in full --
+   // 512 MB * scale^2, i.e. 2 GB at 2x and 4.5 GB at 3x. Measured on the macOS
+   // bench, the process footprint went 2.0 GB (1x) -> 4.0 GB (2x) -> 7.0 GB
+   // (3x). A phone or headset that cannot afford that must not die at GPU init
+   // over a setting: InitializeScaledResolveBuffer would fail and take the
+-  // whole boot with it, leaving a player who chose 1440p with an app that no
+-  // longer launches and no way back to the settings page. Clamp here instead.
+-  //
+-  // The budget comes from VK_EXT_memory_budget, which on Apple platforms
+-  // MoltenVK derives from the process's own available memory -- the number
+-  // jetsam actually enforces -- rather than from the heap size, which on a
+-  // unified-memory device is just the machine's RAM.
++  // whole boot with it. Clamp here instead.
+   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
+-    VkDeviceSize device_local_budget = 0;
+-    if (vulkan_device->extensions().ext_EXT_memory_budget &&
+-        vulkan_device->vulkan_instance()->extensions().ext_1_1_KHR_get_physical_device_properties2) {
+-      VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_properties = {};
+-      budget_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+-      VkPhysicalDeviceMemoryProperties2 memory_properties2 = {};
+-      memory_properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+-      memory_properties2.pNext = &budget_properties;
+-      vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceMemoryProperties2(
+-          vulkan_device->physical_device(), &memory_properties2);
+-      const VkPhysicalDeviceMemoryProperties& mp = memory_properties2.memoryProperties;
+-      for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+-        if (!(mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+-          continue;
+-        }
+-        device_local_budget =
+-            std::max(device_local_budget, budget_properties.heapBudget[mp.memoryTypes[i].heapIndex]);
+-      }
++    uint64_t budget_bytes = uint64_t(device_local_budget);
++    const char* budget_source = "vk device-local budget";
++    if (proc_available_bytes && (!budget_bytes || proc_available_bytes < budget_bytes)) {
++      budget_bytes = proc_available_bytes;
++      budget_source = "os_proc_available_memory";
+     }
+-    if (device_local_budget) {
+-      // Half the budget is the ceiling for this one buffer: the guest's own
+-      // 512 MB shared-memory buffer, every render target, every host texture
+-      // and the swapchain all come out of the same budget.
+-      const uint64_t allowance = uint64_t(device_local_budget) / 2;
++    // Half the budget is the ceiling for this one buffer: the guest's own
++    // 512 MB shared-memory buffer, every render target, every host texture
++    // and the swapchain all come out of the same budget.
++    uint64_t allowance = budget_bytes / 2;
++    if (max_buffer_size && (!allowance || max_buffer_size < allowance)) {
++      allowance = max_buffer_size;
++      budget_source = "vk maxBufferSize";
++    }
++    if (allowance) {
+       uint32_t clamped_x = draw_resolution_scale_x;
+       uint32_t clamped_y = draw_resolution_scale_y;
+       while ((clamped_x > 1 || clamped_y > 1) &&
+@@ -1222,22 +1294,22 @@
+       }
+       if (clamped_x != draw_resolution_scale_x || clamped_y != draw_resolution_scale_y) {
+         REXGPU_WARN(
+-            "Draw resolution scale {}x{} needs a {} MB scaled-resolve buffer but only {} MB of "
+-            "the {} MB device-local budget may go to it -- rendering at {}x{} instead",
++            "Draw resolution scale {}x{} needs a {} MB scaled-resolve buffer but only {} MB may "
++            "go to it ({}) -- rendering at {}x{} instead",
+             draw_resolution_scale_x, draw_resolution_scale_y,
+             (uint64_t(SharedMemory::kBufferSize) * draw_resolution_scale_x *
+              draw_resolution_scale_y) >> 20,
+-            allowance >> 20, uint64_t(device_local_budget) >> 20, clamped_x, clamped_y);
++            allowance >> 20, budget_source, clamped_x, clamped_y);
+         draw_resolution_scale_x = clamped_x;
+         draw_resolution_scale_y = clamped_y;
+       } else {
+         REXGPU_INFO(
+-            "Draw resolution scale {}x{}: {} MB scaled-resolve buffer against a {} MB "
+-            "device-local budget",
++            "Draw resolution scale {}x{}: {} MB scaled-resolve buffer against a {} MB allowance "
++            "({})",
+             draw_resolution_scale_x, draw_resolution_scale_y,
+             (uint64_t(SharedMemory::kBufferSize) * draw_resolution_scale_x *
+              draw_resolution_scale_y) >> 20,
+-            uint64_t(device_local_budget) >> 20);
++            allowance >> 20, budget_source);
+       }
+     } else {
+       REXGPU_WARN(

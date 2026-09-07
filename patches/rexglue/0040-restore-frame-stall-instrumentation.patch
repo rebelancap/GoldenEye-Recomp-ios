@@ -1,0 +1,292 @@
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -20,6 +20,7 @@
+ #include <vector>
+ 
+ #include <rex/assert.h>
++#include <rex/ui/vulkan/presenter_timings.h>
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -57,7 +58,52 @@
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
+                     "Allow FIFO relaxed present mode");
++
++namespace rex {
++namespace ui {
++namespace vulkan {
++
++namespace {
++
++// Presenter timing. The round-5 question was whether the per-frame stall was
++// our own work or the display pipeline handing back a drawable on its own
++// schedule; acquire and present are exactly where that distinction shows up.
++// The answer turned out to be neither (M-054: one drawable wait in 41.7 s), and
++// these stay because a presenter that starts blocking again must be visible
++// immediately rather than re-argued from scratch.
++//
++// Relaxed atomics: written once per frame on the paint thread, read from the
++// console thread, and a torn read costs a stale microsecond.
++std::atomic<uint64_t> g_acquire_us{0};
++std::atomic<uint64_t> g_present_us{0};
++std::atomic<uint64_t> g_acquire_max_us{0};
++std::atomic<uint64_t> g_present_max_us{0};
++
++inline uint64_t NowMicros() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++
++}  // namespace
++
++void GetPresenterTimings(uint64_t* acquire_us, uint64_t* present_us, uint64_t* acquire_max_us,
++                         uint64_t* present_max_us) {
++  if (acquire_us) *acquire_us = g_acquire_us.load(std::memory_order_relaxed);
++  if (present_us) *present_us = g_present_us.load(std::memory_order_relaxed);
++  if (acquire_max_us) *acquire_max_us = g_acquire_max_us.exchange(0, std::memory_order_relaxed);
++  if (present_max_us) *present_max_us = g_present_max_us.exchange(0, std::memory_order_relaxed);
++}
+ 
++}  // namespace vulkan
++}  // namespace ui
++}  // namespace rex
++
++extern "C" void RexGetPresenterTimings(uint64_t* acquire_us, uint64_t* present_us,
++                                       uint64_t* acquire_max_us, uint64_t* present_max_us) {
++  rex::ui::vulkan::GetPresenterTimings(acquire_us, present_us, acquire_max_us, present_max_us);
++}
++
+ namespace rex {
+ namespace ui {
+ namespace vulkan {
+@@ -1556,9 +1602,17 @@
+ 
+   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
+   uint32_t swapchain_image_index;
++  const uint64_t acquire_started_us = NowMicros();
+   VkResult acquire_result =
+       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
+                                 VK_NULL_HANDLE, &swapchain_image_index);
++  {
++    const uint64_t elapsed = NowMicros() - acquire_started_us;
++    g_acquire_us.store(elapsed, std::memory_order_relaxed);
++    if (elapsed > g_acquire_max_us.load(std::memory_order_relaxed)) {
++      g_acquire_max_us.store(elapsed, std::memory_order_relaxed);
++    }
++  }
+   switch (acquire_result) {
+     case VK_SUCCESS:
+     case VK_SUBOPTIMAL_KHR:
+@@ -2227,7 +2281,13 @@
+   {
+     const VulkanDevice::Queue::Acquisition queue_acquisition =
+         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
++    const uint64_t present_started_us = NowMicros();
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
++    const uint64_t elapsed = NowMicros() - present_started_us;
++    g_present_us.store(elapsed, std::memory_order_relaxed);
++    if (elapsed > g_present_max_us.load(std::memory_order_relaxed)) {
++      g_present_max_us.store(elapsed, std::memory_order_relaxed);
++    }
+   }
+   switch (present_result) {
+     case VK_SUCCESS:
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -424,9 +424,23 @@
+   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
+                                          rex::countof(args));
+   rex::gpu_recovery::ExitGpuIsr();
++}
++
++// Microseconds (steady clock) of the most recent vblank. Read by the command
++// processor to time WAIT_REG_MEM completions against the vblank phase: if the
++// stalling semaphore is released by the vblank ISR, waits end at a small,
++// tightly clustered offset from one. They do -- 0.01-0.19 ms (M-052).
++std::atomic<uint64_t> g_last_vblank_us{0};
++
++uint64_t LastVblankMicros() {
++  return g_last_vblank_us.load(std::memory_order_relaxed);
+ }
+ 
+ void GraphicsSystem::MarkVblank() {
++  g_last_vblank_us.store(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                                      std::chrono::steady_clock::now().time_since_epoch())
++                                      .count()),
++                         std::memory_order_relaxed);
+   // TODO: Enable profiling once ported
+   // SCOPE_profile_cpu_f("gpu");
+ 
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -44,6 +44,9 @@
+ 
+ namespace rex::graphics {
+ 
++// Steady-clock microseconds of the most recent vblank; 0 before the first.
++uint64_t LastVblankMicros();
++
+ class CommandProcessor;
+ 
+ class GraphicsSystem : public system::IGraphicsSystem {
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -22,6 +22,7 @@
+ #include <rex/perf/counter.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/graphics/command_processor.h>
++#include <rex/graphics/graphics_system.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+@@ -109,8 +110,69 @@
+     }                                     \
+   } while (0)
+ 
++namespace {
++// WAIT_REG_MEM accounting. This packet is where the emulated GPU waits on a
++// value someone else must write, and it is the whole of the frame's stall
++// (M-051): one blocking wait per frame, released by the guest's vblank ISR, so
++// every frame costs a whole number of 16.67 ms periods (M-052).
++std::atomic<uint64_t> g_wrm_waits{0};
++std::atomic<uint64_t> g_wrm_us{0};
++std::atomic<uint64_t> g_wrm_max_us{0};
++// The address of the longest-blocking wait, and what it wanted -- identifying
++// the writer was the whole question.
++std::atomic<uint32_t> g_wrm_worst_addr{0};
++std::atomic<uint32_t> g_wrm_worst_ref{0};
++std::atomic<uint32_t> g_wrm_worst_op{0};
++std::atomic<uint32_t> g_wrm_worst_is_mem{0};
++// Offset from the preceding vblank at which each wait cleared. Clustered near
++// zero means the vblank ISR is the writer; uniformly spread means it is not.
++std::atomic<uint64_t> g_wrm_since_vblank_sum{0};
++std::atomic<uint64_t> g_wrm_since_vblank_n{0};
++std::atomic<uint64_t> g_wrm_since_vblank_max{0};
++}  // namespace
++
+ namespace rex::graphics {
+ 
++void GetWaitRegMemVblankPhase(uint64_t* mean_us, uint64_t* max_us, uint64_t* n) {
++  const uint64_t count = g_wrm_since_vblank_n.exchange(0, std::memory_order_relaxed);
++  const uint64_t sum = g_wrm_since_vblank_sum.exchange(0, std::memory_order_relaxed);
++  if (n) *n = count;
++  if (mean_us) *mean_us = count ? sum / count : 0;
++  if (max_us) *max_us = g_wrm_since_vblank_max.exchange(0, std::memory_order_relaxed);
++}
++
++void GetWaitRegMemWorst(uint32_t* addr, uint32_t* ref, uint32_t* op, uint32_t* is_memory) {
++  if (addr) *addr = g_wrm_worst_addr.load(std::memory_order_relaxed);
++  if (ref) *ref = g_wrm_worst_ref.load(std::memory_order_relaxed);
++  if (op) *op = g_wrm_worst_op.load(std::memory_order_relaxed);
++  if (is_memory) *is_memory = g_wrm_worst_is_mem.load(std::memory_order_relaxed);
++}
++
++void GetWaitRegMemStats(uint64_t* waits, uint64_t* total_us, uint64_t* max_us) {
++  // exchange: the console reports the interval since it last looked.
++  if (waits) *waits = g_wrm_waits.exchange(0, std::memory_order_relaxed);
++  if (total_us) *total_us = g_wrm_us.exchange(0, std::memory_order_relaxed);
++  if (max_us) *max_us = g_wrm_max_us.exchange(0, std::memory_order_relaxed);
++}
++
++}  // namespace rex::graphics
++
++// Unmangled aliases; see rex/ui/vulkan/presenter_timings.h for why the console
++// bridge reaches these by name rather than by linking rexgraphics.
++extern "C" void RexGetWaitRegMemStats(uint64_t* waits, uint64_t* total_us, uint64_t* max_us) {
++  rex::graphics::GetWaitRegMemStats(waits, total_us, max_us);
++}
++extern "C" void RexGetWaitRegMemWorst(uint32_t* addr, uint32_t* ref, uint32_t* op,
++                                      uint32_t* is_memory) {
++  rex::graphics::GetWaitRegMemWorst(addr, ref, op, is_memory);
++}
++extern "C" void RexGetWaitRegMemVblankPhase(uint64_t* mean_us, uint64_t* max_us, uint64_t* n) {
++  rex::graphics::GetWaitRegMemVblankPhase(mean_us, max_us, n);
++}
++
++namespace rex::graphics {
++
++
+ using namespace rex::graphics::xenos;
+ 
+ namespace {
+@@ -1195,6 +1257,11 @@
+       std::chrono::steady_clock::now() +
+       std::chrono::milliseconds(uint32_t(REXCVAR_GET(gpu_wait_reg_mem_timeout_ms)));
+ 
++  // Only counted once the packet actually blocks: a WAIT_REG_MEM satisfied on
++  // its first read costs nothing and would swamp the average.
++  bool wrm_timing_started = false;
++  std::chrono::steady_clock::time_point wrm_started_at{};
++
+   {
+     static std::atomic<uint64_t> n{0};
+     const uint64_t i = n.fetch_add(1) + 1;
+@@ -1260,6 +1327,10 @@
+           graphics_system_->DispatchInterruptCallback(1, 2);
+         }
+       }
++      if (!wrm_timing_started) {
++        wrm_timing_started = true;
++        wrm_started_at = std::chrono::steady_clock::now();
++      }
+       if (std::chrono::steady_clock::now() >= wait_deadline) {
+         // EXPERIMENT (M-027): rather than merely proceeding -- which walks into
+         // a chain link that is not valid yet and silently ends the IB chain --
+@@ -1309,6 +1380,36 @@
+     }
+   } while (!matched);
+ 
++  if (wrm_timing_started) {
++    const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                                     std::chrono::steady_clock::now() - wrm_started_at)
++                                     .count());
++    g_wrm_waits.fetch_add(1, std::memory_order_relaxed);
++    g_wrm_us.fetch_add(us, std::memory_order_relaxed);
++    uint64_t prev = g_wrm_max_us.load(std::memory_order_relaxed);
++    const bool is_worst = us > prev;
++    while (us > prev && !g_wrm_max_us.compare_exchange_weak(prev, us, std::memory_order_relaxed)) {
++    }
++    const uint64_t vb = LastVblankMicros();
++    if (vb) {
++      const uint64_t now_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                                           std::chrono::steady_clock::now().time_since_epoch())
++                                           .count());
++      const uint64_t since = now_us - vb;
++      g_wrm_since_vblank_sum.fetch_add(since, std::memory_order_relaxed);
++      g_wrm_since_vblank_n.fetch_add(1, std::memory_order_relaxed);
++      uint64_t pm = g_wrm_since_vblank_max.load(std::memory_order_relaxed);
++      while (since > pm &&
++             !g_wrm_since_vblank_max.compare_exchange_weak(pm, since, std::memory_order_relaxed)) {
++      }
++    }
++    if (is_worst) {
++      g_wrm_worst_addr.store(poll_reg_addr, std::memory_order_relaxed);
++      g_wrm_worst_ref.store(ref, std::memory_order_relaxed);
++      g_wrm_worst_op.store(wait_info & 0x7, std::memory_order_relaxed);
++      g_wrm_worst_is_mem.store(is_memory ? 1u : 0u, std::memory_order_relaxed);
++    }
++  }
+   return true;
+ }
+ 
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -36,6 +36,16 @@
+ }  // namespace rex::stream
+ 
+ namespace rex::graphics {
++
++// WAIT_REG_MEM totals since the previous call (which clears them): how many of
++// these packets actually blocked, for how long in total, and the worst one.
++void GetWaitRegMemStats(uint64_t* waits, uint64_t* total_us, uint64_t* max_us);
++// What the longest-blocking WAIT_REG_MEM was polling, so the writer can be
++// identified rather than guessed at.
++void GetWaitRegMemWorst(uint32_t* addr, uint32_t* ref, uint32_t* op, uint32_t* is_memory);
++// Mean/max microseconds between the preceding vblank and a WAIT_REG_MEM
++// clearing. Near zero and tight => the vblank ISR releases the semaphore.
++void GetWaitRegMemVblankPhase(uint64_t* mean_us, uint64_t* max_us, uint64_t* n);
+ 
+ class GraphicsSystem;
+ class Shader;

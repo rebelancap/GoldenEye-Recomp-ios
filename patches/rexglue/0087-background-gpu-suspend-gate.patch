@@ -1,0 +1,525 @@
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -163,6 +163,15 @@
+   };
+ 
+   void WorkerThreadMain();
++
++  // Host GPU suspend gate (GoldenEye-Recomp-ios overlay -- not upstream).
++  // Called on the GPU worker when the app is going to the background, BEFORE it
++  // parks: the backend must close any open submission and wait out every
++  // outstanding fence, so that when the UI thread's bounded wait returns,
++  // nothing of ours is in flight on a GPU the OS is about to take away. The
++  // default does nothing (backends with no host submissions of their own).
++  virtual void QuiesceForHostSuspend() {}
++
+   virtual bool SetupContext() = 0;
+   virtual void ShutdownContext() = 0;
+ 
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -422,6 +422,11 @@
+   // clearing and stopping capturing. Returns whether the submission was done
+   // successfully, if it has failed, leaves it open.
+   bool EndSubmission(bool is_swap);
++  // Host GPU suspend gate (GoldenEye-Recomp-ios overlay -- not upstream).
++  // Close the open submission and wait every outstanding fence out before the
++  // app goes to the background. See rex/host_suspend.h.
++  void QuiesceForHostSuspend() override;
++
+   bool AwaitAllQueueOperationsCompletion() {
+     CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
+     return !submission_open_ && submissions_in_flight_fences_.empty();
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -11,6 +11,10 @@
+     exception_handler.cpp
+     filesystem.cpp
+     filesystem_wildcard.cpp
++    # Host GPU suspend gate (GoldenEye-Recomp-ios overlay): iOS/visionOS take
++    # the GPU away from a backgrounded app, and the runtime's only reaction to
++    # that is FatalError. See rex/host_suspend.h.
++    host_suspend.cpp
+     logging.cpp
+     memory.cpp
+     mutex.cpp
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -22,6 +22,7 @@
+ #include <rex/perf/counter.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/graphics/command_processor.h>
++#include <rex/host_suspend.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/graphics_system.h>
+@@ -423,6 +424,24 @@
+       auto fn = std::move(pending_fns_.front());
+       pending_fns_.pop();
+       fn();
++    }
++
++    // Host GPU suspend gate (GoldenEye-Recomp-ios overlay -- not upstream).
++    // On iOS/visionOS the OS revokes GPU access from a backgrounded process:
++    // Metal fails the command buffer, MoltenVK reports VK_ERROR_DEVICE_LOST on
++    // the next fence wait, and OnHostGpuLossFromAnyThread aborts the app. Every
++    // Digital Crown press on the Vision Pro died exactly there (M-111). So park
++    // the worker here instead -- the top of the loop, with no packet half
++    // executed -- after QuiesceForHostSuspend() has drained the host GPU. This
++    // is a condition variable, not a spin: a 30 s background must cost nothing.
++    // Nothing else in the loop needs to know; the guest keeps running and its
++    // ring simply fills up, exactly as it does during a long pipeline compile.
++    if (rex::host_suspend::IsRequested()) {
++      rex::host_suspend::GateWait(
++          [](void* ctx) { static_cast<CommandProcessor*>(ctx)->QuiesceForHostSuspend(); }, this);
++      // Re-check the loop condition rather than falling through with stale
++      // indices: a shutdown can have been requested while we were parked.
++      continue;
+     }
+ 
+     // M-072 test instrument: an injected delivery outage (see the cvar).
+@@ -458,10 +477,13 @@
+         rex::thread::MaybeYield();
+         loop_count++;
+         write_ptr_index = write_ptr_index_.load();
+-      } while (worker_running_ && pending_fns_.empty() &&
++        // A suspend request must break the stall spin too, or the worker sits
++        // here at 5 ms granularity for the whole background instead of parking
++        // (and never acks, so the resign handler's bounded wait times out).
++      } while (worker_running_ && pending_fns_.empty() && !rex::host_suspend::IsRequested() &&
+                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
+-      if (!worker_running_ || !pending_fns_.empty()) {
++      if (!worker_running_ || !pending_fns_.empty() || rex::host_suspend::IsRequested()) {
+         continue;
+       }
+     }
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -25,6 +25,7 @@
+ #include <rex/graphics/flags.h>
+ #include <rex/kernel/xboxkrnl/video.h>
+ #include <rex/logging.h>
++#include <rex/host_suspend.h>
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xthread.h>
+@@ -499,6 +500,21 @@
+   // in this case there's no user who needs uninterrupted gameplay, or somehow
+   // protect it with a mutex so any thread can be considered a UI thread and
+   // reset).
++  // Host GPU suspend gate backstop (GoldenEye-Recomp-ios overlay -- not
++  // upstream). On iOS/visionOS the OS revokes GPU access from a backgrounded
++  // process; MoltenVK reports that as VK_ERROR_DEVICE_LOST and every path that
++  // sees one lands here, which is rex::FatalError, which is abort(). Three
++  // Vision Pro crash reports, one per Digital Crown press, all on the "GPU
++  // Commands" thread (M-111). The submission and present paths classify this
++  // themselves now; this is the last line, for any path that does not. The
++  // reported flag is cleared again so a genuine loss later still aborts.
++  if (rex::host_suspend::IsSuspendedOrResuming()) {
++    REXGPU_WARN(
++        "HOSTSUSPEND: host GPU loss reported while suspended/resuming -- the app is in the "
++        "background and the OS has the GPU; NOT treating this as fatal");
++    host_gpu_loss_reported_.clear(std::memory_order_relaxed);
++    return;
++  }
+   if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
+     return;
+   }
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -40,6 +40,7 @@
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/gpu_dispatch_stats.h>
++#include <rex/host_suspend.h>
+ #include <rex/graphics/vulkan/command_processor.h>
+ #include <rex/graphics/vulkan/pipeline_cache.h>
+ #include <rex/graphics/vulkan/render_target_cache.h>
+@@ -2931,6 +2932,13 @@
+     return;
+   }
+ 
++  // Host GPU suspend gate (M-111): the app is backgrounded, there is no screen
++  // to present to and the OS has the GPU. Return quietly -- this is not a
++  // failed present, it is a present that must not be attempted.
++  if (rex::host_suspend::IsRequested()) {
++    return;
++  }
++
+   // In case the swap command is the only one in the frame.
+   if (!BeginSubmission(true)) {
+     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
+@@ -4338,6 +4346,17 @@
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  // Host GPU suspend gate (M-111). A suspend request lands asynchronously, so
++  // it can arrive in the middle of a primary buffer -- between the request and
++  // the worker reaching the gate a handful of draws still come through here.
++  // Drop them quietly: "true" means the packet was consumed, which it was, and
++  // nobody is looking at the frame. Without this early return the drops go
++  // through BeginSubmission's gate and are logged as backend failures, which is
++  // a lie -- the first bench suspend produced four [error] lines per cycle.
++  if (rex::host_suspend::IsRequested()) {
++    return true;
++  }
++
+   const RegisterFile& regs = *register_file_;
+   (void)index_buffer_info;
+   auto draw_fail = [&](const char* stage) {
+@@ -5200,6 +5219,13 @@
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  // Host GPU suspend gate (M-111), same reasoning as IssueDraw: consume the
++  // resolve quietly rather than report a backend failure for a frame nobody
++  // will see.
++  if (rex::host_suspend::IsRequested()) {
++    return true;
++  }
++
+   if (!BeginSubmission(true)) {
+     return false;
+   }
+@@ -5786,6 +5812,23 @@
+   }
+ }
+ 
++// Host GPU suspend gate (GoldenEye-Recomp-ios overlay -- not upstream).
++// Runs on the GPU worker, from the gate at the top of WorkerThreadMain, while
++// the UI thread waits (bounded) for the ack. Close whatever is open and wait
++// every fence out, so the app enters the background with an idle host GPU. If
++// the device is already lost there is nothing to drain and nothing to wait for.
++void VulkanCommandProcessor::QuiesceForHostSuspend() {
++  if (device_lost_) {
++    return;
++  }
++  if (submission_open_) {
++    EndSubmission(false);
++  }
++  const bool drained = AwaitAllQueueOperationsCompletion();
++  REXGPU_INFO("HOSTSUSPEND: Vulkan CP quiesced (drained={}, submission {} completed {})", drained,
++              GetCurrentSubmission(), submission_completed_);
++}
++
+ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
+   // Only report once, no need to retry a wait that won't succeed anyway.
+   if (device_lost_) {
+@@ -5821,7 +5864,19 @@
+     } else {
+       REXGPU_ERROR("Failed to await submission completion Vulkan fences");
+       if (wait_result == VK_ERROR_DEVICE_LOST) {
+-        device_lost_ = true;
++        // The suspend gate's whole reason for existing (M-111): while the app
++        // is backgrounded, or in the grace window right after it comes back,
++        // a device loss is the OS having taken the GPU away and given it back
++        // -- not a lost device. Latching device_lost_ here is what turned a
++        // Digital Crown press into a FatalError. Leave it clear and let the
++        // caller retry; a genuine loss outside the window still latches.
++        if (rex::host_suspend::IsSuspendedOrResuming()) {
++          REXGPU_WARN(
++              "HOSTSUSPEND: fence wait reported device loss while suspended/resuming -- "
++              "treating as a background GPU revocation, not a lost device");
++        } else {
++          device_lost_ = true;
++        }
+       }
+     }
+   }
+@@ -5833,7 +5888,14 @@
+         dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited], VK_TRUE, 0);
+     if (fence_status != VK_SUCCESS) {
+       if (fence_status == VK_ERROR_DEVICE_LOST) {
+-        device_lost_ = true;
++        // Same classification as the blocking wait above (M-111).
++        if (rex::host_suspend::IsSuspendedOrResuming()) {
++          REXGPU_WARN(
++              "HOSTSUSPEND: fence poll reported device loss while suspended/resuming -- "
++              "treating as a background GPU revocation, not a lost device");
++        } else {
++          device_lost_ = true;
++        }
+       }
+       break;
+     }
+@@ -5940,6 +6002,18 @@
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
+   if (device_lost_) {
++    return false;
++  }
++
++  // Host GPU suspend gate (GoldenEye-Recomp-ios overlay -- not upstream). The
++  // worker parks between primary buffers, but a suspend can land in the middle
++  // of one -- and the crash stack was exactly that: IssueDraw -> BeginSubmission
++  // -> a fence wait against a GPU the OS had already taken back (M-111). This is
++  // the belt to that brace: while suspended, no submission is opened at all.
++  // Returning false is the same "cannot submit right now" every caller already
++  // handles (the frame-queue-depth path returns it routinely); the draws it
++  // drops are draws for a screen nobody is looking at.
++  if (rex::host_suspend::IsRequested()) {
+     return false;
+   }
+ 
+@@ -6285,9 +6359,19 @@
+     if (submit_result != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
+       if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_) {
+-        device_lost_ = true;
+-        if (graphics_system_) {
+-          graphics_system_->OnHostGpuLossFromAnyThread(true);
++        // M-111: a queue submit that fails while the app is backgrounded (or
++        // in the resume grace window) is the OS revoking GPU access, not a
++        // lost device. Do not latch, and above all do not report the loss --
++        // OnHostGpuLossFromAnyThread is rex::FatalError.
++        if (rex::host_suspend::IsSuspendedOrResuming()) {
++          REXGPU_WARN(
++              "HOSTSUSPEND: queue submit reported device loss while suspended/resuming -- "
++              "dropping the submission instead of reporting host GPU loss");
++        } else {
++          device_lost_ = true;
++          if (graphics_system_) {
++            graphics_system_->OnHostGpuLossFromAnyThread(true);
++          }
+         }
+       }
+       return false;
+--- a/src/system/console_bridge.cpp
++++ b/src/system/console_bridge.cpp
+@@ -77,8 +77,37 @@
+ using GpuPassStatsFn = void (*)(uint64_t*, uint64_t*, uint64_t*);
+ static GpuPassStatsFn GpuPassStats() {
+   static auto fn = reinterpret_cast<GpuPassStatsFn>(dlsym(RTLD_DEFAULT, "RexGetGpuPassStats"));
++  return fn;
++}
++// The host GPU suspend gate (rex/host_suspend.h, M-111). iOS and visionOS
++// revoke GPU access from a backgrounded app and the runtime used to abort on
++// it; the gate stops submitting and presenting instead. The headset press
++// cannot be scripted, but the gate it flips can: `suspend` and `resume` drive
++// exactly the same entry points the UIKit lifecycle observers call, which is
++// how the mechanism is exercised on the macOS bench.
++using HostSuspendVoidFn = void (*)(void);
++using HostSuspendQueryFn = int (*)(void);
++static HostSuspendVoidFn HostSuspendRequest() {
++  static auto fn =
++      reinterpret_cast<HostSuspendVoidFn>(dlsym(RTLD_DEFAULT, "RexHostGpuSuspendRequest"));
++  return fn;
++}
++static HostSuspendVoidFn HostSuspendRelease() {
++  static auto fn =
++      reinterpret_cast<HostSuspendVoidFn>(dlsym(RTLD_DEFAULT, "RexHostGpuSuspendRelease"));
+   return fn;
+ }
++using HostSuspendAckFn = int (*)(unsigned);
++static HostSuspendAckFn HostSuspendWaitForAck() {
++  static auto fn =
++      reinterpret_cast<HostSuspendAckFn>(dlsym(RTLD_DEFAULT, "RexHostGpuWaitForSuspendAck"));
++  return fn;
++}
++static HostSuspendQueryFn HostSuspendIsSuspended() {
++  static auto fn =
++      reinterpret_cast<HostSuspendQueryFn>(dlsym(RTLD_DEFAULT, "RexHostGpuIsSuspended"));
++  return fn;
++}
+ // The per-pass census (M-099's follow-up): Metal System Trace can time the ~25
+ // render encoders of a Dam frame but cannot say which guest render target each
+ // one is. The engine renders the table itself -- see command_processor.cpp --
+@@ -170,6 +199,8 @@
+       "  edramdump <dir> [n]  dump raw pre-resolve EDRAM (+ register sidecar) at the next n resolves\n"
+       "  passes            one-frame render-pass census: every guest pass named by render target\n"
+       "  log [n]           last n lines (default 40) of the app's own log file\n"
++      "  suspend           gate the host GPU off, as backgrounding the app does\n"
++      "  resume            let it run again (see M-111)\n"
+ #if REX_PLATFORM_IOS
+       "  settings [close]  open (or close) the native settings page\n"
+ #endif
+@@ -251,6 +282,13 @@
+     // Pipelines compiled this session: the hitch suspect. Climbing while the
+     // game hitches = compile-bound (expected on the first session after any
+     // binary update); flat while hitching = look elsewhere.
++    // Loud in `stat` because a suspended GPU looks exactly like a hung one:
++    // frames, submitted and presented all frozen.
++    if (auto* suspended_fn = HostSuspendIsSuspended()) {
++      if (suspended_fn()) {
++        out << " [HOST GPU SUSPENDED]";
++      }
++    }
+     if (auto* pso_fn = PipelinesCreated()) {
+       out << " pso=" << pso_fn();
+     }
+@@ -325,6 +363,30 @@
+     return out.str();
+   }
+ 
++  if (cmd == "suspend" || cmd == "resume") {
++    const bool want_suspend = (cmd == "suspend");
++    auto* fn = want_suspend ? HostSuspendRequest() : HostSuspendRelease();
++    auto* query = HostSuspendIsSuspended();
++    if (!fn) {
++      return "error: host suspend gate not linked into this build\n";
++    }
++    fn();
++    std::ostringstream out;
++    out << "host GPU " << (want_suspend ? "suspended" : "resumed");
++    // Same bounded wait the resign-active handler does, so the bench sees the
++    // real thing: the worker drained and parked, not merely a flag flipped.
++    if (want_suspend) {
++      if (auto* ack = HostSuspendWaitForAck()) {
++        out << (ack(500) ? " (GPU worker parked)" : " (worker did NOT park within 500 ms)");
++      }
++    }
++    if (query) {
++      out << " (gate=" << (query() ? "set" : "clear") << ")";
++    }
++    out << "\n";
++    return out.str();
++  }
++
+   if (cmd == "log") {
+     // Tail of the app's own log file. This exists for the device case: when a
+     // freeze or recovery fires on a phone, the evidence lands in a file only
+@@ -559,7 +621,7 @@
+ 
+ namespace {
+ 
+-// A client that hangs up mid-reply (`log 2000 | head`, a dropped network link)
++// A client that hangs up mid-reply (`log 2000 | head`, a dropped network link)
+ // must never take the game with it. Without this, the next ::send into the
+ // closed socket raised SIGPIPE and iOS killed the process with signal 13 --
+ // 0.1.0.59 died exactly that way on the user's phone (2026-09-04) while the
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
++#include <rex/host_suspend.h>
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/ui/presenter.h>
+@@ -1511,7 +1512,27 @@
+ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
+   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
+   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
++  // Host GPU suspend gate (GoldenEye-Recomp-ios overlay -- not upstream). Both
++  // present drivers -- the UI thread and the guest output thread -- funnel
++  // through here, so this one check stops every acquire, every submit and every
++  // vkQueuePresentKHR while the app is backgrounded. Acquiring a swapchain
++  // image the compositor has taken back is the other half of the M-111 crash:
++  // vkAcquireNextImageKHR returning VK_ERROR_DEVICE_LOST becomes
++  // kGpuLostResponsible, which calls the loss callback, which is FatalError.
++  if (rex::host_suspend::IsRequested()) {
++    return PaintResult::kNotPresented;
++  }
+   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
++  // A loss reported inside the suspend/resume window is the OS handing the
++  // surface back, not a dead device: demote it to "the connection is outdated",
++  // which is the path that already recreates the swapchain on the next paint.
++  if ((result == PaintResult::kGpuLostResponsible || result == PaintResult::kGpuLostExternally) &&
++      rex::host_suspend::IsSuspendedOrResuming()) {
++    REXLOG_WARN(
++        "HOSTSUSPEND: presenter reported GPU loss while suspended/resuming -- recreating the "
++        "swapchain instead of reporting host GPU loss");
++    result = PaintResult::kNotPresentedConnectionOutdated;
++  }
+   switch (result) {
+     case PaintResult::kPresented:
+       surface_paint_connection_was_optimal_at_successful_paint_ = true;
+--- a/src/ui/windowed_app_main_uikit.mm
++++ b/src/ui/windowed_app_main_uikit.mm
+@@ -23,6 +23,7 @@
+ 
+ #include <rex/cvar.h>
+ #include <rex/filesystem.h>
++#include <rex/host_suspend.h>
+ #include <rex/logging.h>
+ 
+ // Flush every logger's queued lines to disk (core/logging.cpp). C linkage —
+@@ -91,6 +92,75 @@
+ }
+ #endif
+ 
++// --- Host GPU suspend gate (M-111) -------------------------------------------
++//
++// iOS and visionOS revoke GPU access from a process that is not foreground.
++// Metal fails the command buffer, MoltenVK reports VK_ERROR_DEVICE_LOST, and
++// the runtime's only reaction to a lost device is rex::FatalError -- so every
++// Digital Crown press on the Vision Pro aborted the app, with the same stack in
++// three separate crash reports (IssueDraw -> BeginSubmission ->
++// CheckSubmissionFenceAndDeviceLoss -> OnHostGpuLossFromAnyThread -> abort).
++//
++// The fix is to stop touching the GPU before the OS takes it away, and to start
++// again when it is handed back. rex/host_suspend.h holds the gate; this is the
++// half that knows about app lifecycle.
++//
++// Both the application notifications and the scene notifications are observed.
++// On iOS the application ones fire; on visionOS the app is scene-based and the
++// scene ones are the reliable signal (the application-level ones still fire for
++// the last scene, but relying on that is how a port ends up crashing only in
++// multi-window). Request() is idempotent, so hearing both costs nothing.
++void RexSuspendHostGpu(NSNotification* note) {
++  REXLOG_INFO("iOS: lifecycle {} -- suspending the host GPU",
++              note.name ? note.name.UTF8String : "?");
++  rex::host_suspend::Request();
++  // Bounded: the GPU worker has to close its open submission and wait its
++  // fences out, and we must not sit in a lifecycle callback long enough for the
++  // OS watchdog to notice. 500 ms is ~30 frames of headroom for a drain that
++  // normally costs one. A timeout is not fatal -- it only means the classifier
++  // in the Vulkan backend, rather than the drain, is what keeps the next fence
++  // error from being read as a lost device.
++  if (!rex::host_suspend::WaitForAck(500)) {
++    REXLOG_WARN(
++        "iOS: host GPU did not reach the suspend gate within 500 ms -- proceeding; the "
++        "device-loss classifier covers the window");
++  }
++}
++
++void RexResumeHostGpu(NSNotification* note) {
++  REXLOG_INFO("iOS: lifecycle {} -- resuming the host GPU",
++              note.name ? note.name.UTF8String : "?");
++  rex::host_suspend::Release();
++}
++
++void RexObserveLifecycleForHostGpu() {
++  NSNotificationCenter* nc = NSNotificationCenter.defaultCenter;
++  NSArray<NSNotificationName>* suspend_names = @[
++    UIApplicationWillResignActiveNotification,
++    UIApplicationDidEnterBackgroundNotification,
++    UISceneWillDeactivateNotification,
++    UISceneDidEnterBackgroundNotification,
++  ];
++  for (NSNotificationName name in suspend_names) {
++    [nc addObserverForName:name
++                    object:nil
++                     queue:NSOperationQueue.mainQueue
++                usingBlock:^(NSNotification* note) { RexSuspendHostGpu(note); }];
++  }
++  NSArray<NSNotificationName>* resume_names = @[
++    UIApplicationDidBecomeActiveNotification,
++    UISceneDidActivateNotification,
++  ];
++  for (NSNotificationName name in resume_names) {
++    [nc addObserverForName:name
++                    object:nil
++                     queue:NSOperationQueue.mainQueue
++                usingBlock:^(NSNotification* note) { RexResumeHostGpu(note); }];
++  }
++  REXLOG_INFO("iOS: host GPU suspend gate armed on {} suspend / {} resume notifications",
++              suspend_names.count, resume_names.count);
++}
++
+ }  // namespace
+ 
+ @interface RexAppDelegate : UIResponder <UIApplicationDelegate>
+@@ -107,6 +177,10 @@
+   // during cutscenes or long stretches of aiming.
+   application.idleTimerDisabled = YES;
+ 
++  // Armed BEFORE the guest boots: a Crown press during the (heavy) boot must
++  // gate the GPU too, and the observers are inert until something submits.
++  RexObserveLifecycleForHostGpu();
++
+ #if TARGET_OS_VISION
+   RexBootWhenSceneReady(0);
+ #else

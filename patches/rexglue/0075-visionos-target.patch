@@ -1,0 +1,402 @@
+--- a/src/ui/window_uikit.mm
++++ b/src/ui/window_uikit.mm
+@@ -32,6 +32,81 @@
+ #include <rex/ui/display_pacer.h>
+ 
+ // ---------------------------------------------------------------------------
++// visionOS compatibility (D-024)
++//
++// UIScreen does not exist on visionOS -- every call site is a compile error,
++// not a runtime nil. There is no screen: the app owns a resizable window in a
++// scene, and everything UIScreen used to answer comes from that scene instead.
++// The iOS answers below are byte-for-byte the expressions that were inline
++// before, so nothing about the iOS build changes.
++// ---------------------------------------------------------------------------
++
++namespace {
++
++#if TARGET_OS_VISION
++// Prefer the foreground-active scene; fall back to any window scene, because a
++// scene that is merely foreground-inactive still has correct geometry and is
++// what exists for the instant between connection and activation.
++UIWindowScene* RexActiveWindowScene() {
++  UIWindowScene* fallback = nil;
++  for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
++    if (![scene isKindOfClass:UIWindowScene.class]) {
++      continue;
++    }
++    UIWindowScene* window_scene = (UIWindowScene*)scene;
++    if (window_scene.activationState == UISceneActivationStateForegroundActive) {
++      return window_scene;
++    }
++    if (!fallback) {
++      fallback = window_scene;
++    }
++  }
++  return fallback;
++}
++#endif
++
++CGRect RexScreenBounds() {
++#if TARGET_OS_VISION
++  UIWindowScene* scene = RexActiveWindowScene();
++  CGRect bounds = scene ? scene.coordinateSpace.bounds : CGRectZero;
++  // Scene bounds can still be empty in the window between scene connection and
++  // the first layout pass. 1280x720 is a placeholder that viewDidLayoutSubviews
++  // corrects on the very next turn; it exists only so nothing divides by zero.
++  if (CGRectIsEmpty(bounds)) {
++    bounds = CGRectMake(0, 0, 1280, 720);
++  }
++  return bounds;
++#else
++  return UIScreen.mainScreen.bounds;
++#endif
++}
++
++CGFloat RexScreenScale() {
++#if TARGET_OS_VISION
++  UIWindowScene* scene = RexActiveWindowScene();
++  const CGFloat scale = scene ? scene.traitCollection.displayScale : 0;
++  return scale > 0 ? scale : 2.0;
++#else
++  const CGFloat scale = UIScreen.mainScreen.nativeScale;
++  return scale > 0 ? scale : 1.0;
++#endif
++}
++
++float RexMaxFramesPerSecond() {
++#if TARGET_OS_VISION
++  // There is no API for this on visionOS: the compositor owns presentation and
++  // the app does not drive a panel. 90 is the Vision Pro compositor's target
++  // and the rate the display link actually ticks at; the pacer measures the
++  // real period every tick anyway, so this only seeds the requested range.
++  return 90.0f;
++#else
++  return float(UIScreen.mainScreen.maximumFramesPerSecond);
++#endif
++}
++
++}  // namespace
++
++// ---------------------------------------------------------------------------
+ // Display link -> DisplayPacer feed (docs/pacing.md)
+ //
+ // The pacer turns the emulated guest vblank into a divided-down copy of the
+@@ -71,8 +146,8 @@
+     // Without this, UIKit idles the link at 60 even on a 120 Hz panel (and
+     // Info.plist carries CADisableMinimumFrameDurationOnPhone for the same
+     // reason on the present side).
+-    if (@available(iOS 15.0, tvOS 15.0, *)) {
+-      const float max_fps = float(UIScreen.mainScreen.maximumFramesPerSecond);
++    if (@available(iOS 15.0, tvOS 15.0, visionOS 1.0, *)) {
++      const float max_fps = RexMaxFramesPerSecond();
+       _link.preferredFrameRateRange = CAFrameRateRangeMake(max_fps, max_fps, max_fps);
+     }
+     [_link addToRunLoop:NSRunLoop.currentRunLoop forMode:NSRunLoopCommonModes];
+@@ -133,8 +208,9 @@
+ @implementation RexViewController
+ 
+ - (void)loadView {
+-  self.view = [[RexMetalView alloc] initWithFrame:UIScreen.mainScreen.bounds];
+-  self.view.contentScaleFactor = UIScreen.mainScreen.nativeScale;
++  self.view = [[RexMetalView alloc] initWithFrame:RexScreenBounds()];
++  self.view.contentScaleFactor = RexScreenScale();
++  self.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+   self.view.multipleTouchEnabled = YES;
+   // The on-screen controls sit above the Metal layer as ordinary UIKit views.
+   // They hide themselves whenever a real controller is connected.
+@@ -148,7 +224,10 @@
+   }
+ }
+ 
++#if !TARGET_OS_VISION
+ // The game is landscape; the guest renders 16:9 and has no portrait layout.
++// None of these exist on visionOS: its windows are resizable, have no
++// orientation, no status bar and no home indicator.
+ - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+   return UIInterfaceOrientationMaskLandscape;
+ }
+@@ -160,6 +239,7 @@
+ - (BOOL)prefersHomeIndicatorAutoHidden {
+   return YES;
+ }
++#endif
+ 
+ @end
+ 
+@@ -201,7 +281,28 @@
+ 
+ bool UIKitWindow::OpenImpl() {
+   @autoreleasepool {
++#if TARGET_OS_VISION
++    // -initWithFrame: on a scene-based app produces a window with no
++    // windowScene, which UIKit then never displays -- no error, no crash, just
++    // an app that launched into nothing. The scene is guaranteed to exist here
++    // because boot is deferred until one connects (windowed_app_main_uikit.mm).
++    UIWindowScene* scene = RexActiveWindowScene();
++    if (!scene) {
++      REXLOG_ERROR("UIKitWindow: no UIWindowScene is connected");
++      return false;
++    }
++    UIWindow* window = [[UIWindow alloc] initWithWindowScene:scene];
++    const CGRect scene_bounds = scene.coordinateSpace.bounds;
++    window.frame = RexScreenBounds();
++    // Report what the scene actually said, separately from what was used: an
++    // empty scene bounds silently becomes the 1280x720 placeholder, and the
++    // only way to tell that apart from a real 1280x720 window is this line.
++    REXLOG_INFO("visionOS: window scene bounds {:.0f}x{:.0f} scale {:.2f} -> window {:.0f}x{:.0f}",
++                scene_bounds.size.width, scene_bounds.size.height, RexScreenScale(),
++                window.frame.size.width, window.frame.size.height);
++#else
+     UIWindow* window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
++#endif
+     if (!window) {
+       REXLOG_ERROR("UIKitWindow: UIWindow creation failed");
+       return false;
+@@ -244,7 +345,7 @@
+     if (!controller || !layer) {
+       return;
+     }
+-    const CGFloat scale = UIScreen.mainScreen.nativeScale > 0 ? UIScreen.mainScreen.nativeScale : 1.0;
++    const CGFloat scale = RexScreenScale();
+     const CGRect bounds = controller.view.bounds;
+     layer.contentsScale = scale;
+     layer.drawableSize = CGSizeMake(bounds.size.width * scale, bounds.size.height * scale);
+@@ -262,7 +363,7 @@
+ 
+ uint32_t UIKitWindow::GetLatestDpiImpl() const {
+   @autoreleasepool {
+-    const CGFloat scale = UIScreen.mainScreen.nativeScale > 0 ? UIScreen.mainScreen.nativeScale : 1.0;
++    const CGFloat scale = RexScreenScale();
+     return uint32_t(GetMediumDpi() * scale);
+   }
+ }
+--- a/src/ui/windowed_app_main_uikit.mm
++++ b/src/ui/windowed_app_main_uikit.mm
+@@ -41,6 +41,56 @@
+ namespace {
+ rex::ui::UIKitWindowedAppContext* g_app_context = nullptr;
+ std::unique_ptr<rex::ui::WindowedApp>* g_app = nullptr;
++
++// Everything didFinishLaunching used to do inline. Factored out because on
++// visionOS it cannot run there (see RexBootWhenSceneReady below).
++void RexBootApp() {
++  g_app_context = new rex::ui::UIKitWindowedAppContext();
++  g_app = new std::unique_ptr<rex::ui::WindowedApp>(
++      rex::ui::GetWindowedAppCreator()(*g_app_context));
++
++  if (!(*g_app)->OnInitialize()) {
++    REXLOG_ERROR("iOS: app OnInitialize failed");
++    rex::ui::ScheduleSettingsSelftest();
++    return;  // stay alive so the log can be retrieved
++  }
++  REXLOG_INFO("iOS: app initialised");
++  rex::ui::ScheduleSettingsSelftest();
++}
++
++#if TARGET_OS_VISION
++// visionOS is scene-based, and UIKit connects the scene AFTER
++// didFinishLaunching returns. Creating the window before then produces a
++// UIWindow with no windowScene, which is never displayed -- an app that
++// launches into an empty void with nothing in the log to explain it.
++//
++// So on visionOS boot is deferred: hop the main queue until a UIWindowScene
++// exists, then run exactly the same boot. In practice this takes one or two
++// turns.
++void RexBootWhenSceneReady(int attempt) {
++  for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
++    if ([scene isKindOfClass:UIWindowScene.class]) {
++      RexBootApp();
++      // Logged AFTER the boot, not before it: the file logger is not opened
++      // until config load inside RexBootApp, so anything written here first
++      // goes only to the early sink and never reaches Documents/logs -- which
++      // is exactly how this line went missing on its first run.
++      REXLOG_INFO("visionOS: window scene connected after {} turn(s); booted", attempt);
++      return;
++    }
++  }
++  // ~5 s at 16 ms. If no scene ever arrives the Info.plist scene manifest is
++  // wrong, and booting anyway would only hide that behind a blank window.
++  if (attempt >= 300) {
++    REXLOG_ERROR("visionOS: no UIWindowScene connected after {} turns -- "
++                 "check UIApplicationSceneManifest in Info.plist", attempt);
++    return;
++  }
++  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, int64_t(16 * NSEC_PER_MSEC)),
++                 dispatch_get_main_queue(), ^{ RexBootWhenSceneReady(attempt + 1); });
++}
++#endif
++
+ }  // namespace
+ 
+ @interface RexAppDelegate : UIResponder <UIApplicationDelegate>
+@@ -57,17 +107,11 @@
+   // during cutscenes or long stretches of aiming.
+   application.idleTimerDisabled = YES;
+ 
+-  g_app_context = new rex::ui::UIKitWindowedAppContext();
+-  g_app = new std::unique_ptr<rex::ui::WindowedApp>(
+-      rex::ui::GetWindowedAppCreator()(*g_app_context));
+-
+-  if (!(*g_app)->OnInitialize()) {
+-    REXLOG_ERROR("iOS: app OnInitialize failed");
+-    rex::ui::ScheduleSettingsSelftest();
+-    return YES;  // stay alive so the log can be retrieved
+-  }
+-  REXLOG_INFO("iOS: app initialised");
+-  rex::ui::ScheduleSettingsSelftest();
++#if TARGET_OS_VISION
++  RexBootWhenSceneReady(0);
++#else
++  RexBootApp();
++#endif
+   return YES;
+ }
+ 
+--- a/src/ui/touch_overlay_uikit.mm
++++ b/src/ui/touch_overlay_uikit.mm
+@@ -211,7 +211,9 @@
+   NSMutableDictionary<NSValue*, NSString*>* _buttonTouches;  // touch -> label
+   NSMutableSet<NSString*>* _heldButtons;
+ 
+-  UIImpactFeedbackGenerator* _haptics;
++#if !TARGET_OS_VISION
++  UIImpactFeedbackGenerator* _haptics;  // no taptic engine on visionOS
++#endif
+   // The readout is a small label, NOT part of drawRect. Drawing it in the
+   // full-screen view meant marking the whole view dirty every display-link
+   // tick, which re-rasterises a 1260x2736 backing store on the CPU sixty times
+@@ -319,8 +321,10 @@
+       }
+     }
+   }
++#if !TARGET_OS_VISION
+   _haptics = [[UIImpactFeedbackGenerator alloc]
+       initWithStyle:UIImpactFeedbackStyleLight];
++#endif
+ 
+   _hud = [[UILabel alloc] initWithFrame:CGRectZero];
+   _hud.numberOfLines = 0;
+@@ -467,8 +471,10 @@
+       // already-held button is not a new press, and buzzing for it would make
+       // held-fire feel like a fault.
+       if (!wasHeld && REXCVAR_GET(touch_haptics)) {
++#if !TARGET_OS_VISION
+         [_haptics impactOccurred];
+         [_haptics prepare];
++#endif
+       }
+     } else if (p.x < self.bounds.size.width * kStickRegionFrac) {
+       // Floating stick: it appears wherever the thumb lands rather than at a
+@@ -1156,6 +1162,23 @@
+   [parent addSubview:overlay];
+   g_overlay_view = overlay;
+ 
++#if TARGET_OS_VISION
++  // Without this, visionOS treats every gamepad button as a gaze-pinch UI
++  // event and withholds it from GameController/SDL entirely: a paired pad
++  // looks completely dead, and nothing is logged to say why. The claim goes on
++  // the PARENT -- the CAMetalLayer host view, the placement Apple's header
++  // prescribes and the one every sibling port uses -- not on the overlay: the
++  // overlay hides itself the moment a controller connects, and a hidden view's
++  // interactions receive nothing, which made the claim inert exactly when a
++  // pad was present (the user, headset, 0.1.0.69: "gamepad isn't working").
++  if (@available(visionOS 1.0, *)) {
++    GCEventInteraction* pad_claim = [[GCEventInteraction alloc] init];
++    pad_claim.handledEventTypes = GCUIEventTypeGamepad;
++    [parent addInteraction:pad_claim];
++    REXLOG_INFO("visionOS: claimed gamepad events via GCEventInteraction on the Metal view");
++  }
++#endif
++
+   g_settings_target = [RexSettingsButtonTarget new];
+   UIButton* gear = [UIButton buttonWithType:UIButtonTypeSystem];
+   [gear setImage:[UIImage systemImageNamed:@"gearshape.fill"] forState:UIControlStateNormal];
+--- a/src/ui/settings_uikit.mm
++++ b/src/ui/settings_uikit.mm
+@@ -414,7 +414,11 @@
+                          format:^NSString*(double v) {
+                            return [NSString stringWithFormat:@"%.0f%%", v * 100.0];
+                          }],
++#if !TARGET_OS_VISION
++                // No taptic engine on visionOS: the row would be a switch that
++                // does nothing, which is worse than no row.
+                 [self switchRow:@"Haptics" cvar:@"touch_haptics"],
++#endif
+                 [self segmentedRow:@"Crosshair"
+                               cvar:@"touch_crosshair"
+                             labels:@[ @"Off", @"Cross", @"Circle" ]
+@@ -885,10 +889,17 @@
+       if (window.rootViewController) return window.rootViewController;
+     }
+   }
++#if TARGET_OS_VISION
++  // +[UIApplication keyWindow] does not exist on visionOS, and it is not
++  // needed: the window there is built with -initWithWindowScene:, so it is
++  // always in the scene's window list the loop above walks.
++  return nil;
++#else
+   // The game's window is created directly rather than through a scene
+   // delegate, so it may not be attached to a scene's window list yet.
+   UIWindow* key = UIApplication.sharedApplication.keyWindow;
+   return key.rootViewController;
++#endif
+ }
+ 
+ }  // namespace
+--- a/src/ui/onboarding_uikit.mm
++++ b/src/ui/onboarding_uikit.mm
+@@ -122,7 +122,14 @@
+   body.text =
+       @"This app ships with no game data. You supply your own copy.\n\n"
+       @"1.  Open the Files app.\n"
++#if TARGET_OS_VISION
++      // There is no "On My iPhone" on visionOS -- the local container is
++      // "On My Apple Vision Pro", and telling a headset user to look for the
++      // iPhone entry sends them hunting for something that is not there.
++      @"2.  Go to On My Apple Vision Pro → GoldenEye.\n"
++#else
+       @"2.  Go to On My iPhone → GoldenEye.\n"
++#endif
+       @"3.  Put your game files in a folder named exactly “assets”.\n\n"
+       @"Either form works:\n\n"
+       @"•  The extracted file set — assets/default.xex, assets/files/, "
+@@ -266,9 +273,11 @@
+         if (window) break;
+       }
+     }
++#if !TARGET_OS_VISION
+     if (!window) {
+       window = UIApplication.sharedApplication.windows.firstObject;
+     }
++#endif
+     if (!window || !window.rootViewController) {
+       REXLOG_ERROR("onboarding: no window to present in; game data must be supplied manually");
+       delete owned_dir;
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -69,7 +69,23 @@
+ // upstream wall-clock behaviour and the automatic fallback wherever no
+ // display link exists. Hot-reload on purpose: the judder A/B flips this live
+ // in one device session.
+-REXCVAR_DEFINE_STRING(pace, "displaylink", "GPU",
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++// visionOS default is "timer", not "displaylink" (D-024). The Vision Pro
++// compositor runs at 90 Hz and the guest's video mode is 60: 90 has no whole
++// divisor that lands on 60, so the display-linked path can only offer 90 (the
++// guest runs 1.5x fast) or 45 (the guest runs at 0.75x speed). Both are wrong
++// in a way the player feels immediately. The timer path keeps the guest's
++// clock at its own 60 Hz and lets the compositor resample; the cost is a
++// 2:1:2:1 present cadence against the panel rather than an even one. Phase 6
++// replaces this entirely -- CompositorServices hands us the cadence.
++#if TARGET_OS_VISION
++#define REX_DEFAULT_PACE "timer"
++#else
++#define REX_DEFAULT_PACE "displaylink"
++#endif
++REXCVAR_DEFINE_STRING(pace, REX_DEFAULT_PACE, "GPU",
+                       "Guest vblank clock source: displaylink (divided from the panel's real "
+                       "refresh; falls back to timer if none) or timer (wall clock)")
+     .allowed({"displaylink", "timer"})

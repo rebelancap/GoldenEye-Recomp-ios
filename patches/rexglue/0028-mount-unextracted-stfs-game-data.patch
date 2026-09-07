@@ -1,0 +1,110 @@
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -13,6 +13,7 @@
+ #include <rex/cvar.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/null_device.h>
++#include <rex/filesystem/devices/stfs_container_device.h>  // unextracted game data
+ #include <rex/filesystem/vfs.h>
+ #include <rex/logging.h>
+ #include <rex/perf/counter.h>
+@@ -269,14 +270,28 @@
+ 
+   // Mount game_data_root as \Device\Harddisk0\Partition1
+   auto mount_path = "\\Device\\Harddisk0\\Partition1";
+-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(
+-      mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
++
++  // The game data reaches us in one of two shapes, and users have both: the
++  // scene release is a single unextracted STFS ("LIVE") container, and the
++  // commonly-circulated form is that container already extracted to a folder.
++  // They hold identical content, so mount whichever we were handed rather than
++  // making the user unpack one into the other -- which on iOS, where the drop
++  // happens through the Files app, they could not do at all.
++  auto stfs_package = rex::filesystem::StfsContainerDevice::FindPackageIn(abs_game_root);
++  std::unique_ptr<rex::filesystem::Device> device;
++  if (!stfs_package.empty()) {
++    REXSYS_INFO("  Game data is an STFS container: {}", stfs_package.string());
++    device = std::make_unique<rex::filesystem::StfsContainerDevice>(mount_path, stfs_package);
++  } else {
++    device = std::make_unique<rex::filesystem::HostPathDevice>(
++        mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
++  }
+   if (!device->Initialize()) {
+-    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
++    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize game data device");
+     return false;
+   }
+   if (!file_system_->RegisterDevice(std::move(device))) {
+-    REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");
++    REXSYS_ERROR("Runtime::SetupVfs: Failed to register game data device");
+     return false;
+   }
+   REXSYS_INFO("  Mounted {} at {}", abs_game_root.string(), mount_path);
+--- a/include/rex/filesystem/devices/stfs_container_device.h
++++ b/include/rex/filesystem/devices/stfs_container_device.h
+@@ -55,6 +55,16 @@
+   // or has an invalid magic.
+   static std::unique_ptr<StfsHeader> ReadPackageHeader(const std::filesystem::path& file_path);
+ 
++  // Finds an STFS package at or under `root`, or an empty path if there is
++  // none. `root` may itself be the package file.
++  //
++  // Scene releases bury the container several levels down under numeric
++  // title/content IDs, so this searches -- but bounded, because the extracted
++  // form of the same content is a ~1,800-file asset tree with nothing to find
++  // in it. Candidates are validated by header, not by name: a container has no
++  // extension and its filename is a content hash.
++  static std::filesystem::path FindPackageIn(const std::filesystem::path& root);
++
+   uint32_t total_allocation_units() const override {
+     if (header_.metadata.volume_type == XContentVolumeType::kStfs) {
+       return header_.metadata.volume_descriptor.stfs.total_block_count;
+--- a/src/filesystem/devices/stfs_container_device.cpp
++++ b/src/filesystem/devices/stfs_container_device.cpp
+@@ -67,6 +67,45 @@
+   return header;
+ }
+ 
++std::filesystem::path StfsContainerDevice::FindPackageIn(const std::filesystem::path& root) {
++  std::error_code ec;
++  if (std::filesystem::is_regular_file(root, ec)) {
++    return ReadPackageHeader(root) ? root : std::filesystem::path{};
++  }
++
++  // Deep enough for the scene layout (0000000000000000/<title>/<type>/<hash>),
++  // shallow enough that an extracted asset tree costs nothing to reject.
++  constexpr int kMaxDepth = 4;
++  constexpr int kMaxCandidates = 64;
++  int examined = 0;
++
++  std::filesystem::recursive_directory_iterator it(
++      root, std::filesystem::directory_options::skip_permission_denied, ec);
++  if (ec) {
++    return {};
++  }
++  for (const auto& entry : it) {
++    if (it.depth() >= kMaxDepth) {
++      it.disable_recursion_pending();
++    }
++    if (!entry.is_regular_file(ec)) {
++      continue;
++    }
++    // A package for a full XBLA title is hundreds of MB; the size floor keeps
++    // us from reading a header off every .nfo and .diz sitting beside it.
++    if (entry.file_size(ec) < 1024 * 1024) {
++      continue;
++    }
++    if (ReadPackageHeader(entry.path())) {
++      return entry.path();
++    }
++    if (++examined >= kMaxCandidates) {
++      break;
++    }
++  }
++  return {};
++}
++
+ bool StfsContainerDevice::Initialize() {
+   // Resolve a valid STFS file if a directory is given.
+   if (std::filesystem::is_directory(host_path_) && !ResolveFromFolder(host_path_)) {

@@ -1,0 +1,98 @@
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -50,6 +50,18 @@
+ #include <rex/ui/vulkan/util.h>
+ 
+ // Legacy backend compatibility aliases for shared readback controls.
++REXCVAR_DEFINE_BOOL(ge_edram_alias_clip, false, "GPU",
++                    "M-100 experiment: clip every draw's scissor to the rows of its render "
++                    "target that do not alias another bound attachment's EDRAM range (or the "
++                    "EDRAM end). bean predicated-tiles 720p at 4x MSAA into 256-row tiles with "
++                    "an unbounded window scissor; the host render target image is 512 rows, so "
++                    "each tile pass shaded up to 2x its tile and the render target cache then "
++                    "had to reconcile the aliased depth rows. On a console the same rows would "
++                    "have landed in the depth buffer, which the game evidently does not rely "
++                    "on. Hot-reload for A/B.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++static std::atomic<uint32_t> g_alias_clip_draws{0};
++
+ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -6132,6 +6144,50 @@
+   // Scissor.
+   draw_util::Scissor scissor;
+   draw_util::GetScissor(regs, scissor);
++  if (REXCVAR_GET(ge_edram_alias_clip)) {
++    // See the cvar. Rows are in guest render-target space (window offset is
++    // already folded into the scissor by GetScissor), before resolution scaling.
++    const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
++    const uint32_t msaa_x_log2 = uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
++    const uint32_t msaa_y_log2 = uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k2X);
++    const uint32_t pitch_tiles =
++        ((rb_surface_info.surface_pitch << msaa_x_log2) + xenos::kEdramTileWidthSamples - 1) /
++        xenos::kEdramTileWidthSamples;
++    if (pitch_tiles) {
++      const uint32_t rows_per_tile_row = xenos::kEdramTileHeightSamples >> msaa_y_log2;
++      uint32_t bases[5];
++      uint32_t n = 0;
++      const uint32_t color_mask = regs.Get<reg::RB_COLOR_MASK>().value;
++      for (uint32_t i = 0; i < 4; ++i) {
++        if ((color_mask >> (4 * i)) & 0xF) {
++          bases[n++] = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i])
++                           .color_base;
++        }
++      }
++      const auto rb_depthcontrol = regs.Get<reg::RB_DEPTHCONTROL>();
++      if (rb_depthcontrol.z_enable || rb_depthcontrol.stencil_enable) {
++        bases[n++] = regs.Get<reg::RB_DEPTH_INFO>().depth_base;
++      }
++      uint32_t max_rows = UINT32_MAX;
++      for (uint32_t a = 0; a < n; ++a) {
++        uint32_t end = xenos::kEdramTileCount;
++        for (uint32_t b = 0; b < n; ++b) {
++          if (bases[b] > bases[a] && bases[b] < end) end = bases[b];
++        }
++        if (end > bases[a]) {
++          max_rows = std::min(max_rows, (end - bases[a]) / pitch_tiles * rows_per_tile_row);
++        }
++      }
++      if (max_rows != UINT32_MAX && scissor.offset[1] + scissor.extent[1] > max_rows) {
++        scissor.extent[1] = max_rows > scissor.offset[1] ? max_rows - scissor.offset[1] : 0;
++        const uint32_t clipped = g_alias_clip_draws.fetch_add(1, std::memory_order_relaxed) + 1;
++        if ((clipped % 5000u) == 1u) {
++          REXGPU_INFO("GECLIP #{}: scissor clipped to {} rows (pitch {}t, {} attachments)", clipped,
++                      max_rows, pitch_tiles, n);
++        }
++      }
++    }
++  }
+   scissor.offset[0] *= draw_resolution_scale_x;
+   scissor.offset[1] *= draw_resolution_scale_y;
+   scissor.extent[0] *= draw_resolution_scale_x;
+--- a/src/ui/screen_capture.cpp
++++ b/src/ui/screen_capture.cpp
+@@ -34,6 +34,7 @@
+ #include <vector>
+ 
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/logging.h>
+ #include <rex/ui/presenter.h>
+ 
+@@ -181,9 +182,14 @@
+ }
+ 
+ void StartCaptureService(Presenter* presenter) {
+-  const std::string dir = REXCVAR_GET(capture_dir);
++  std::string dir = REXCVAR_GET(capture_dir);
+   if (dir.empty() || !presenter) {
+     return;
++  }
++  // A relative capture_dir lives under Documents: the iOS container path
++  // changes on every reinstall, so an absolute path in ge.toml goes stale.
++  if (!std::filesystem::path(dir).is_absolute()) {
++    dir = (rex::filesystem::GetDocumentsFolder() / dir).string();
+   }
+   std::error_code ec;
+   std::filesystem::create_directories(dir, ec);

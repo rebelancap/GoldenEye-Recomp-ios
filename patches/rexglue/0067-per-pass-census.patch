@@ -1,0 +1,484 @@
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -124,6 +124,138 @@
+ // count them but cannot name them; this names them.
+ std::atomic<uint64_t>
+     g_dispatches[size_t(rex::graphics::DispatchKind::kCount)];
++
++// ---- GEPASS per-pass census (patch 0067) -----------------------------------
++// M-099 attributed the Dam frame to fragment work inside ~25 guest render
++// passes -- one of them 8.3 ms, 44% of the frame -- but Metal System Trace can
++// only number the encoders, not name the guest render target each one draws
++// into. This names them: `passes` on the console arms a ONE-frame capture and
++// the next inter-swap span is recorded pass by pass, with the guest
++// RenderTargetKey identity of every attachment, the draw/vertex/blend counts,
++// and the compute dispatches that ran between passes.
++//
++// Zero-cost when idle: every hot-path hook is one relaxed load of
++// g_census_state. Only the GPU worker thread writes the table, and only while
++// the state is kCapturing, so no locking is needed -- the console thread reads
++// it after the state has been released as kDone.
++constexpr uint32_t kCensusDispatchKinds = uint32_t(rex::graphics::DispatchKind::kCount);
++constexpr uint32_t kCensusMaxPasses = 128;
++// This file's anonymous namespace is at global scope, so `xenos::` does not
++// resolve here the way it does inside rex::graphics.
++constexpr uint32_t kCensusMaxColorRts = rex::graphics::xenos::kMaxColorRenderTargets;
++enum : uint32_t {
++  kCensusIdle = 0,
++  kCensusArmed = 1,    // start at the next swap
++  kCensusCapturing = 2,
++  kCensusDone = 3,
++};
++struct CensusPass {
++  uint32_t kind;  // 0 = guest render target, 1 = EDRAM transfer, 2 = swap gamma
++  uint32_t width, height;
++  uint32_t samples;
++  uint32_t color_count;
++  uint32_t rt_keys[1 + kCensusMaxColorRts];     // depth first; 0 = unused
++  uint32_t vk_formats[1 + kCensusMaxColorRts];  // host VkFormat
++  uint32_t pitch_tiles;
++  uint32_t draws;
++  uint32_t vertices;
++  uint32_t blend_draws;
++  uint32_t max_scissor_w, max_scissor_h;
++  // Union of every draw's scissor and viewport, in host pixels: tells whether a
++  // predicated-tiling pass really is confined to its tile (M-100).
++  int32_t sc_x0, sc_y0, sc_x1, sc_y1;
++  int32_t vp_x0, vp_y0, vp_x1, vp_y1;
++  uint32_t window_offset_reg;
++  uint32_t pre_dispatches[kCensusDispatchKinds];
++};
++std::atomic<uint32_t> g_census_state{kCensusIdle};
++CensusPass g_census_passes[kCensusMaxPasses];
++uint32_t g_census_pass_count = 0;
++int32_t g_census_current = -1;
++uint32_t g_census_pending_dispatches[kCensusDispatchKinds] = {};
++uint32_t g_census_dropped = 0;
++
++inline bool CensusCapturing() {
++  return g_census_state.load(std::memory_order_relaxed) == kCensusCapturing;
++}
++
++void CensusBeginPass(uint32_t kind, uint32_t width, uint32_t height, uint32_t samples,
++                     uint32_t color_count, const uint32_t* rt_keys, const uint32_t* vk_formats,
++                     uint32_t pitch_tiles) {
++  if (g_census_pass_count >= kCensusMaxPasses) {
++    ++g_census_dropped;
++    g_census_current = -1;
++    return;
++  }
++  CensusPass& p = g_census_passes[g_census_pass_count];
++  std::memset(&p, 0, sizeof(p));
++  p.kind = kind;
++  p.width = width;
++  p.height = height;
++  p.samples = samples;
++  p.color_count = color_count;
++  p.pitch_tiles = pitch_tiles;
++  if (rt_keys) {
++    std::memcpy(p.rt_keys, rt_keys, sizeof(p.rt_keys));
++  }
++  if (vk_formats) {
++    std::memcpy(p.vk_formats, vk_formats, sizeof(p.vk_formats));
++  }
++  std::memcpy(p.pre_dispatches, g_census_pending_dispatches, sizeof(p.pre_dispatches));
++  std::memset(g_census_pending_dispatches, 0, sizeof(g_census_pending_dispatches));
++  g_census_current = int32_t(g_census_pass_count);
++  ++g_census_pass_count;
++}
++
++void CensusCountDraw(uint32_t vertices, bool blend, uint32_t scissor_w, uint32_t scissor_h,
++                     const VkRect2D& sc, const VkViewport& vp, uint32_t window_offset_reg) {
++  if (g_census_current < 0) {
++    return;
++  }
++  CensusPass& p = g_census_passes[g_census_current];
++  if (p.draws == 0) {
++    p.sc_x0 = sc.offset.x; p.sc_y0 = sc.offset.y;
++    p.sc_x1 = sc.offset.x + int32_t(sc.extent.width); p.sc_y1 = sc.offset.y + int32_t(sc.extent.height);
++    p.vp_x0 = int32_t(vp.x); p.vp_y0 = int32_t(vp.y);
++    p.vp_x1 = int32_t(vp.x + vp.width); p.vp_y1 = int32_t(vp.y + vp.height);
++    p.window_offset_reg = window_offset_reg;
++  } else {
++    p.sc_x0 = std::min(p.sc_x0, sc.offset.x); p.sc_y0 = std::min(p.sc_y0, sc.offset.y);
++    p.sc_x1 = std::max(p.sc_x1, sc.offset.x + int32_t(sc.extent.width));
++    p.sc_y1 = std::max(p.sc_y1, sc.offset.y + int32_t(sc.extent.height));
++    p.vp_x0 = std::min(p.vp_x0, int32_t(vp.x)); p.vp_y0 = std::min(p.vp_y0, int32_t(vp.y));
++    p.vp_x1 = std::max(p.vp_x1, int32_t(vp.x + vp.width));
++    p.vp_y1 = std::max(p.vp_y1, int32_t(vp.y + vp.height));
++  }
++  ++p.draws;
++  p.vertices += vertices;
++  if (blend) {
++    ++p.blend_draws;
++  }
++  p.max_scissor_w = std::max(p.max_scissor_w, scissor_w);
++  p.max_scissor_h = std::max(p.max_scissor_h, scissor_h);
++}
++
++// Called from EndSubmission(is_swap=true), i.e. at the guest frame boundary.
++void CensusSwap() {
++  const uint32_t state = g_census_state.load(std::memory_order_relaxed);
++  if (state == kCensusArmed) {
++    g_census_pass_count = 0;
++    g_census_current = -1;
++    g_census_dropped = 0;
++    std::memset(g_census_pending_dispatches, 0, sizeof(g_census_pending_dispatches));
++    g_census_state.store(kCensusCapturing, std::memory_order_release);
++  } else if (state == kCensusCapturing) {
++    // Keep-alive swaps (M-083: VdSwap fires with no frame behind it) arrive
++    // back to back; closing on one of those returned an empty table on .62.
++    // A frame is a span that contained at least one pass.
++    if (g_census_pass_count == 0) {
++      return;
++    }
++    g_census_current = -1;
++    g_census_state.store(kCensusDone, std::memory_order_release);
++  }
++}
+ }  // namespace
+ 
+ namespace rex::graphics::vulkan {
+@@ -136,6 +268,11 @@
+   const auto i = size_t(kind);
+   if (i < size_t(DispatchKind::kCount)) {
+     g_dispatches[i].fetch_add(1, std::memory_order_relaxed);
++    // GEPASS: dispatches land between passes; they are attributed to the next
++    // pass that begins (or to the trailing bucket if the frame ends first).
++    if (CensusCapturing()) {
++      ++g_census_pending_dispatches[i];
++    }
+   }
+ }
+ 
+@@ -2987,6 +3124,12 @@
+           render_pass_begin_info.pClearValues = nullptr;
+           deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                                         VK_SUBPASS_CONTENTS_INLINE);
++          // GEPASS: the presenter's own gamma-apply pass -- M-099 measured it
++          // at 0.20 ms, so it is here to close the frame's accounting, not
++          // because it is a suspect.
++          if (CensusCapturing()) {
++            CensusBeginPass(2, guest_output_width, guest_output_height, 1, 1, nullptr, nullptr, 0);
++          }
+ 
+           VkViewport viewport;
+           viewport.x = 0.0f;
+@@ -3304,6 +3447,33 @@
+     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                                   VK_SUBPASS_CONTENTS_INLINE);
+   }
++  // GEPASS: the guest's own render pass -- name its render targets.
++  if (CensusCapturing()) {
++    uint32_t rt_keys[1 + xenos::kMaxColorRenderTargets] = {};
++    uint32_t vk_formats[1 + xenos::kMaxColorRenderTargets] = {};
++    uint32_t pitch_tiles = 0;
++    render_target_cache_->GetPassCensusRenderTargetKeys(rt_keys, &pitch_tiles);
++    uint32_t color_count = 0;
++    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++      if (!rt_keys[i]) {
++        continue;
++      }
++      VulkanRenderTargetCache::PassCensusKey key;
++      key.key = rt_keys[i];
++      if (key.is_depth) {
++        vk_formats[i] = uint32_t(render_target_cache_->GetDepthVulkanFormat(key.GetDepthFormat()));
++      } else {
++        vk_formats[i] = uint32_t(render_target_cache_->GetColorVulkanFormat(key.GetColorFormat()));
++        if (i) {
++          ++color_count;
++        }
++      }
++    }
++    const uint32_t samples =
++        uint32_t(1) << uint32_t(render_target_cache_->last_update_render_pass_key().msaa_samples);
++    CensusBeginPass(0, framebuffer->host_extent.width, framebuffer->host_extent.height, samples,
++                    color_count, rt_keys, vk_formats, pitch_tiles);
++  }
+   g_render_passes.fetch_add(1, std::memory_order_relaxed);
+   in_render_pass_ = true;
+ }
+@@ -3396,6 +3566,11 @@
+     render_pass_begin_info.pClearValues = nullptr;
+     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                                   VK_SUBPASS_CONTENTS_INLINE);
++  }
++  // GEPASS: an EDRAM ownership-transfer pass, not a guest draw pass.
++  if (CensusCapturing()) {
++    CensusBeginPass(1, framebuffer->host_extent.width, framebuffer->host_extent.height, 0,
++                    transfer_dest_is_depth ? 0 : 1, nullptr, nullptr, 0);
+   }
+   g_render_passes.fetch_add(1, std::memory_order_relaxed);
+   in_render_pass_ = true;
+@@ -4300,6 +4475,19 @@
+             : VK_INDEX_TYPE_UINT32);
+     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+                                               0, 0, 0);
++  }
++
++  // GEPASS: attribute the draw to the pass just (re)entered above. One relaxed
++  // load when idle; the register reads only happen during an armed frame.
++  if (CensusCapturing()) {
++    const auto blend_control = regs.Get<reg::RB_BLENDCONTROL>();
++    const bool blend = blend_control.color_srcblend != xenos::BlendFactor::kOne ||
++                       blend_control.color_destblend != xenos::BlendFactor::kZero ||
++                       blend_control.color_comb_fcn != xenos::BlendOp::kAdd;
++    CensusCountDraw(primitive_processing_result.host_draw_vertex_count, blend,
++                    dynamic_scissor_.extent.width, dynamic_scissor_.extent.height,
++                    dynamic_scissor_, dynamic_viewport_,
++                    regs.Get<reg::PA_SC_WINDOW_OFFSET>().value);
+   }
+ 
+   // Invalidate textures in memexported memory and watch for changes.
+@@ -5476,6 +5664,11 @@
+   }
+   if (is_swap) {
+     g_swaps.fetch_add(1, std::memory_order_relaxed);
++  }
++  if (is_swap) {
++    // GEPASS: the guest frame boundary -- arm here, and close the capture at
++    // the next one, so the table covers exactly one inter-swap span.
++    CensusSwap();
+   }
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+@@ -7133,3 +7326,117 @@
+   *p95_us_out = copy[(uint64_t(n) * 95) / 100];
+   *max_us_out = copy[n - 1];
+ }
++
++// ---- GEPASS per-pass census readout (patch 0067) ----------------------------
++// The table is rendered here rather than in the console bridge because only
++// this translation unit knows what a RenderTargetKey means, and the bridge
++// lives in rexruntime, which does not link rexgraphics (see
++// rex/ui/vulkan/presenter_timings.h) -- it reaches this by dlsym, as text.
++namespace {
++
++void CensusAppendAttachment(std::string& s, const char* label, uint32_t key_bits,
++                            uint32_t vk_format) {
++  if (!key_bits) {
++    return;
++  }
++  rex::graphics::vulkan::VulkanRenderTargetCache::PassCensusKey key;
++  key.key = key_bits;
++  char tmp[224];
++  std::snprintf(tmp, sizeof(tmp), " %s=[0x%08x b=%ut p=%ut s=%ux %s %s vk=%u]", label, key_bits,
++                uint32_t(key.base_tiles), key.GetPitchTiles(),
++                uint32_t(1) << uint32_t(key.msaa_samples), key.GetFormatName(),
++                key.Is64bpp() ? "64bpp" : "32bpp", vk_format);
++  s += tmp;
++}
++
++void CensusAppendDispatches(std::string& s, const char* label, const uint32_t* counts) {
++  bool any = false;
++  for (uint32_t k = 0; k < kCensusDispatchKinds; ++k) {
++    if (!counts[k]) {
++      continue;
++    }
++    s += any ? "," : label;
++    any = true;
++    s += rex::graphics::DispatchKindName(rex::graphics::DispatchKind(k));
++    s += ":";
++    s += std::to_string(counts[k]);
++  }
++}
++
++std::string CensusText() {
++  std::string s;
++  char buf[640];
++  uint32_t total_draws = 0, total_verts = 0;
++  for (uint32_t i = 0; i < g_census_pass_count; ++i) {
++    total_draws += g_census_passes[i].draws;
++    total_verts += g_census_passes[i].vertices;
++  }
++  std::snprintf(buf, sizeof(buf), "GEPASS frame passes=%u draws=%u vtx=%u dropped=%u\n",
++                g_census_pass_count, total_draws, total_verts, g_census_dropped);
++  s += buf;
++  for (uint32_t i = 0; i < g_census_pass_count; ++i) {
++    const CensusPass& p = g_census_passes[i];
++    const char* kind = p.kind == 0 ? "guest" : (p.kind == 1 ? "xfer " : "swap ");
++    std::snprintf(buf, sizeof(buf), "GEPASS[%02u] %s %ux%u s%u col=%u pitch=%ut", i, kind, p.width,
++                  p.height, p.samples, p.color_count, p.pitch_tiles);
++    s += buf;
++    CensusAppendAttachment(s, "d", p.rt_keys[0], p.vk_formats[0]);
++    for (uint32_t c = 0; c < kCensusMaxColorRts; ++c) {
++      const char* labels[4] = {"c0", "c1", "c2", "c3"};
++      CensusAppendAttachment(s, labels[c], p.rt_keys[1 + c], p.vk_formats[1 + c]);
++    }
++    std::snprintf(buf, sizeof(buf), " draws=%u vtx=%u blend=%u scis=%ux%u", p.draws, p.vertices,
++                  p.blend_draws, p.max_scissor_w, p.max_scissor_h);
++    s += buf;
++    if (p.draws) {
++      std::snprintf(buf, sizeof(buf), " scU=[%d,%d %dx%d] vpU=[%d,%d %dx%d] wofs=%#x", p.sc_x0,
++                    p.sc_y0, p.sc_x1 - p.sc_x0, p.sc_y1 - p.sc_y0, p.vp_x0, p.vp_y0,
++                    p.vp_x1 - p.vp_x0, p.vp_y1 - p.vp_y0, p.window_offset_reg);
++      s += buf;
++    }
++    CensusAppendDispatches(s, " pre=", p.pre_dispatches);
++    s += "\n";
++  }
++  bool trailing = false;
++  for (uint32_t k = 0; k < kCensusDispatchKinds; ++k) {
++    trailing |= g_census_pending_dispatches[k] != 0;
++  }
++  if (trailing) {
++    s += "GEPASS[--] post ";
++    CensusAppendDispatches(s, "", g_census_pending_dispatches);
++    s += "\n";
++  }
++  return s;
++}
++
++}  // namespace
++
++// Arm a one-frame capture: the span between the next two swaps is recorded.
++extern "C" void RexArmPassCensus() {
++  g_census_state.store(kCensusArmed, std::memory_order_release);
++}
++
++// -1 while the armed frame has not completed. `force` gives up waiting and
++// returns whatever was recorded (the console's ~2 s timeout). Returns the
++// number of bytes written, excluding the NUL.
++extern "C" int RexFetchPassCensus(char* out, uint32_t cap, uint32_t force) {
++  if (!out || cap == 0) {
++    return -1;
++  }
++  const uint32_t state = g_census_state.load(std::memory_order_acquire);
++  if (state != kCensusDone) {
++    if (!force || state == kCensusIdle) {
++      return -1;
++    }
++    // Stop the writer before reading its table.
++    g_census_state.store(kCensusIdle, std::memory_order_release);
++  }
++  const std::string text = CensusText();
++  g_census_state.store(kCensusIdle, std::memory_order_release);
++  const size_t n = std::min<size_t>(text.size(), size_t(cap) - 1);
++  std::memcpy(out, text.data(), n);
++  out[n] = '\0';
++  // Also to the app log, so a capture survives the console session.
++  REXGPU_INFO("{}", text);
++  return int(n);
++}
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -131,6 +131,41 @@
+                                          VkRenderingAttachmentInfo* depth_attachment,
+                                          VkRenderingAttachmentInfo* stencil_attachment) const;
+ 
++  // RenderTargetKey is protected on the base; the census (patch 0067) decodes
++  // the keys outside the class, so publish the type under its own name.
++  using PassCensusKey = RenderTargetCache::RenderTargetKey;
++
++  // GEPASS per-pass census (patch 0067). M-099 attributed the Dam frame to
++  // fragment work inside ~25 guest render passes but the trace cannot name
++  // them; the engine can. Fills `keys_out` (depth first, then the four colour
++  // slots) with RenderTargetKey::key -- 0 for an unused slot -- so a pass can
++  // be recognised as the same guest render target across frames. Public, and
++  // on VulkanRenderTargetCache rather than the base, because the accumulated
++  // render targets are protected on the base and only a derived member may
++  // reach them.
++  void GetPassCensusRenderTargetKeys(uint32_t* keys_out,
++                                     uint32_t* pitch_tiles_at_32bpp_out) const {
++    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++      keys_out[i] = 0;
++    }
++    if (pitch_tiles_at_32bpp_out) {
++      *pitch_tiles_at_32bpp_out = last_update_framebuffer_pitch_tiles_at_32bpp_;
++    }
++    if (GetPath() != Path::kHostRenderTargets) {
++      return;
++    }
++    RenderTarget* const* rts = last_update_accumulated_render_targets();
++    if (!rts) {
++      return;
++    }
++    const uint32_t used = last_update_render_pass_key_.depth_and_color_used;
++    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++      if ((used & (uint32_t(1) << i)) && rts[i]) {
++        keys_out[i] = rts[i]->key().key;
++      }
++    }
++  }
++
+   // Using R16G16[B16A16]_SNORM, which are -1...1, not the needed -32...32.
+   // Persistent data doesn't depend on this, so can be overriden by per-game
+   // configuration.
+--- a/src/system/console_bridge.cpp
++++ b/src/system/console_bridge.cpp
+@@ -15,6 +15,7 @@
+ #endif
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <atomic>
+ #include <cstring>
+ #include <fstream>
+@@ -76,6 +77,20 @@
+ using GpuPassStatsFn = void (*)(uint64_t*, uint64_t*, uint64_t*);
+ static GpuPassStatsFn GpuPassStats() {
+   static auto fn = reinterpret_cast<GpuPassStatsFn>(dlsym(RTLD_DEFAULT, "RexGetGpuPassStats"));
++  return fn;
++}
++// The per-pass census (M-099's follow-up): Metal System Trace can time the ~25
++// render encoders of a Dam frame but cannot say which guest render target each
++// one is. The engine renders the table itself -- see command_processor.cpp --
++// and this reaches it by name, like everything else in rexgraphics.
++using ArmPassCensusFn = void (*)();
++using FetchPassCensusFn = int (*)(char*, uint32_t, uint32_t);
++static ArmPassCensusFn ArmPassCensus() {
++  static auto fn = reinterpret_cast<ArmPassCensusFn>(dlsym(RTLD_DEFAULT, "RexArmPassCensus"));
++  return fn;
++}
++static FetchPassCensusFn FetchPassCensus() {
++  static auto fn = reinterpret_cast<FetchPassCensusFn>(dlsym(RTLD_DEFAULT, "RexFetchPassCensus"));
+   return fn;
+ }
+ // Swap cadence percentiles and the session pipeline-compile count -- the
+@@ -140,6 +155,7 @@
+       "  info <name>       type, category, default and description\n"
+       "  reset <name>      restore a cvar's default\n"
+       "  edramdump <dir> [n]  dump raw pre-resolve EDRAM (+ register sidecar) at the next n resolves\n"
++      "  passes            one-frame render-pass census: every guest pass named by render target\n"
+       "  log [n]           last n lines (default 40) of the app's own log file\n"
+ #if REX_PLATFORM_IOS
+       "  settings [close]  open (or close) the native settings page\n"
+@@ -463,6 +479,38 @@
+     }
+     std::string s = out.str();
+     return s.empty() ? "nothing differs from default\n" : s;
++  }
++
++  if (cmd == "passes") {
++    // Arm a one-frame capture and wait for the GPU worker to close it at the
++    // next swap. ~2 s is far longer than any frame this port produces, so a
++    // timeout means the guest is not presenting -- return the partial table
++    // rather than nothing, which is itself the useful answer in that case.
++    auto* arm = ArmPassCensus();
++    auto* fetch = FetchPassCensus();
++    if (!arm || !fetch) {
++      return "error: RexArmPassCensus not present in this build\n";
++    }
++    arm();
++    std::vector<char> buf(96 * 1024);
++    int n = -1;
++    for (int i = 0; i < 200 && n < 0; ++i) {
++      std::this_thread::sleep_for(std::chrono::milliseconds(10));
++      n = fetch(buf.data(), uint32_t(buf.size()), 0);
++    }
++    bool timed_out = false;
++    if (n < 0) {
++      timed_out = true;
++      n = fetch(buf.data(), uint32_t(buf.size()), 1);
++    }
++    if (n < 0) {
++      return "error: no frame captured (is the guest presenting?)\n";
++    }
++    std::string out(buf.data(), size_t(n));
++    if (timed_out) {
++      out += "GEPASS note: timed out after 2s -- partial frame\n";
++    }
++    return out;
+   }
+ 
+   if (cmd == "edramdump") {

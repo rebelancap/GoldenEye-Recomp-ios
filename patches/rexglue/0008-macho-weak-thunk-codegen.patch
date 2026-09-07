@@ -1,0 +1,37 @@
+--- a/resources/templates/codegen/init_h.inja
++++ b/resources/templates/codegen/init_h.inja
+@@ -60,9 +60,34 @@
+   REX_EXTERN(name);            \
+   REX_EXTERN(__imp__##name)
+ 
++// The recompiled body is emitted as __imp__<name>; <name> is a WEAK symbol
++// pointing at it, so a strong definition elsewhere (a midasm hook in
++// ge_hooks.cpp, or a kernel export standing in for a guest import) silently
++// wins the link and takes over the call.
++//
++// Mach-O has no __attribute__((alias)) -- clang rejects it outright with
++// "aliases are not supported on darwin" -- so Apple targets express the same
++// thing as a weak forwarding thunk. [[clang::musttail]] guarantees it compiles
++// to exactly one instruction, `b ___imp__<name>`, so the only costs are 4 bytes
++// of code per guest function and one perfectly-predicted branch per call.
++// Override semantics are identical (verified: a strong <name> wins, and without
++// one the thunk reaches the real body).
++//
++// Mach-O's .weak_definition on a `.set` alias does NOT work -- the linker
++// reports a duplicate symbol rather than letting the strong definition win --
++// so the thunk is the only form that preserves the hook mechanism.
++#if defined(__APPLE__)
++#define DEFINE_REX_FUNC(name)                                    \
++  REX_EXTERN(__imp__##name);                                     \
++  extern "C" REX_WEAK_FUNC(name) {                               \
++    [[clang::musttail]] return __imp__##name(ctx, base);         \
++  }                                                              \
++  REX_EXTERN(__imp__##name)
++#else
+ #define DEFINE_REX_FUNC(name)                                  \
+   __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name); \
+   REX_EXTERN(__imp__##name)
++#endif
+ 
+ //=============================================================================
+ // Function Prologue

@@ -1,0 +1,131 @@
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -1160,9 +1160,25 @@
+   // give up and proceed, which lets the CP advance, the guest wait clear, and
+   // the CPU resume and write the fence. Worst case is a one-frame artifact, not
+   // a hard freeze.
++  // The 60 ms default is a deadlock-breaker, and during bring-up it actively
++  // hides bugs: when it fires the CP walks past an un-released semaphore into a
++  // chain link that is not valid yet, the indirect-buffer chain ends silently,
++  // and the resulting "guest stopped submitting" steady state looks nothing like
++  // the real fault (M-026/M-027). Make it tunable so a diagnosis run can hold
++  // the CP at the genuine stall point instead of corrupting the chain.
+   const auto wait_deadline =
+-      std::chrono::steady_clock::now() + std::chrono::milliseconds(60);
++      std::chrono::steady_clock::now() +
++      std::chrono::milliseconds(uint32_t(REXCVAR_GET(gpu_wait_reg_mem_timeout_ms)));
+ 
++  {
++    static std::atomic<uint64_t> n{0};
++    const uint64_t i = n.fetch_add(1) + 1;
++    if (i <= 24 || (i % 200) == 0) {
++      REXGPU_INFO("CPDIAG WRM #{} poll={:08X} ref={:08X} mask={:08X} op={} mem={}", i,
++                  poll_reg_addr, ref, mask, wait_info & 0x7, is_memory);
++    }
++  }
++  auto last_wrm_interrupt = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+   bool matched = false;
+   do {
+     uint32_t value = 0;
+@@ -1205,11 +1221,40 @@
+         break;
+     }
+     if (!matched) {
++      // EXPERIMENT (GoldenEye-Recomp-ios, M-027): the Xenos semaphore block is
++      // how the GPU asks the CPU for mid-stream service -- the guest arms a
++      // record with a callback and the CP blocks until the CPU writes the
++      // release. Here that release never comes, and the guest's callback runs
++      // zero times, because the only PM4_INTERRUPT in the stream sits BEHIND
++      // this very semaphore (a circular dependency). Nudge the guest's ISR while
++      // blocked so it can walk its records and issue the release.
++      if (is_memory && REXCVAR_GET(gpu_interrupt_on_wait_reg_mem) && graphics_system_) {
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last_wrm_interrupt >= std::chrono::milliseconds(4)) {
++          last_wrm_interrupt = now;
++          graphics_system_->DispatchInterruptCallback(1, 2);
++        }
++      }
+       if (std::chrono::steady_clock::now() >= wait_deadline) {
++        // EXPERIMENT (M-027): rather than merely proceeding -- which walks into
++        // a chain link that is not valid yet and silently ends the IB chain --
++        // PERFORM the release the hardware's display engine would have done, by
++        // writing the awaited value into the polled location. The guest's own
++        // state then stays consistent with the stream.
++        if (is_memory && REXCVAR_GET(gpu_perform_wait_reg_mem_release) &&
++            (wait_info & 0x7) == 0x3) {
++          const uint32_t addr = poll_reg_addr & ~uint32_t(0x3);
++          memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(addr),
++                                           ref & mask);
++          REXGPU_WARN("WAIT_REG_MEM: performing the release ({:08X} := {:08X})", addr, ref & mask);
++          matched = true;
++          break;
++        }
+         REXGPU_WARN(
+-            "WAIT_REG_MEM stalled >60ms (poll={:08X} ref={:08X} mask={:08X} op={}); proceeding to "
+-            "avoid a CPU/GPU sync deadlock",
+-            poll_reg_addr, ref, mask, wait_info & 0x7);
++            "WAIT_REG_MEM stalled >{}ms (poll={:08X} ref={:08X} mask={:08X} op={}); proceeding to "
++            "avoid a CPU/GPU sync deadlock -- NOTE this may cut the IB chain",
++            uint32_t(REXCVAR_GET(gpu_wait_reg_mem_timeout_ms)), poll_reg_addr, ref, mask,
++            wait_info & 0x7);
+         break;
+       }
+       // Wait.
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -339,8 +339,17 @@
+     case 0x01C5:  // CP_RB_WPTR
+       command_processor_->UpdateWritePointer(value);
+       break;
+-    case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
++    case 0x1844: {
++      // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS -- the display flip register.
++      // Upstream ignores it. On hardware this write asks the display engine to
++      // flip, and flip-complete has side effects the CPU never performs itself;
++      // the prime suspect for the missing WAIT_REG_MEM semaphore release
++      // (M-027). Log it so it can be correlated with the parked WRM.
++      static std::atomic<uint64_t> n{0};
++      const uint64_t i = n.fetch_add(1) + 1;
++      REXGPU_INFO("CPDIAG FLIP(0x1844) #{} value={:08X}", i, value);
+       break;
++    }
+     default:
+       REXGPU_WARN("Unknown GPU register {:04X} write: {:08X}", r, value);
+       break;
+--- a/src/graphics/flags.cpp
++++ b/src/graphics/flags.cpp
+@@ -51,3 +51,20 @@
+   }
+   return result;
+ }
++
++// Added by the GoldenEye-Recomp-ios overlay. See command_processor.cpp: the
++// WAIT_REG_MEM deadlock-breaker. 60 ms is right for shipping (a stuck fence
++// becomes a one-frame artifact rather than a freeze) but wrong for diagnosis,
++// where firing it cuts the indirect-buffer chain and masks the real dependency.
++REXCVAR_DEFINE_INT32(gpu_wait_reg_mem_timeout_ms, 60, "GPU",
++                     "How long WAIT_REG_MEM waits before proceeding anyway "
++                     "(raise it during bring-up; firing this can cut the IB chain)");
++
++REXCVAR_DEFINE_BOOL(gpu_interrupt_on_wait_reg_mem, false, "GPU",
++                    "While the CP is blocked on a memory WAIT_REG_MEM, periodically raise the "
++                    "guest graphics interrupt so its ISR can service the semaphore record "
++                    "(GoldenEye-Recomp-ios experiment, M-027)");
++
++REXCVAR_DEFINE_BOOL(gpu_perform_wait_reg_mem_release, false, "GPU",
++                    "On WAIT_REG_MEM timeout, write the awaited value into the polled memory "
++                    "instead of just proceeding (GoldenEye-Recomp-ios experiment, M-027)");
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -15,6 +15,11 @@
+ 
+ // GPU Core
+ REXCVAR_DECLARE(bool, vsync);
++// Added by the GoldenEye-Recomp-ios overlay -- WAIT_REG_MEM deadlock-breaker
++// budget; see command_processor.cpp and M-027.
++REXCVAR_DECLARE(int32_t, gpu_wait_reg_mem_timeout_ms);
++REXCVAR_DECLARE(bool, gpu_interrupt_on_wait_reg_mem);
++REXCVAR_DECLARE(bool, gpu_perform_wait_reg_mem_release);
+ REXCVAR_DECLARE(bool, clear_memory_page_state);
+ REXCVAR_DECLARE(bool, half_pixel_offset);
+ REXCVAR_DECLARE(bool, async_shader_compilation);

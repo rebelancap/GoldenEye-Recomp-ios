@@ -1,0 +1,18 @@
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -376,7 +376,14 @@
+ BaseHeap* Memory::LookupHeapByType(bool physical, uint32_t page_size) {
+   if (physical) {
+     if (page_size <= 4096) {
+-      return &heaps_.vE0000000;
++      // EXPERIMENT (Fable consult round 3): the recompiled guest's own
++      // virtual->physical math adds the hardware +0x1000 for E-view addresses
++      // (measured: ((vaddr>>20)+0x200)&0x1000 in the WAIT_REG_MEM and fence
++      // packet builders). On a 16 KB-page host the E-view mapping cannot give
++      // raw CPU accesses that 4 KB phase, so E-view allocations make the GPU
++      // write 4 KB above where the CPU reads. The A-view has no offset on any
++      // path. Serve 4 KB physical allocations from it.
++      return &heaps_.vA0000000;
+     } else if (page_size <= 64 * 1024) {
+       return &heaps_.vA0000000;
+     } else {

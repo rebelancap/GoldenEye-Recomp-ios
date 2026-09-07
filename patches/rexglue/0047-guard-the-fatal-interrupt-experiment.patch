@@ -1,0 +1,24 @@
+--- a/src/graphics/flags.cpp
++++ b/src/graphics/flags.cpp
+@@ -60,10 +60,17 @@
+                      "How long WAIT_REG_MEM waits before proceeding anyway "
+                      "(raise it during bring-up; firing this can cut the IB chain)");
+ 
+-REXCVAR_DEFINE_BOOL(gpu_interrupt_on_wait_reg_mem, false, "GPU",
+-                    "While the CP is blocked on a memory WAIT_REG_MEM, periodically raise the "
+-                    "guest graphics interrupt so its ISR can service the semaphore record "
+-                    "(GoldenEye-Recomp-ios experiment, M-027)");
++REXCVAR_DEFINE_BOOL(
++    gpu_interrupt_on_wait_reg_mem, false, "GPU",
++    "DANGEROUS -- FATAL ON A HEALTHY PIPELINE. While the CP is blocked on a memory "
++    "WAIT_REG_MEM, periodically raise the guest graphics interrupt so its ISR can service the "
++    "semaphore record. This was a round-2 diagnostic for a pipeline that was already broken, "
++    "and its 'no effect' verdict was measured in that state. On a working pipeline the "
++    "November-2007 debug D3D asserts on any CPU interrupt it did not itself plant "
++    "('Unanticipated CPU_INTERRUPT') and jumps to 0x0BADF00D -- measured fatal within 1 ms "
++    "(M-060). Init-only so that a live console 'set' cannot kill a running game; to use it as "
++    "a diagnostic, put it in ge.toml and relaunch.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ REXCVAR_DEFINE_BOOL(gpu_perform_wait_reg_mem_release, false, "GPU",
+                     "On WAIT_REG_MEM timeout, write the awaited value into the polled memory "

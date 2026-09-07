@@ -1,0 +1,48 @@
+--- a/src/system/xsocket.cpp
++++ b/src/system/xsocket.cpp
+@@ -29,6 +29,18 @@
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
+ #include <sys/socket.h>
++#endif
++
++#if defined(__APPLE__)
++// Darwin defines IPPROTO_* as object-like macros expanding to integer literals,
++// so `XSocket::Protocol::IPPROTO_UDP` becomes `Protocol::17`. (glibc also
++// #defines them, but to themselves, which is harmless.) Drop the macros -- this
++// translation unit only ever names the enumerators, never the system values.
++#undef IPPROTO_IP
++#undef IPPROTO_ICMP
++#undef IPPROTO_TCP
++#undef IPPROTO_UDP
++#undef IPPROTO_RAW
+ #endif
+ 
+ namespace rex::system {
+--- a/src/kernel/xam/xam_net.cpp
++++ b/src/kernel/xam/xam_net.cpp
+@@ -37,11 +37,23 @@
+ // NOTE: must be included last as it expects windows.h to already be included.
+ #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
+ #include <winsock2.h>                    // NOLINT(build/include_order)
+-#elif REX_PLATFORM_LINUX
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+ #include <arpa/inet.h>
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
++#include <sys/select.h>  // select(); reached transitively on glibc, not on Darwin
+ #include <sys/socket.h>
++#endif
++
++#if defined(__APPLE__)
++// See xsocket.cpp: Darwin's IPPROTO_* are integer-literal macros and collide
++// with XSocket::Protocol's enumerators. This file uses the system AF_*/
++// INADDR_* values (left intact) but names IPPROTO_* only via the enum.
++#undef IPPROTO_IP
++#undef IPPROTO_ICMP
++#undef IPPROTO_TCP
++#undef IPPROTO_UDP
++#undef IPPROTO_RAW
+ #endif
+ 
+ namespace rex {

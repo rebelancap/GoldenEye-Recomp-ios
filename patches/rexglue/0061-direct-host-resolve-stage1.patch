@@ -1,0 +1,1043 @@
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -43,6 +43,19 @@
+ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++REXCVAR_DEFINE_BOOL(direct_resolve, true, "GPU/Vulkan",
++                    "Fuse eligible resolve copies into one compute pass reading the render "
++                    "target directly (M-078..M-084), skipping the EDRAM dump+copy round-trip. "
++                    "Off = every resolve takes the stock dump path. Hot-reloadable, for live "
++                    "A/B over the bridge.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(direct_resolve_depth, true, "GPU/Vulkan",
++                    "Include DEPTH resolves in the fused direct path (the final EDRAM stage). "
++                    "Off = depth resolves dump, color still fuses -- the bisect lever for "
++                    "anything that smells of depth-fusion misbehavior.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ // Records the path Setup actually selected (0 = fbo, 1 = fsi) for the exported
+ // RexActiveRenderTargetPath at the bottom of this file, which the settings page
+@@ -1554,10 +1567,12 @@
+       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
+           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
+       bool direct_resolved = false;
++      DirectResolvePrep direct_prep;
+       if (GetPath() == Path::kHostRenderTargets) {
+         if (REXCVAR_GET(direct_host_resolve)) {
+           direct_resolved =
+-              TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
++              TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled,
++                                     direct_prep);
+           if (direct_resolved) {
+             ++direct_resolve_success_count_;
+           } else {
+@@ -1650,6 +1665,32 @@
+                               std::pair<uint32_t, uint32_t>(uint32_t(copy_dest_use_start),
+                                                             uint32_t(copy_dest_use_length)));
+           }
++          if (direct_resolved) {
++            // M-062 direct resolve: one fused pass, source RT image -> dest.
++            // No EDRAM buffer involvement at all -- that is the point. The
++            // dest flow above (commit, transient descriptor, shared_memory
++            // .Use) is shared with the copy path verbatim.
++            command_processor_.BindExternalComputePipeline(direct_prep.pipeline);
++            VkPipelineLayout direct_layout = direct_prep.is_depth
++                                                 ? direct_resolve_pipeline_layout_depth_
++                                                 : direct_resolve_pipeline_layout_color_;
++            VkDescriptorSet direct_sets[2] = {descriptor_set_dest,
++                                              direct_prep.source_descriptor_set};
++            command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, direct_layout,
++                                                   0, 2, direct_sets, 0, nullptr);
++            DirectResolvePushConstants direct_push;
++            direct_push.resolve = copy_shader_constants;
++            direct_push.resolve.dest_base -=
++                uint32_t(write_descriptor_set_dest_buffer_info.offset);
++            direct_push.source_base_tiles = direct_prep.source_base_tiles;
++            direct_push.source_pitch_tiles = direct_prep.source_pitch_tiles;
++            direct_push.dispatch_first_tile = direct_prep.dispatch_first_tile;
++            command_buffer.CmdVkPushConstants(direct_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                              sizeof(direct_push), &direct_push);
++            command_processor_.SubmitBarriers(true);
++            CountGpuDispatch(DispatchKind::kResolveCopy);
++            command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
++          } else {
+           UseEdramBuffer(EdramBufferUsage::kComputeRead);
+           command_processor_.BindExternalComputePipeline(
+               resolve_copy_pipelines_[size_t(copy_shader)]);
+@@ -1676,6 +1717,7 @@
+           command_processor_.SubmitBarriers(true);
+           CountGpuDispatch(DispatchKind::kResolveCopy);
+           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
++          }
+ 
+           // Invalidate textures and mark the range as scaled if needed.
+           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+@@ -6388,24 +6430,820 @@
+   if (pipeline_it != direct_resolve_pipelines_.end()) {
+     return pipeline_it->second;
+   }
+-  VkPipeline pipeline = VK_NULL_HANDLE;
+-  // Until dedicated direct host RT -> shared memory shaders are added, reuse
+-  // the resolve copy pipelines to keep all resolve shader modes wired for the
+-  // direct preflight path.
+-  size_t copy_shader_index = size_t(key.copy_shader);
+-  if (copy_shader_index < size_t(draw_util::ResolveCopyShaderIndex::kCount)) {
+-    pipeline = resolve_copy_pipelines_[copy_shader_index];
++  // M-062 direct resolve, stage 1: a fused source-image -> shared-memory
++  // resolve for the common case ONLY (32bpp color, 1x MSAA, unscaled,
++  // k_8_8_8_8). Everything else caches VK_NULL_HANDLE and the caller falls
++  // back to dump+copy. The shader is the prebuilt resolve_fast_32bpp copy
++  // shader's exact structure (docs/direct-resolve-design.md carries the
++  // instruction-level decode; scratchpad/resolve_fast_32bpp.dis is the
++  // reference) with the EDRAM buffer load replaced by: EDRAM sample
++  // position -> owning-RT texel -> image fetch -> the dump generator's
++  // k_8_8_8_8 packing. Bit-identical to dump+copy by construction.
++  const DumpPipelineKey& dump_key = key.dump_pipeline_key;
++  // Stage 2a: 1x/2x via the 1x2x fast shader, 4x via the 4x fast shader (the
++  // two share byte-identical destination math -- constant-diff of the
++  // disassemblies; the 4x variant differs only in sample selection, which on
++  // the fused source side is the dump generator's own MSAA mapping).
++  // Stage 2 (validated 2026-08-07): 1x/2x via the 1x2x fast shader, 4x via
++  // the 4x fast shader. The M-080 black-thumbnail bug was the 4x sample
++  // stride (two columns per output pixel); fixed and proven pixel-identical
++  // to the stock path on matched-timeline boots at the resolve-fed menu
++  // screens (the standing fidelity canary), and rtdump 6->4 in Dam.
++  bool msaa_shader_ok =
++      (dump_key.msaa_samples <= xenos::MsaaSamples::k2X &&
++       key.copy_shader == draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA) ||
++      (dump_key.msaa_samples == xenos::MsaaSamples::k4X &&
++       key.copy_shader == draw_util::ResolveCopyShaderIndex::kFast32bpp4xMSAA) ||
++      // Stage 3: the kFull32bpp class (arbitrary alignment; 4 dest pixels per
++      // invocation, ONE uint4 store). Same push layout and dest tiling as the
++      // fast class -- disassembly-verified; the exponent-bias field it adds is
++      // inert for the gated k_8_8_8_8 format.
++      key.copy_shader == draw_util::ResolveCopyShaderIndex::kFull32bpp;
++  bool format_ok =
++      dump_key.is_depth
++          ? (dump_key.GetDepthFormat() == xenos::DepthRenderTargetFormat::kD24S8 ||
++             dump_key.GetDepthFormat() == xenos::DepthRenderTargetFormat::kD24FS8)
++          : dump_key.GetColorFormat() == xenos::ColorRenderTargetFormat::k_8_8_8_8;
++  // Depth resolves route through the FAST classes (sample-select; averaging
++  // depth is meaningless) -- census-confirmed. kFull stays color-only.
++  bool depth_shape_ok =
++      !dump_key.is_depth || key.copy_shader != draw_util::ResolveCopyShaderIndex::kFull32bpp;
++  if (!msaa_shader_ok || !format_ok || !depth_shape_ok || key.draw_resolution_scaled) {
++    direct_resolve_pipelines_.emplace(key, VK_NULL_HANDLE);
++    return VK_NULL_HANDLE;
++  }
++  bool source_is_multisampled = dump_key.msaa_samples != xenos::MsaaSamples::k1X;
++  bool full_shape = key.copy_shader == draw_util::ResolveCopyShaderIndex::kFull32bpp;
++  uint32_t pixels_per_invocation = full_shape ? 4u : 8u;
++  uint32_t pixel_base_shift = full_shape ? 2u : 3u;
++
++  std::vector<spv::Id> id_vector_temp;
++  SpirvBuilder builder(spv::Spv_1_0, (SpirvShaderTranslator::kSpirvMagicToolId << 16) | 1, nullptr);
++  spv::Id ext_inst_glsl_std_450 = builder.import("GLSL.std.450");
++  builder.addCapability(spv::CapabilityShader);
++  builder.setMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
++  builder.setSource(spv::SourceLanguageUnknown, 0);
++
++  spv::Id type_void = builder.makeVoidType();
++  spv::Id type_bool = builder.makeBoolType();
++  spv::Id type_int = builder.makeIntType(32);
++  spv::Id type_int2 = builder.makeVectorType(type_int, 2);
++  spv::Id type_uint = builder.makeUintType(32);
++  spv::Id type_uint2 = builder.makeVectorType(type_uint, 2);
++  spv::Id type_uint3 = builder.makeVectorType(type_uint, 3);
++  spv::Id type_uint4 = builder.makeVectorType(type_uint, 4);
++  spv::Id type_float = builder.makeFloatType(32);
++  spv::Id type_float4 = builder.makeVectorType(type_float, 4);
++
++  // Destination: v4uint runtime array, set 0 binding 0 (the direct layout's
++  // transient storage buffer), NonReadable -- mirrors the copy shader's dest.
++  id_vector_temp.clear();
++  id_vector_temp.push_back(builder.makeRuntimeArray(type_uint4));
++  builder.addDecoration(id_vector_temp.back(), spv::DecorationArrayStride, sizeof(uint32_t) * 4);
++  spv::Id type_dest = builder.makeStructType(id_vector_temp, "XeResolveDest");
++  builder.addMemberName(type_dest, 0, "dest");
++  builder.addMemberDecoration(type_dest, 0, spv::DecorationNonReadable);
++  builder.addMemberDecoration(type_dest, 0, spv::DecorationOffset, 0);
++  builder.addDecoration(type_dest, spv::DecorationBufferBlock);
++  spv::Id dest_buffer =
++      builder.createVariable(spv::NoPrecision, spv::StorageClassUniform, type_dest, "xe_dest");
++  builder.addDecoration(dest_buffer, spv::DecorationDescriptorSet, 0);
++  builder.addDecoration(dest_buffer, spv::DecorationBinding, 0);
++
++  // Source render target image: sampled float 2D, set 1 binding 0 (the direct
++  // layout's sampled-image set).
++  spv::Id source_texture = builder.createVariable(
++      spv::NoPrecision, spv::StorageClassUniformConstant,
++      builder.makeImageType(type_float, spv::Dim2D, false, false, source_is_multisampled, 1,
++                            spv::ImageFormatUnknown),
++      "xe_direct_resolve_source");
++  builder.addDecoration(source_texture, spv::DecorationDescriptorSet, 1);
++  builder.addDecoration(source_texture, spv::DecorationBinding, 0);
++  spv::Id source_stencil_texture = spv::NoResult;
++  if (dump_key.is_depth) {
++    source_stencil_texture = builder.createVariable(
++        spv::NoPrecision, spv::StorageClassUniformConstant,
++        builder.makeImageType(type_uint, spv::Dim2D, false, false, source_is_multisampled, 1,
++                              spv::ImageFormatUnknown),
++        "xe_direct_resolve_stencil");
++    builder.addDecoration(source_stencil_texture, spv::DecorationDescriptorSet, 1);
++    builder.addDecoration(source_stencil_texture, spv::DecorationBinding, 1);
++  }
++
++  // Push constants: the copy shader's five words + source_base_tiles,
++  // source_pitch_tiles, dispatch_first_tile (DirectResolvePushConstants).
++  constexpr uint32_t kPushCount = 8;
++  id_vector_temp.clear();
++  for (uint32_t i = 0; i < kPushCount; ++i) {
++    id_vector_temp.push_back(type_uint);
++  }
++  spv::Id type_push = builder.makeStructType(id_vector_temp, "XeDirectResolvePushConstants");
++  for (uint32_t i = 0; i < kPushCount; ++i) {
++    builder.addMemberDecoration(type_push, i, spv::DecorationOffset, int(sizeof(uint32_t) * i));
++  }
++  builder.addDecoration(type_push, spv::DecorationBlock);
++  spv::Id push_constants = builder.createVariable(spv::NoPrecision, spv::StorageClassPushConstant,
++                                                  type_push, "xe_direct_resolve_push");
++
++  spv::Id input_global_invocation_id = builder.createVariable(
++      spv::NoPrecision, spv::StorageClassInput, type_uint3, "gl_GlobalInvocationID");
++  builder.addDecoration(input_global_invocation_id, spv::DecorationBuiltIn,
++                        spv::BuiltInGlobalInvocationId);
++
++  std::vector<spv::Id> main_param_types;
++  std::vector<std::vector<spv::Decoration>> main_precisions;
++  spv::Block* main_entry;
++  spv::Function* main_function = builder.makeFunctionEntry(
++      spv::NoPrecision, type_void, "main", main_param_types, main_precisions, &main_entry);
++
++  auto load_push = [&](uint32_t index) -> spv::Id {
++    id_vector_temp.clear();
++    id_vector_temp.push_back(builder.makeIntConstant(int(index)));
++    return builder.createLoad(
++        builder.createAccessChain(spv::StorageClassPushConstant, push_constants, id_vector_temp),
++        spv::NoPrecision);
++  };
++  spv::Id const_uint_0 = builder.makeUintConstant(0);
++  spv::Id const_uint_1 = builder.makeUintConstant(1);
++  spv::Id const_uint_2 = builder.makeUintConstant(2);
++  spv::Id const_uint_3 = builder.makeUintConstant(3);
++
++  // --- push decode, verbatim semantics of the copy shader ---
++  spv::Id w0 = load_push(0);  // edram_info
++  spv::Id w1 = load_push(1);  // coordinate_info
++  spv::Id edram_pitch_tiles =
++      builder.createBinOp(spv::OpBitwiseAnd, type_uint, w0, builder.makeUintConstant(1023));
++  spv::Id edram_msaa = builder.createBinOp(
++      spv::OpBitwiseAnd, type_uint,
++      builder.createBinOp(spv::OpShiftRightLogical, type_uint, w0, builder.makeUintConstant(10)),
++      const_uint_3);
++  spv::Id edram_is_depth = builder.createBinOp(
++      spv::OpINotEqual, type_bool,
++      builder.createBinOp(spv::OpBitwiseAnd, type_uint, w0, builder.makeUintConstant(4096)),
++      const_uint_0);
++  spv::Id edram_base_tiles = builder.createBinOp(
++      spv::OpBitwiseAnd, type_uint,
++      builder.createBinOp(spv::OpShiftRightLogical, type_uint, w0, builder.makeUintConstant(13)),
++      builder.makeUintConstant(2047));
++  spv::Id copy_format = builder.createBinOp(
++      spv::OpBitwiseAnd, type_uint,
++      builder.createBinOp(spv::OpShiftRightLogical, type_uint, w0, builder.makeUintConstant(24)),
++      builder.makeUintConstant(15));
++  // w1: packed source offset (x: bits 0-3, y: bits 4-7, both <<3), width in
++  // 8-sample units at bits 5-15 of w1>>5 (verbatim from the .dis: two views
++  // of the same word).
++  spv::Id w1_pair = builder.createCompositeConstruct(
++      type_uint2, std::vector<spv::Id>{w1, w1});
++  id_vector_temp.clear();
++  id_vector_temp.push_back(const_uint_0);
++  id_vector_temp.push_back(builder.makeUintConstant(4));
++  spv::Id offset_shifts = builder.createCompositeConstruct(type_uint2, id_vector_temp);
++  spv::Id const_15_pair = builder.createCompositeConstruct(
++      type_uint2, std::vector<spv::Id>{builder.makeUintConstant(15), const_uint_1});
++  spv::Id source_offset = builder.createBinOp(
++      spv::OpShiftLeftLogical, type_uint2,
++      builder.createBinOp(
++          spv::OpBitwiseAnd, type_uint2,
++          builder.createBinOp(spv::OpShiftRightLogical, type_uint2, w1_pair, offset_shifts),
++          const_15_pair),
++      builder.createCompositeConstruct(type_uint2,
++                                       std::vector<spv::Id>{const_uint_3, const_uint_3}));
++  spv::Id extent_x_blocks = builder.createBinOp(
++      spv::OpBitwiseAnd, type_uint,
++      builder.createBinOp(spv::OpShiftRightLogical, type_uint, w1, builder.makeUintConstant(5)),
++      builder.makeUintConstant(2047));
++
++  spv::Id w2 = load_push(2);  // dest_info
++  spv::Id dest_endian =
++      builder.createBinOp(spv::OpBitwiseAnd, type_uint, w2, builder.makeUintConstant(7));
++  spv::Id dest_is_3d = builder.createBinOp(
++      spv::OpINotEqual, type_bool,
++      builder.createBinOp(spv::OpBitwiseAnd, type_uint, w2, builder.makeUintConstant(8)),
++      const_uint_0);
++  spv::Id dest_slice = builder.createBinOp(
++      spv::OpBitwiseAnd, type_uint,
++      builder.createBinOp(spv::OpShiftRightLogical, type_uint, w2, builder.makeUintConstant(4)),
++      builder.makeUintConstant(7));
++  spv::Id channel_swap = builder.createBinOp(
++      spv::OpINotEqual, type_bool,
++      builder.createBinOp(spv::OpBitwiseAnd, type_uint, w2, builder.makeUintConstant(16777216)),
++      const_uint_0);
++
++  spv::Id w3 = load_push(3);  // dest_coordinate_info
++  spv::Id dest_pitch = builder.createBinOp(
++      spv::OpShiftLeftLogical, type_uint,
++      builder.createBinOp(spv::OpBitwiseAnd, type_uint, w3, builder.makeUintConstant(1023)),
++      builder.makeUintConstant(5));
++  spv::Id dest_height = builder.createBinOp(
++      spv::OpShiftLeftLogical, type_uint,
++      builder.createBinOp(
++          spv::OpBitwiseAnd, type_uint,
++          builder.createBinOp(spv::OpShiftRightLogical, type_uint, w3,
++                              builder.makeUintConstant(10)),
++          builder.makeUintConstant(1023)),
++      builder.makeUintConstant(5));
++  spv::Id w3_pair =
++      builder.createCompositeConstruct(type_uint2, std::vector<spv::Id>{w3, w3});
++  spv::Id dest_offset = builder.createBinOp(
++      spv::OpShiftLeftLogical, type_uint2,
++      builder.createBinOp(
++          spv::OpBitwiseAnd, type_uint2,
++          builder.createBinOp(
++              spv::OpShiftRightLogical, type_uint2, w3_pair,
++              builder.createCompositeConstruct(
++                  type_uint2, std::vector<spv::Id>{builder.makeUintConstant(20),
++                                                   builder.makeUintConstant(24)})),
++          builder.createCompositeConstruct(
++              type_uint2, std::vector<spv::Id>{builder.makeUintConstant(15),
++                                               builder.makeUintConstant(15)})),
++      builder.createCompositeConstruct(type_uint2,
++                                       std::vector<spv::Id>{const_uint_3, const_uint_3}));
++  spv::Id sample_swap_class_raw = builder.createBinOp(
++      spv::OpBitwiseAnd, type_uint,
++      builder.createBinOp(spv::OpShiftRightLogical, type_uint, w3, builder.makeUintConstant(28)),
++      builder.makeUintConstant(7));
++
++  spv::Id dest_base = load_push(4);
++  spv::Id src_base_tiles = load_push(5);
++  spv::Id src_pitch_tiles = load_push(6);
++
++  // --- guard: gid.x >= extent_x_blocks -> return ---
++  id_vector_temp.clear();
++  id_vector_temp.push_back(const_uint_0);
++  spv::Id gid_x = builder.createLoad(
++      builder.createAccessChain(spv::StorageClassInput, input_global_invocation_id, id_vector_temp),
++      spv::NoPrecision);
++  spv::Id guard_limit =
++      full_shape ? builder.createBinOp(spv::OpShiftLeftLogical, type_uint, extent_x_blocks,
++                                       const_uint_1)
++                 : extent_x_blocks;
++  spv::Builder::If guard_if(
++      builder.createBinOp(spv::OpULessThan, type_bool, gid_x, guard_limit),
++      spv::SelectionControlDontFlattenMask, builder);
++
++  // --- sample position (the copy shader's %21036/%17779 chain) ---
++  spv::Id gid = builder.createLoad(input_global_invocation_id, spv::NoPrecision);
++  spv::Id gid_xy = builder.createRvalueSwizzle(spv::NoPrecision, type_uint2, gid,
++                                               std::vector<unsigned int>{0, 1});
++  spv::Id pos_blocks = builder.createBinOp(
++      spv::OpShiftLeftLogical, type_uint2, gid_xy,
++      builder.createCompositeConstruct(
++          type_uint2, std::vector<spv::Id>{builder.makeUintConstant(pixel_base_shift),
++                                           const_uint_0}));
++  spv::Id pos = builder.createBinOp(spv::OpIAdd, type_uint2, pos_blocks, source_offset);
++  // Sample-swap class: <=3 as-is, ==5 -> 2, else 0 (%23776 phi).
++  spv::Id class_le3 = builder.createBinOp(spv::OpULessThanEqual, type_bool, sample_swap_class_raw,
++                                          const_uint_3);
++  spv::Id class_eq5 = builder.createBinOp(spv::OpIEqual, type_bool, sample_swap_class_raw,
++                                          builder.makeUintConstant(5));
++  spv::Id swap_class = builder.createTriOp(
++      spv::OpSelect, type_uint, class_le3, sample_swap_class_raw,
++      builder.createTriOp(spv::OpSelect, type_uint, class_eq5, const_uint_2, const_uint_0));
++  // MSAA position scaling (per-axis <<1 when msaa >= {2,1} -- verbatim).
++  spv::Id msaa_pair = builder.createCompositeConstruct(
++      type_uint2, std::vector<spv::Id>{edram_msaa, edram_msaa});
++  spv::Id msaa_ge = builder.createBinOp(
++      spv::OpUGreaterThanEqual, builder.makeVectorType(type_bool, 2), msaa_pair,
++      builder.createCompositeConstruct(type_uint2,
++                                       std::vector<spv::Id>{const_uint_2, const_uint_1}));
++  spv::Id ones_pair = builder.createCompositeConstruct(
++      type_uint2, std::vector<spv::Id>{const_uint_1, const_uint_1});
++  spv::Id zeros_pair = builder.createCompositeConstruct(
++      type_uint2, std::vector<spv::Id>{const_uint_0, const_uint_0});
++  spv::Id msaa_shift = builder.createTriOp(spv::OpSelect, type_uint2, msaa_ge, ones_pair,
++                                           zeros_pair);
++  spv::Id pos_scaled = builder.createBinOp(spv::OpShiftLeftLogical, type_uint2, pos, msaa_shift);
++  spv::Id swap_pair = builder.createCompositeConstruct(
++      type_uint2, std::vector<spv::Id>{swap_class, swap_class});
++  spv::Id swap_add = builder.createBinOp(
++      spv::OpBitwiseAnd, type_uint2,
++      builder.createBinOp(
++          spv::OpShiftRightLogical, type_uint2, swap_pair,
++          builder.createCompositeConstruct(type_uint2,
++                                           std::vector<spv::Id>{const_uint_1, const_uint_0})),
++      ones_pair);
++  spv::Id sample_pos = builder.createBinOp(spv::OpIAdd, type_uint2, pos_scaled, swap_add);
++
++  // --- EDRAM tile decomposition (80x16) ---
++  spv::Id tile_dims = builder.createCompositeConstruct(
++      type_uint2, std::vector<spv::Id>{builder.makeUintConstant(80),
++                                       builder.makeUintConstant(16)});
++  spv::Id tile_xy = builder.createBinOp(spv::OpUDiv, type_uint2, sample_pos, tile_dims);
++  spv::Id in_tile = builder.createBinOp(
++      spv::OpISub, type_uint2, sample_pos,
++      builder.createBinOp(spv::OpIMul, type_uint2, tile_xy, tile_dims));
++  // Depth column swap (in.x +/- 40) -- gated on is_depth at runtime, verbatim.
++  spv::Id in_x = builder.createCompositeExtract(in_tile, type_uint, 0);
++  spv::Id in_x_ge40 = builder.createBinOp(spv::OpUGreaterThanEqual, type_bool, in_x,
++                                          builder.makeUintConstant(40));
++  spv::Id in_x_depth = builder.createBinOp(
++      spv::OpIAdd, type_uint, in_x,
++      builder.createTriOp(spv::OpSelect, type_uint, in_x_ge40,
++                          builder.makeUintConstant(uint32_t(-40)), builder.makeUintConstant(40)));
++  in_x = builder.createTriOp(spv::OpSelect, type_uint, edram_is_depth, in_x_depth, in_x);
++  spv::Id in_y = builder.createCompositeExtract(in_tile, type_uint, 1);
++  spv::Id tile_x = builder.createCompositeExtract(tile_xy, type_uint, 0);
++  spv::Id tile_y = builder.createCompositeExtract(tile_xy, type_uint, 1);
++  spv::Id edram_tile = builder.createBinOp(
++      spv::OpIAdd, type_uint, edram_base_tiles,
++      builder.createBinOp(spv::OpIAdd, type_uint,
++                          builder.createBinOp(spv::OpIMul, type_uint, tile_y, edram_pitch_tiles),
++                          tile_x));
++
++  // --- SOURCE (the fused replacement): RT texel from the EDRAM tile ---
++  spv::Id rt_tile = builder.createBinOp(spv::OpISub, type_uint, edram_tile, src_base_tiles);
++  spv::Id rt_tile_y = builder.createBinOp(spv::OpUDiv, type_uint, rt_tile, src_pitch_tiles);
++  spv::Id rt_tile_x = builder.createBinOp(spv::OpUMod, type_uint, rt_tile, src_pitch_tiles);
++  spv::Id texel_base_x = builder.createBinOp(
++      spv::OpIAdd, type_uint,
++      builder.createBinOp(spv::OpIMul, type_uint, rt_tile_x, builder.makeUintConstant(80)), in_x);
++  spv::Id texel_y = builder.createBinOp(
++      spv::OpIAdd, type_uint,
++      builder.createBinOp(spv::OpIMul, type_uint, rt_tile_y, builder.makeUintConstant(16)), in_y);
++  spv::Id texel_y_int = builder.createUnaryOp(spv::OpBitcast, type_int, texel_y);
++
++  // Fetch 8 texels, pack each with the dump's k_8_8_8_8 packing.
++  spv::Id unorm_scale = builder.makeFloatConstant(255.0f);
++  spv::Id unorm_round = builder.makeFloatConstant(0.5f);
++  spv::Id component_width = builder.makeUintConstant(8);
++  spv::Id packed_samples[8];
++  for (uint32_t i = 0; i < pixels_per_invocation; ++i) {
++    // texel_base_x/texel_y are SAMPLE coordinates in the RT's sample space.
++    // Map to (pixel, sample index) exactly as the dump generator does
++    // (rtc.cpp:6086-6112): 4x -> pixel = sample >> 1 both axes, sample id
++    // bit0 = x&1, bit1 = y&1; 2x -> pixel_y = sample_y >> 1, sample id via
++    // the guest->Vulkan standard-location remap; 1x -> identity.
++    // Pixel stride in SAMPLE space: at 4x MSAA each output pixel spans two
++    // sample columns (the M-080 black-thumbnail bug was stepping one).
++    uint32_t sample_step =
++        dump_key.msaa_samples >= xenos::MsaaSamples::k4X ? (i << 1) : i;
++    spv::Id sample_x = builder.createBinOp(spv::OpIAdd, type_uint, texel_base_x,
++                                           builder.makeUintConstant(sample_step));
++    spv::Id pixel_x = sample_x;
++    spv::Id pixel_y_id = texel_y;
++    spv::Id fetch_sample_id = spv::NoResult;
++    if (source_is_multisampled) {
++      pixel_y_id =
++          builder.createBinOp(spv::OpShiftRightLogical, type_uint, texel_y, const_uint_1);
++      if (dump_key.msaa_samples >= xenos::MsaaSamples::k4X) {
++        pixel_x = builder.createBinOp(spv::OpShiftRightLogical, type_uint, sample_x, const_uint_1);
++        fetch_sample_id = builder.createQuadOp(
++            spv::OpBitFieldInsert, type_uint,
++            builder.createBinOp(spv::OpBitwiseAnd, type_uint, sample_x, const_uint_1), texel_y,
++            const_uint_1, const_uint_1);
++      } else {
++        fetch_sample_id = builder.createTriOp(
++            spv::OpSelect, type_uint,
++            builder.createBinOp(
++                spv::OpINotEqual, type_bool,
++                builder.createBinOp(spv::OpBitwiseAnd, type_uint, texel_y, const_uint_1),
++                const_uint_0),
++            builder.makeUintConstant(
++                draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_attachments_supported_)),
++            builder.makeUintConstant(
++                draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_attachments_supported_)));
++      }
++    }
++    id_vector_temp.clear();
++    id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, pixel_x));
++    id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, pixel_y_id));
++    spv::Builder::TextureParameters fetch_params = {};
++    fetch_params.sampler = builder.createLoad(source_texture, spv::NoPrecision);
++    fetch_params.coords = builder.createCompositeConstruct(type_int2, id_vector_temp);
++    if (source_is_multisampled) {
++      fetch_params.sample = builder.createUnaryOp(spv::OpBitcast, type_int, fetch_sample_id);
++    } else {
++      fetch_params.lod = builder.makeIntConstant(0);
++    }
++    spv::Id texel_vec4 = builder.createTextureCall(spv::NoPrecision, type_float4, false, true,
++                                                   false, false, false, fetch_params,
++                                                   spv::ImageOperandsMaskNone);
++    // kFull is a true MSAA resolve: it AVERAGES every sample of the pixel
++    // (the fast class and the plain path select one -- the census delta that
++    // caught this). Fetch the remaining samples and average; order is
++    // permutation-invariant so guest->Vulkan sample remaps don't matter.
++    if (full_shape && source_is_multisampled) {
++      uint32_t sample_count = dump_key.msaa_samples >= xenos::MsaaSamples::k4X ? 4u : 2u;
++      spv::Id acc = spv::NoResult;
++      for (uint32_t si = 0; si < sample_count; ++si) {
++        spv::Builder::TextureParameters avg_params = fetch_params;
++        avg_params.sample = builder.makeIntConstant(int(si));
++        spv::Id sv = builder.createTextureCall(spv::NoPrecision, type_float4, false, true, false,
++                                               false, false, avg_params,
++                                               spv::ImageOperandsMaskNone);
++        acc = si == 0 ? sv : builder.createBinOp(spv::OpFAdd, type_float4, acc, sv);
++      }
++      texel_vec4 = builder.createBinOp(
++          spv::OpVectorTimesScalar, type_float4, acc,
++          builder.makeFloatConstant(1.0f / float(sample_count)));
++    }
++    spv::Id packed;
++    if (dump_key.is_depth) {
++      // Depth encode, verbatim from the dump generator: depth24 (RoundEven
++      // for D24S8, 20e4 for D24FS8) in bits 8-31, stencil in bits 0-7.
++      spv::Builder::TextureParameters stencil_params = fetch_params;
++      stencil_params.sampler = builder.createLoad(source_stencil_texture, spv::NoPrecision);
++      spv::Id stencil_val = builder.createCompositeExtract(
++          builder.createTextureCall(spv::NoPrecision, builder.makeVectorType(type_uint, 4), false,
++                                    true, false, false, false, stencil_params,
++                                    spv::ImageOperandsMaskNone),
++          type_uint, 0);
++      spv::Id depth32 = builder.createCompositeExtract(texel_vec4, type_float, 0);
++      spv::Id depth24;
++      if (dump_key.GetDepthFormat() == xenos::DepthRenderTargetFormat::kD24S8) {
++        depth24 = builder.createUnaryOp(
++            spv::OpConvertFToU, type_uint,
++            builder.createUnaryBuiltinCall(
++                type_float, ext_inst_glsl_std_450, GLSLstd450RoundEven,
++                builder.createBinOp(spv::OpFMul, type_float, depth32,
++                                    builder.makeFloatConstant(float(0xFFFFFF)))));
++      } else {
++        depth24 = SpirvShaderTranslator::PreClampedDepthTo20e4(
++            builder, depth32, depth_float24_round(), true, ext_inst_glsl_std_450);
++      }
++      packed = builder.createQuadOp(spv::OpBitFieldInsert, type_uint, stencil_val, depth24,
++                                    builder.makeUintConstant(8), builder.makeUintConstant(24));
++    } else {
++      packed = builder.createUnaryOp(
++          spv::OpConvertFToU, type_uint,
++          builder.createBinOp(
++              spv::OpFAdd, type_float,
++              builder.createBinOp(spv::OpFMul, type_float,
++                                  builder.createCompositeExtract(texel_vec4, type_float, 0),
++                                  unorm_scale),
++              unorm_round));
++      for (uint32_t c = 1; c < 4; ++c) {
++        spv::Id comp = builder.createUnaryOp(
++            spv::OpConvertFToU, type_uint,
++            builder.createBinOp(
++                spv::OpFAdd, type_float,
++                builder.createBinOp(spv::OpFMul, type_float,
++                                    builder.createCompositeExtract(texel_vec4, type_float, c),
++                                    unorm_scale),
++                unorm_round));
++        packed = builder.createQuadOp(spv::OpBitFieldInsert, type_uint, packed, comp,
++                                      builder.makeUintConstant(8 * c), component_width);
++      }
++    }
++    packed_samples[i] = packed;
+   }
++  id_vector_temp.clear();
++  for (uint32_t i = 0; i < 4; ++i) id_vector_temp.push_back(packed_samples[i]);
++  spv::Id data_lo = builder.createCompositeConstruct(type_uint4, id_vector_temp);
++  spv::Id data_hi = spv::NoResult;
++  if (!full_shape) {
++    id_vector_temp.clear();
++    for (uint32_t i = 4; i < 8; ++i) id_vector_temp.push_back(packed_samples[i]);
++    data_hi = builder.createCompositeConstruct(type_uint4, id_vector_temp);
++  }
++
++  // --- channel swap (the copy's bit24 + format switch): for 32bpp formats
++  // 0/1 -> 8-in-32 red/blue style swap via the 16-shift composite; 2,3,10,12
++  // -> 10-10-10 rotate. Verbatim as two selectable transforms. ---
++  auto swap_8in32 = [&](spv::Id v) -> spv::Id {
++    spv::Id mask_ff00ff00 = builder.makeUintConstant(0xFF00FF00u);
++    spv::Id mask_ff = builder.makeUintConstant(0x000000FFu);
++    spv::Id m4_hi = builder.smearScalar(spv::NoPrecision, mask_ff00ff00, type_uint4);
++    spv::Id m4_ff = builder.smearScalar(spv::NoPrecision, mask_ff, type_uint4);
++    spv::Id c16 = builder.smearScalar(spv::NoPrecision, builder.makeUintConstant(16), type_uint4);
++    spv::Id keep = builder.createBinOp(spv::OpBitwiseAnd, type_uint4, v, m4_hi);
++    spv::Id lo = builder.createBinOp(spv::OpBitwiseAnd, type_uint4, v, m4_ff);
++    spv::Id lo_shifted = builder.createBinOp(spv::OpShiftLeftLogical, type_uint4, lo, c16);
++    spv::Id hi = builder.createBinOp(
++        spv::OpBitwiseAnd, type_uint4,
++        builder.createBinOp(spv::OpShiftRightLogical, type_uint4, v, c16), m4_ff);
++    return builder.createBinOp(
++        spv::OpBitwiseOr, type_uint4,
++        builder.createBinOp(spv::OpBitwiseOr, type_uint4, keep, lo_shifted), hi);
++  };
++  auto swap_10in32 = [&](spv::Id v) -> spv::Id {
++    spv::Id m_keep = builder.smearScalar(spv::NoPrecision,
++                                         builder.makeUintConstant(0xC00FFC00u), type_uint4);
++    spv::Id m_10 = builder.smearScalar(spv::NoPrecision, builder.makeUintConstant(1023),
++                                       type_uint4);
++    spv::Id c20 = builder.smearScalar(spv::NoPrecision, builder.makeUintConstant(20), type_uint4);
++    spv::Id keep = builder.createBinOp(spv::OpBitwiseAnd, type_uint4, v, m_keep);
++    spv::Id lo = builder.createBinOp(
++        spv::OpShiftLeftLogical, type_uint4,
++        builder.createBinOp(spv::OpBitwiseAnd, type_uint4, v, m_10), c20);
++    spv::Id hi = builder.createBinOp(
++        spv::OpBitwiseAnd, type_uint4,
++        builder.createBinOp(spv::OpShiftRightLogical, type_uint4, v, c20), m_10);
++    return builder.createBinOp(spv::OpBitwiseOr, type_uint4,
++                               builder.createBinOp(spv::OpBitwiseOr, type_uint4, keep, lo), hi);
++  };
++  spv::Id fmt_is_8888 = builder.createBinOp(
++      spv::OpULessThanEqual, type_bool, copy_format, const_uint_1);
++  spv::Id fmt_is_10 = builder.createBinOp(
++      spv::OpLogicalOr, type_bool,
++      builder.createBinOp(
++          spv::OpLogicalAnd, type_bool,
++          builder.createBinOp(spv::OpUGreaterThanEqual, type_bool, copy_format, const_uint_2),
++          builder.createBinOp(spv::OpULessThanEqual, type_bool, copy_format, const_uint_3)),
++      builder.createBinOp(
++          spv::OpLogicalOr, type_bool,
++          builder.createBinOp(spv::OpIEqual, type_bool, copy_format,
++                              builder.makeUintConstant(10)),
++          builder.createBinOp(spv::OpIEqual, type_bool, copy_format,
++                              builder.makeUintConstant(12))));
++  spv::Id do_8888_swap = builder.createBinOp(spv::OpLogicalAnd, type_bool, channel_swap,
++                                             fmt_is_8888);
++  spv::Id do_10_swap = builder.createBinOp(spv::OpLogicalAnd, type_bool, channel_swap, fmt_is_10);
++  if (!dump_key.is_depth) {
++  data_lo = builder.createTriOp(
++      spv::OpSelect, type_uint4, do_8888_swap, swap_8in32(data_lo),
++      builder.createTriOp(spv::OpSelect, type_uint4, do_10_swap, swap_10in32(data_lo), data_lo));
++  if (!full_shape) {
++    data_hi = builder.createTriOp(
++        spv::OpSelect, type_uint4, do_8888_swap, swap_8in32(data_hi),
++        builder.createTriOp(spv::OpSelect, type_uint4, do_10_swap, swap_10in32(data_hi),
++                            data_hi));
++  }
++  }
++
++  // --- destination address (dest-space pixel = pos_blocks + dest_offset) ---
++  spv::Id dest_xy = builder.createBinOp(spv::OpIAdd, type_uint2, pos_blocks, dest_offset);
++  spv::Id dx = builder.createUnaryOp(
++      spv::OpBitcast, type_int, builder.createCompositeExtract(dest_xy, type_uint, 0));
++  spv::Id dy = builder.createUnaryOp(
++      spv::OpBitcast, type_int, builder.createCompositeExtract(dest_xy, type_uint, 1));
++  spv::Id const_int_3 = builder.makeIntConstant(3);
++  spv::Id const_int_5 = builder.makeIntConstant(5);
++
++  // 2D tiled (.dis %21373 branch), verbatim.
++  spv::Id t2_x5 = builder.createBinOp(spv::OpShiftRightArithmetic, type_int, dx, const_int_5);
++  spv::Id t2_y5 = builder.createBinOp(spv::OpShiftRightArithmetic, type_int, dy, const_int_5);
++  spv::Id dest_pitch_tiles = builder.createUnaryOp(
++      spv::OpBitcast, type_int,
++      builder.createBinOp(spv::OpShiftRightLogical, type_uint, dest_pitch,
++                          builder.makeUintConstant(5)));
++  spv::Id t2_macro = builder.createBinOp(
++      spv::OpShiftLeftLogical, type_int,
++      builder.createBinOp(spv::OpIAdd, type_int, t2_x5,
++                          builder.createBinOp(spv::OpIMul, type_int, t2_y5, dest_pitch_tiles)),
++      builder.makeUintConstant(9));
++  spv::Id t2_e = builder.createBinOp(
++      spv::OpShiftLeftLogical, type_int,
++      builder.createBinOp(
++          spv::OpIAdd, type_int,
++          builder.createBinOp(spv::OpBitwiseAnd, type_int, dx, builder.makeIntConstant(7)),
++          builder.createBinOp(
++              spv::OpShiftLeftLogical, type_int,
++              builder.createBinOp(spv::OpBitwiseAnd, type_int, dy, builder.makeIntConstant(14)),
++              builder.makeIntConstant(2))),
++      const_uint_2);
++  spv::Id t2_a = builder.createBinOp(
++      spv::OpIAdd, type_int, t2_macro,
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(spv::OpBitwiseAnd, type_int, t2_e, builder.makeIntConstant(-16)),
++          builder.makeIntConstant(1)));
++  spv::Id t2_b = builder.createBinOp(
++      spv::OpIAdd, type_int, t2_a,
++      builder.createBinOp(spv::OpBitwiseAnd, type_int, t2_e, builder.makeIntConstant(15)));
++  spv::Id t2_c = builder.createBinOp(
++      spv::OpIAdd, type_int, t2_b,
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(spv::OpBitwiseAnd, type_int, dy, builder.makeIntConstant(1)),
++          builder.makeIntConstant(4)));
++  spv::Id t2_d = builder.createBinOp(
++      spv::OpIAdd, type_int,
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(spv::OpBitwiseAnd, type_int, t2_c, builder.makeIntConstant(-512)),
++          const_int_3),
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(spv::OpBitwiseAnd, type_int, dy, builder.makeIntConstant(16)),
++          builder.makeIntConstant(7)));
++  spv::Id t2_f = builder.createBinOp(
++      spv::OpIAdd, type_int, t2_d,
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(spv::OpBitwiseAnd, type_int, t2_c, builder.makeIntConstant(448)),
++          builder.makeIntConstant(2)));
++  spv::Id t2_g = builder.createBinOp(
++      spv::OpIAdd, type_int, t2_f,
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(
++              spv::OpBitwiseAnd, type_int,
++              builder.createBinOp(
++                  spv::OpIAdd, type_int,
++                  builder.createBinOp(spv::OpShiftRightArithmetic, type_int,
++                                      builder.createBinOp(spv::OpBitwiseAnd, type_int, dy,
++                                                          builder.makeIntConstant(8)),
++                                      builder.makeIntConstant(2)),
++                  builder.createBinOp(spv::OpShiftRightArithmetic, type_int, dx, const_int_3)),
++              const_int_3),
++          builder.makeIntConstant(6)));
++  spv::Id addr_2d = builder.createUnaryOp(
++      spv::OpBitcast, type_uint,
++      builder.createBinOp(
++          spv::OpIAdd, type_int, t2_g,
++          builder.createBinOp(spv::OpBitwiseAnd, type_int, t2_c, builder.makeIntConstant(63))));
++
++  // 3D tiled (.dis %10574 branch), verbatim.
++  spv::Id dz = builder.createUnaryOp(spv::OpBitcast, type_int, dest_slice);
++  spv::Id s_y4 = builder.createBinOp(spv::OpShiftRightArithmetic, type_int, dy,
++                                     builder.makeIntConstant(4));
++  spv::Id s_z2 = builder.createBinOp(spv::OpShiftRightArithmetic, type_int, dz,
++                                     builder.makeIntConstant(2));
++  spv::Id dest_height_tiles = builder.createUnaryOp(
++      spv::OpBitcast, type_int,
++      builder.createBinOp(spv::OpShiftRightLogical, type_uint, dest_height,
++                          builder.makeUintConstant(4)));
++  spv::Id s_row = builder.createBinOp(
++      spv::OpIMul, type_int,
++      builder.createBinOp(spv::OpIAdd, type_int, s_y4,
++                          builder.createBinOp(spv::OpIMul, type_int, s_z2, dest_height_tiles)),
++      dest_pitch_tiles);
++  spv::Id s_macro = builder.createBinOp(
++      spv::OpShiftLeftLogical, type_int,
++      builder.createBinOp(
++          spv::OpBitwiseAnd, type_int,
++          builder.createBinOp(
++              spv::OpShiftLeftLogical, type_int,
++              builder.createBinOp(
++                  spv::OpIAdd, type_int,
++                  builder.createBinOp(spv::OpShiftRightArithmetic, type_int, dx, const_int_5),
++                  s_row),
++              builder.makeUintConstant(8)),
++          builder.makeIntConstant(268435455)),
++      builder.makeIntConstant(1));
++  spv::Id s_e = builder.createBinOp(
++      spv::OpShiftRightArithmetic, type_int,
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(
++              spv::OpIAdd, type_int,
++              builder.createBinOp(spv::OpBitwiseAnd, type_int, dx, builder.makeIntConstant(7)),
++              builder.createBinOp(
++                  spv::OpShiftLeftLogical, type_int,
++                  builder.createBinOp(spv::OpBitwiseAnd, type_int, dy,
++                                      builder.makeIntConstant(6)),
++                  builder.makeIntConstant(2))),
++          builder.makeUintConstant(8)),
++      builder.makeIntConstant(6));
++  spv::Id s_t = builder.createBinOp(
++      spv::OpBitwiseAnd, type_int,
++      builder.createBinOp(
++          spv::OpIAdd, type_int,
++          builder.createBinOp(spv::OpShiftRightArithmetic, type_int, dy, const_int_3), s_z2),
++      builder.makeIntConstant(1));
++  spv::Id s_u = builder.createBinOp(
++      spv::OpBitwiseAnd, type_int,
++      builder.createBinOp(
++          spv::OpIAdd, type_int,
++          builder.createBinOp(spv::OpShiftRightArithmetic, type_int, dx, const_int_3),
++          builder.createBinOp(spv::OpShiftLeftLogical, type_int, s_t, builder.makeIntConstant(1))),
++      const_int_3);
++  spv::Id s_v = builder.createBinOp(
++      spv::OpIAdd, type_int, s_t,
++      builder.createBinOp(spv::OpShiftLeftLogical, type_int,
++                          builder.createBinOp(spv::OpBitwiseAnd, type_int, s_u,
++                                              const_int_3),
++                          builder.makeIntConstant(1)));
++  spv::Id s_w = builder.createBinOp(
++      spv::OpIAdd, type_int,
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(
++              spv::OpIAdd, type_int, s_macro,
++              builder.createBinOp(spv::OpBitwiseAnd, type_int, s_e,
++                                  builder.makeIntConstant(-16))),
++          builder.makeIntConstant(1)),
++      builder.createBinOp(spv::OpBitwiseAnd, type_int, s_e, builder.makeIntConstant(15)));
++  spv::Id s_x2 = builder.createBinOp(
++      spv::OpIAdd, type_int, s_w,
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(spv::OpBitwiseAnd, type_int, dz, const_int_3),
++          builder.makeUintConstant(8)));
++  spv::Id s_y2 = builder.createBinOp(
++      spv::OpIAdd, type_int, s_x2,
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(spv::OpBitwiseAnd, type_int, dy, builder.makeIntConstant(1)),
++          builder.makeIntConstant(4)));
++  spv::Id s_z3 = builder.createBinOp(
++      spv::OpIAdd, type_int,
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(
++              spv::OpIAdd, type_int,
++              builder.createBinOp(
++                  spv::OpShiftLeftLogical, type_int,
++                  builder.createBinOp(spv::OpBitwiseAnd, type_int, s_v,
++                                      builder.makeIntConstant(1)),
++                  const_int_3),
++              builder.createBinOp(
++                  spv::OpBitwiseAnd, type_int,
++                  builder.createBinOp(spv::OpShiftRightArithmetic, type_int, s_y2,
++                                      builder.makeIntConstant(6)),
++                  builder.makeIntConstant(7))),
++          const_int_3),
++      builder.createBinOp(spv::OpBitwiseAnd, type_int, s_v, builder.makeIntConstant(-2)));
++  spv::Id s_final = builder.createBinOp(
++      spv::OpIAdd, type_int,
++      builder.createBinOp(
++          spv::OpShiftLeftLogical, type_int,
++          builder.createBinOp(
++              spv::OpIAdd, type_int,
++              builder.createBinOp(spv::OpShiftLeftLogical, type_int, s_z3, const_uint_2),
++              builder.createBinOp(spv::OpBitwiseAnd, type_int, s_y2,
++                                  builder.makeIntConstant(-512))),
++          const_int_3),
++      builder.createBinOp(spv::OpBitwiseAnd, type_int, s_y2, builder.makeIntConstant(63)));
++  spv::Id addr_3d = builder.createUnaryOp(spv::OpBitcast, type_uint, s_final);
++
++  spv::Id tiled_addr = builder.createTriOp(spv::OpSelect, type_uint, dest_is_3d, addr_3d, addr_2d);
++  spv::Id dest_addr = builder.createBinOp(spv::OpIAdd, type_uint, tiled_addr, dest_base);
++  spv::Id dest_index = builder.createBinOp(spv::OpShiftRightLogical, type_uint, dest_addr,
++                                           builder.makeUintConstant(4));
++
++  // --- dest endian (1|2 -> 8in16; 2|3 -> 16-rotate), then two stores ---
++  spv::Id endian_8in16 = builder.createBinOp(
++      spv::OpLogicalOr, type_bool,
++      builder.createBinOp(spv::OpIEqual, type_bool, dest_endian, const_uint_1),
++      builder.createBinOp(spv::OpIEqual, type_bool, dest_endian, const_uint_2));
++  spv::Id endian_16rot = builder.createBinOp(
++      spv::OpLogicalOr, type_bool,
++      builder.createBinOp(spv::OpIEqual, type_bool, dest_endian, const_uint_2),
++      builder.createBinOp(spv::OpIEqual, type_bool, dest_endian, const_uint_3));
++  auto endian_apply = [&](spv::Id v) -> spv::Id {
++    spv::Id m_00ff00ff = builder.smearScalar(spv::NoPrecision,
++                                             builder.makeUintConstant(0x00FF00FFu), type_uint4);
++    spv::Id m_ff00ff00 = builder.smearScalar(spv::NoPrecision,
++                                             builder.makeUintConstant(0xFF00FF00u), type_uint4);
++    spv::Id c8 = builder.smearScalar(spv::NoPrecision, builder.makeUintConstant(8), type_uint4);
++    spv::Id c16 = builder.smearScalar(spv::NoPrecision, builder.makeUintConstant(16), type_uint4);
++    spv::Id swapped16 = builder.createBinOp(
++        spv::OpBitwiseOr, type_uint4,
++        builder.createBinOp(
++            spv::OpShiftLeftLogical, type_uint4,
++            builder.createBinOp(spv::OpBitwiseAnd, type_uint4, v, m_00ff00ff), c8),
++        builder.createBinOp(
++            spv::OpShiftRightLogical, type_uint4,
++            builder.createBinOp(spv::OpBitwiseAnd, type_uint4, v, m_ff00ff00), c8));
++    spv::Id v1 = builder.createTriOp(spv::OpSelect, type_uint4, endian_8in16, swapped16, v);
++    spv::Id rotated = builder.createBinOp(
++        spv::OpBitwiseOr, type_uint4,
++        builder.createBinOp(spv::OpShiftLeftLogical, type_uint4, v1, c16),
++        builder.createBinOp(spv::OpShiftRightLogical, type_uint4, v1, c16));
++    return builder.createTriOp(spv::OpSelect, type_uint4, endian_16rot, rotated, v1);
++  };
++  data_lo = endian_apply(data_lo);
++  if (!full_shape) data_hi = endian_apply(data_hi);
++
++  spv::Id const_int_0 = builder.makeIntConstant(0);
++  id_vector_temp.clear();
++  id_vector_temp.push_back(const_int_0);
++  id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, dest_index));
++  builder.createStore(data_lo, builder.createAccessChain(spv::StorageClassUniform, dest_buffer,
++                                                         id_vector_temp));
++  if (!full_shape) {
++    spv::Id dest_index_hi =
++        builder.createBinOp(spv::OpIAdd, type_uint, dest_index, const_uint_2);
++    id_vector_temp.clear();
++    id_vector_temp.push_back(const_int_0);
++    id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, dest_index_hi));
++    builder.createStore(data_hi, builder.createAccessChain(spv::StorageClassUniform, dest_buffer,
++                                                           id_vector_temp));
++  }
++
++  guard_if.makeEndIf();
++
++  builder.leaveFunction();
++  builder.addExecutionMode(main_function, spv::ExecutionModeLocalSize, 8, 8, 1);
++  spv::Instruction* entry_point =
++      builder.addEntryPoint(spv::ExecutionModelGLCompute, main_function, "main");
++  entry_point->addIdOperand(input_global_invocation_id);
++
++  std::vector<unsigned int> shader_code;
++  builder.dump(shader_code);
++
++  VkPipeline pipeline = ui::vulkan::util::CreateComputePipeline(
++      command_processor_.GetVulkanDevice(),
++      dump_key.is_depth ? direct_resolve_pipeline_layout_depth_
++                        : direct_resolve_pipeline_layout_color_,
++      reinterpret_cast<const uint32_t*>(shader_code.data()), sizeof(uint32_t) * shader_code.size());
++  if (pipeline == VK_NULL_HANDLE) {
++    REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the direct resolve pipeline");
++  }
+   direct_resolve_pipelines_.emplace(key, pipeline);
+   return pipeline;
+ }
+ 
+ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
+                                                      draw_util::ResolveCopyShaderIndex copy_shader,
+-                                                     bool draw_resolution_scaled) {
++                                                     bool draw_resolution_scaled,
++                                                     DirectResolvePrep& prep_out) {
+   ++direct_resolve_attempt_count_;
+-  (void)copy_shader;
+-  (void)draw_resolution_scaled;
++  if (!REXCVAR_GET(direct_resolve)) {
++    return false;
++  }
+   if (direct_resolve_pipeline_layout_color_ == VK_NULL_HANDLE ||
+       direct_resolve_pipeline_layout_depth_ == VK_NULL_HANDLE) {
+     return false;
+@@ -6416,36 +7254,82 @@
+   uint32_t dump_rows;
+   uint32_t dump_pitch;
+   resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+-  GetResolveCopyDispatchesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+-                                 dump_rectangles_, direct_resolve_dispatches_);
+-  if (direct_resolve_dispatches_.empty()) {
++  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
++                                 dump_rectangles_);
++  // Stage 1: exactly one render target owning the ENTIRE resolve span -- the
++  // fused shader reads one source image; partial ownership would need the
++  // dump path for the remainder anyway.
++  if (dump_rectangles_.size() != 1) {
+     return false;
+   }
+-
+-  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
+-    const auto* render_target = static_cast<const VulkanRenderTarget*>(rectangle.render_target);
+-    if (render_target == nullptr) {
+-      return false;
++  const ResolveCopyDumpRectangle& rectangle = dump_rectangles_.front();
++  auto* vulkan_rt = static_cast<VulkanRenderTarget*>(rectangle.render_target);
++  if (vulkan_rt == nullptr || rectangle.row_first != 0 || rectangle.rows != dump_rows ||
++      rectangle.row_first_start != 0 || rectangle.row_last_end != dump_row_length_used) {
++    return false;
++  }
++  RenderTargetKey rt_key = vulkan_rt->key();
++  if (rt_key.is_depth && !REXCVAR_GET(direct_resolve_depth)) {
++    return false;
++  }
++  DirectResolvePipelineKey direct_pipeline_key;
++  direct_pipeline_key.dump_pipeline_key.msaa_samples = rt_key.msaa_samples;
++  direct_pipeline_key.dump_pipeline_key.resource_format = rt_key.resource_format;
++  direct_pipeline_key.dump_pipeline_key.is_depth = rt_key.is_depth;
++  direct_pipeline_key.copy_shader = copy_shader;
++  direct_pipeline_key.draw_resolution_scaled = draw_resolution_scaled;
++  // Stage-3 host gate: the fused kFull path implements unorm 8888 dest with
++  // optional PWL gamma and zero exponent bias. Anything else keeps the stock
++  // path. (Census log names what actually shows up, so coverage gaps stay
++  // data rather than guesses.)
++  if (copy_shader == draw_util::ResolveCopyShaderIndex::kFull32bpp) {
++    const reg::RB_COPY_DEST_INFO& di = resolve_info.copy_dest_info;
++    static std::atomic<uint32_t> dest_census_logged{0};
++    uint32_t census_n = dest_census_logged.fetch_add(1, std::memory_order_relaxed);
++    if (census_n < 16 || (census_n & 0x3FF) == 0) {
++      REXGPU_INFO("direct-resolve kFull dest census #{}: fmt={} num={} bias={} swap={}",
++                  census_n, uint32_t(di.copy_dest_format), uint32_t(di.copy_dest_number),
++                  int32_t(di.copy_dest_exp_bias), uint32_t(di.copy_dest_swap));
+     }
+-    DumpPipelineKey dump_pipeline_key;
+-    dump_pipeline_key.msaa_samples = render_target->key().msaa_samples;
+-    dump_pipeline_key.resource_format = render_target->key().resource_format;
+-    dump_pipeline_key.is_depth = render_target->key().is_depth;
+-    if (GetDumpPipeline(dump_pipeline_key) == VK_NULL_HANDLE) {
++    if (di.copy_dest_exp_bias != 0) {
+       return false;
+     }
+-    DirectResolvePipelineKey direct_pipeline_key;
+-    direct_pipeline_key.dump_pipeline_key = dump_pipeline_key;
+-    direct_pipeline_key.copy_shader = copy_shader;
+-    direct_pipeline_key.draw_resolution_scaled = draw_resolution_scaled;
+-    if (GetDirectResolvePipeline(direct_pipeline_key) == VK_NULL_HANDLE) {
+-      return false;
++  }
++  VkPipeline pipeline = GetDirectResolvePipeline(direct_pipeline_key);
++  if (pipeline == VK_NULL_HANDLE) {
++    // Which gate rejected it decides which coverage stage to build next --
++    // log the key (throttled) so a bench run yields the fallback census.
++    static std::atomic<uint32_t> fallback_logged{0};
++    uint32_t n = fallback_logged.fetch_add(1, std::memory_order_relaxed);
++    if (n < 64 || (n & 0x3FF) == 0) {
++      REXGPU_INFO("direct-resolve fallback #{}: depth={} msaa={} fmt={} shader={} scaled={}", n,
++                  uint32_t(rt_key.is_depth), uint32_t(rt_key.msaa_samples),
++                  uint32_t(rt_key.resource_format), uint32_t(copy_shader),
++                  uint32_t(draw_resolution_scaled));
+     }
++    return false;
+   }
+ 
+-  // Dedicated direct resolve dispatches are staged behind the same preflight;
+-  // keep using the existing dump path until source-image direct shaders land.
+-  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
++  // The source render target is read by the fused compute shader -- same
++  // barrier the dump path issues (DumpRenderTargets' gather loop, verbatim).
++  command_processor_.PushImageMemoryBarrier(
++      vulkan_rt->image(),
++      ui::vulkan::util::InitializeSubresourceRange(
++          rt_key.is_depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
++                          : VK_IMAGE_ASPECT_COLOR_BIT),
++      vulkan_rt->current_stage_mask(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++      vulkan_rt->current_access_mask(), VK_ACCESS_SHADER_READ_BIT, vulkan_rt->current_layout(),
++      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++  vulkan_rt->SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
++                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++
++  prep_out.pipeline = pipeline;
++  prep_out.is_depth = rt_key.is_depth;
++  prep_out.source_descriptor_set = vulkan_rt->GetDescriptorSetTransferSource();
++  prep_out.source_base_tiles = rt_key.base_tiles;
++  prep_out.source_pitch_tiles = rt_key.GetPitchTiles();
++  prep_out.dispatch_first_tile = dump_base;
++  return true;
+ }
+ 
+ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -778,6 +778,18 @@
+     uint32_t source_base_tiles;
+     uint32_t source_pitch_tiles;
+     uint32_t dispatch_first_tile;
++  };
++
++  // Filled by TryResolveCopyDirectly's preflight; consumed at the shared
++  // resolve dispatch site, which then binds the fused pipeline + these
++  // bindings instead of the EDRAM copy pipeline (M-062 direct resolve).
++  struct DirectResolvePrep {
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    VkDescriptorSet source_descriptor_set = VK_NULL_HANDLE;
++    bool is_depth = false;
++    uint32_t source_base_tiles = 0;
++    uint32_t source_pitch_tiles = 0;
++    uint32_t dispatch_first_tile = 0;
+   };
+ 
+   struct DirectResolvePipelineKey {
+@@ -824,7 +836,7 @@
+   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
+   bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
+                               draw_util::ResolveCopyShaderIndex copy_shader,
+-                              bool draw_resolution_scaled);
++                              bool draw_resolution_scaled, DirectResolvePrep& prep_out);
+ 
+   // Writes contents of host render targets within rectangles from
+   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.

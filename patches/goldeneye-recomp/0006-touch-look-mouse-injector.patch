@@ -1,0 +1,154 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -21,6 +21,16 @@
+ #include <rex/runtime.h>
+ #include <rex/system/xmemory.h>
+ #include <rex/graphics/graphics_system.h>
++#include <rex/thread.h>  // rex::thread::Sleep -- frame-wait backoff
++
++// Backing off this spin is the single change M-049 identified as highest
++// leverage; exposed as a cvar so its effect is measured rather than asserted.
++REXCVAR_DEFINE_INT32(ge_frame_wait_backoff_us, 100, "GPU",
++                     "Microseconds to sleep between polls once the guest's GPU-completion wait "
++                     "has spun without success. 0 restores the original uncapped spin, which "
++                     "pins a performance core for the whole wait.")
++    .range(0, 5000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ #include <rex/graphics/command_processor.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/kernel_state.h>
+@@ -222,6 +232,25 @@
+ std::atomic<uint32_t> g_ge_idblk{0};    // id-block (idblk) seen by ge_dbg_now
+ std::atomic<uint32_t> g_dbgnow_calls{0};  // increments each ge_dbg_now (guest polling sub_82198C28)
+ 
++// Frame-phase accounting (Fable round 5 / M-049 item 1). The claim to test is
++// that a displayed frame is not one long wait but six to eight short
++// submit->wait cycles, each paying a cross-thread handoff. Counting the
++// transitions and the time either side of them turns that from a theory into
++// arithmetic. Guest ticks (~49.875 MHz) throughout; converted at the console.
++std::atomic<uint32_t> g_wait_cycles{0};      // completed wait cycles this present
++std::atomic<uint64_t> g_wait_ticks{0};       // ticks spent inside waits
++std::atomic<uint64_t> g_between_ticks{0};    // ticks spent outside waits
++// Per thread, not global. Several guest threads poll this hook, and a shared
++// "when did the last wait end" marker interleaves them: thread A's wait start
++// gets differenced against thread B's wait end, and `between` becomes a
++// meaningless mixture. The cycle *count* is still a process-wide sum, which is
++// what we want -- it is the per-thread timing that must not be crossed.
++thread_local uint32_t t_last_wait_end = 0;
++// Published at each present so a reader sees one frame's worth, not a running sum.
++std::atomic<uint32_t> g_frame_wait_cycles{0};
++std::atomic<uint64_t> g_frame_wait_ticks{0};
++std::atomic<uint64_t> g_frame_between_ticks{0};
++
+ void ge_watchdog_thread() {
+   // The watchdog may be armed at app startup (ge::StartGpuWatchdog), which runs
+   // during window/presenter setup -- BEFORE ConstructRuntime, so kernel_state()
+@@ -601,8 +630,41 @@
+   // this stays a one-shot "proceed past this stall", not a permanent skip.
+   static thread_local uint32_t s_wait_start = 0;
+   static thread_local bool s_waiting = false;
++  // Poll iterations spent spinning before backing off. ~200 at a few hundred
++  // nanoseconds each is roughly the 200 us fast path Fable specified.
++  static constexpr uint32_t kFrameWaitSpinPolls = 200;
++  static thread_local uint32_t s_spins = 0;
+   if (!drawn) {
+-    if (!s_waiting) { s_waiting = true; s_wait_start = t; }
++    // Back off instead of spinning (Fable, M-049 item 2). The guest polls this
++    // routine in a tight loop -- measured at 13.5 M calls/s -- which pins a
++    // performance core for the whole wait. On a 360 that is free: six hardware
++    // threads, nothing else wants the core. On a phone it is the problem, and
++    // not because polling is slow: the occupied core is the one the command
++    // processor needs in order to finish the very work being waited on, so the
++    // spin lengthens the wait it is spinning on.
++    //
++    // A short spin first, because most waits are brief and a sleep would cost
++    // more than it saves. Past that, sleep between polls: at ~13.5 ms of wait
++    // (M-050) a 100 us poll interval is ~135 checks instead of ~180,000, and
++    // adds at most 100 us of discovery latency to a 13 ms wait.
++    const int32_t backoff_us = REXCVAR_GET(ge_frame_wait_backoff_us);
++    if (backoff_us > 0) {
++      if (s_spins < kFrameWaitSpinPolls) {
++        ++s_spins;
++      } else {
++        rex::thread::Sleep(std::chrono::microseconds(backoff_us));
++      }
++    }
++    if (!s_waiting) {
++      s_waiting = true;
++      s_wait_start = t;
++      s_spins = 0;
++      // Time since the previous wait cleared is the guest's own work plus the
++      // submit; it is the half of the cycle that is NOT handoff latency.
++      if (t_last_wait_end) {
++        g_between_ticks.fetch_add(uint32_t(t - t_last_wait_end), std::memory_order_relaxed);
++      }
++    }
+     else if ((uint32_t)(t - s_wait_start) > 4000000u) {  // ~80ms @49.875MHz
+       drawn = true;
+       if (dev) base[dev + 10941u] |= 0x02u;   // stalled: skip this GPU wait
+@@ -616,7 +678,13 @@
+     // worker reliably gets CPU and can finish the frame.
+     if (!drawn) std::this_thread::yield();
+   } else {
+-    s_waiting = false;
++    if (s_waiting) {
++      s_waiting = false;
++      s_spins = 0;
++      g_wait_cycles.fetch_add(1, std::memory_order_relaxed);
++      g_wait_ticks.fetch_add(uint32_t(t - s_wait_start), std::memory_order_relaxed);
++      t_last_wait_end = t;
++    }
+   }
+ 
+   if (dev && idblk && idblk < 0xFFFFFFFEu && drawn) {
+@@ -647,6 +715,13 @@
+   auto* cpp = ge_cp();
+   uint32_t cpc = cpp ? cpp->counter() : 0;
+   g_present_cpcnt.store(cpc, std::memory_order_relaxed);
++  // Publish and reset the per-frame phase accounting.
++  g_frame_wait_cycles.store(g_wait_cycles.exchange(0, std::memory_order_relaxed),
++                            std::memory_order_relaxed);
++  g_frame_wait_ticks.store(g_wait_ticks.exchange(0, std::memory_order_relaxed),
++                           std::memory_order_relaxed);
++  g_frame_between_ticks.store(g_between_ticks.exchange(0, std::memory_order_relaxed),
++                              std::memory_order_relaxed);
+   g_present_tb.store((uint32_t)REX_QUERY_TIMEBASE(), std::memory_order_relaxed);
+ 
+   static uint32_t n = 0;                       // throttled fps heartbeat
+@@ -1003,6 +1078,18 @@
+ int ge_take_mouse_dx() { return g_mouse_dx.exchange(0, std::memory_order_relaxed); }
+ int ge_take_mouse_dy() { return g_mouse_dy.exchange(0, std::memory_order_relaxed); }
+ }  // namespace
++
++// Look-delta entry point for platform layers with no raw-mouse source (iOS
++// touch drag, future gyro). Resolved via dlsym from the runtime's UI layer, so
++// it must stay extern "C" and default-visibility. Units are mouse counts: the
++// mousehook applies (counts / 10) * ge_mouse_sens degrees to the camera, so a
++// rate-independent swipe turns the view by a screen-proportional angle instead
++// of saturating a virtual stick at the game's fixed turn rate.
++extern "C" __attribute__((visibility("default"))) void GeInjectLookDelta(int dx, int dy) {
++  if (!ge_mouse_active()) return;
++  g_mouse_dx.fetch_add(dx, std::memory_order_relaxed);
++  g_mouse_dy.fetch_add(dy, std::memory_order_relaxed);
++}
+ 
+ namespace ge {
+ // Arm the GPU freeze watchdog at app startup.
+@@ -1018,6 +1105,17 @@
+ // reports. These live in the guest's device struct, so they describe what the
+ // *game* believes about its frame pacing rather than what the host renderer is
+ // doing, which is the number that matters when asking why it feels slow.
++void GetFramePhases(uint32_t* out_cycles, uint64_t* out_wait_us, uint64_t* out_between_us) {
++  // 49.875 MHz guest timebase -> microseconds.
++  constexpr double kTicksPerUs = 49.875;
++  if (out_cycles) *out_cycles = g_frame_wait_cycles.load(std::memory_order_relaxed);
++  if (out_wait_us)
++    *out_wait_us = uint64_t(double(g_frame_wait_ticks.load(std::memory_order_relaxed)) / kTicksPerUs);
++  if (out_between_us)
++    *out_between_us =
++        uint64_t(double(g_frame_between_ticks.load(std::memory_order_relaxed)) / kTicksPerUs);
++}
++
+ void GetGpuSubmitPresentCounts(uint64_t* out_submitted, uint64_t* out_presented) {
+   if (out_submitted) *out_submitted = 0;
+   if (out_presented) *out_presented = 0;

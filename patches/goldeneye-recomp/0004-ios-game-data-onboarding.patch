@@ -1,0 +1,65 @@
+--- a/src/ge_app.h
++++ b/src/ge_app.h
+@@ -7,13 +7,21 @@
+ #pragma once
+ 
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
++#include <rex/logging.h>
++#include <rex/platform.h>
+ #include <rex/rex_app.h>
++#if REX_PLATFORM_IOS
++#include <rex/ui/onboarding_uikit.h>
++#endif
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/user_profile.h>
+ #include <rex/ui/keybinds.h>
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++#include <functional>
++#include <optional>
+ #include <string>
+ 
+ #include "ge_menu.h"
+@@ -46,6 +54,40 @@
+         PPCImageConfig));
+   }
+ 
++#if REX_PLATFORM_IOS
++  // The app ships with no game data -- the user drops their own file set into
++  // Documents/assets through the Files app. On desktop a missing drop is an
++  // error on stderr; on iOS there is nothing to read it, so hold initialization
++  // here and put the instructions on screen instead.
++  //
++  // This is the SDK's async path-resolution seam working as designed: return
++  // nullopt to say "not yet", and call resume once the user has supplied a
++  // usable set. Boot continues from there with no special-casing downstream.
++  std::optional<rex::PathConfig> OnFinalizePaths(const rex::PathConfig& defaults,
++                                                 std::function<void(rex::PathConfig)> resume)
++      override {
++    auto game_dir = defaults.game_data_root.empty()
++                        ? rex::filesystem::GetDocumentsFolder() / "assets"
++                        : defaults.game_data_root;
++
++    auto status = rex::ui::ClassifyGameData(game_dir);
++    if (status.usable()) {
++      REXLOG_INFO("game data: {}", status.detail);
++      auto paths = defaults;
++      paths.game_data_root = game_dir;
++      return paths;
++    }
++
++    REXLOG_WARN("game data not usable yet: {}", status.detail);
++    rex::ui::PresentGameDataOnboarding(game_dir, [this, defaults, game_dir, resume]() {
++      auto paths = defaults;
++      paths.game_data_root = game_dir;
++      resume(paths);
++    });
++    return std::nullopt;
++  }
++#endif  // REX_PLATFORM_IOS
++
+   // GoldenEye boot defaults. Runs before the config file is loaded, so these
+   // are just defaults -- ge.toml (written by the in-game menu) overrides them.
+   void OnConfigurePaths(rex::PathConfig& paths) override {

@@ -1,0 +1,69 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -223,7 +223,24 @@
+ std::atomic<uint32_t> g_dbgnow_calls{0};  // increments each ge_dbg_now (guest polling sub_82198C28)
+ 
+ void ge_watchdog_thread() {
+-  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
++  // The watchdog may be armed at app startup (ge::StartGpuWatchdog), which runs
++  // during window/presenter setup -- BEFORE ConstructRuntime, so kernel_state()
++  // is still null. Wait for the runtime rather than dereferencing null: with
++  // this runtime's SIGSEGV handler installed for guest MMIO traps, a null deref
++  // does not produce a clean crash, it wedges the process.
++  for (int waited_ms = 0; waited_ms < 60000; waited_ms += 50) {
++    auto* ks = rex::system::kernel_state();
++    if (ks && ks->memory()) {
++      break;
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(50));
++  }
++  auto* kernel_state_ptr = rex::system::kernel_state();
++  if (!kernel_state_ptr || !kernel_state_ptr->memory()) {
++    REXKRNL_INFO("GEWATCHDOG: runtime never came up; watchdog exiting");
++    return;
++  }
++  uint8_t* base = kernel_state_ptr->memory()->virtual_membase();
+   uint32_t last_wpi = 0xFFFFFFFFu, last_rpi = 0, last_present = 0, last_submit = 0;
+   uint32_t present_at_stall_start = 0, dbg_at_stall_start = 0, submit_at_stall_start = 0;
+   uint32_t stall = 0;
+@@ -241,6 +258,29 @@
+     uint32_t idblk = g_ge_idblk.load(std::memory_order_relaxed);
+     uint32_t submit = dev ? LD32(base, dev + 16544) : 0;
+ 
++    // DIAGNOSTIC (GoldenEye-Recomp-ios overlay): first-frame bring-up. The
++    // watchdog only speaks when its own trigger fires; print the raw state every
++    // ~5 s so "the guest never presents" can be told apart from "the guest never
++    // submits GPU work".
++    {
++      static int tick = 0;
++      if ((tick++ % 20) == 0) {
++        uint32_t render_gate = LD32(base, 0x8242043C);
++        // The three the guest's frame limiter actually compares (offsets from
++        // upstream's own watchdog): what it has submitted, what the GPU has
++        // reported complete, and what it is waiting for.
++        uint32_t presented = dev ? LD32(base, dev + 16552) : 0;
++        uint32_t target = dev ? LD32(base, dev + 10908) : 0;
++        // The semaphore the CP parks on (guest-virtual 0xFFC9C000 == physical
++        // 0x1FC9C000). Armed to 4 by the guest; the release writes 0. If this
++        // reads 4 forever, the guest never issues the release at all.
++        uint32_t sem = idblk ? LD32(base, idblk) : 0;
++        REXKRNL_INFO(
++            "GESTATUS ring rpi={:#x} wpi={:#x} | present={} dbgnow={} | dev={:#x} idblk={:#x} "
++            "submit={} presented={} target={} sem={:#x} | render_gate(8242043C)={}",
++            rpi, wpi, present, dbg, dev, idblk, submit, presented, target, sem, render_gate);
++      }
++    }
+     bool present_alive = (present != last_present);
+     bool ring_moved = (wpi != last_wpi) || (rpi != last_rpi);
+     if (present_alive && !ring_moved) {
+@@ -267,6 +307,10 @@
+         logged = true;
+         uint32_t presented = dev ? LD32(base, dev + 16552) : 0;
+         uint32_t target = dev ? LD32(base, dev + 10908) : 0;
++        // The semaphore the CP parks on (guest-virtual 0xFFC9C000 == physical
++        // 0x1FC9C000). Armed to 4 by the guest; the release writes 0. If this
++        // reads 4 forever, the guest never issues the release at all.
++        uint32_t sem = idblk ? LD32(base, idblk) : 0;
+         uint32_t completed = idblk ? LD32(base, idblk + 0) : 0;
+         uint32_t skip = dev ? (base[dev + 10941] & 2) : 0;
+         REXKRNL_INFO(

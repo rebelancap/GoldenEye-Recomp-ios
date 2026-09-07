@@ -1,0 +1,83 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -61,6 +61,21 @@
+                      "the watchdog recovery can be proven against a real locked state.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(ge_hsio_guard, true, "GPU",
++                    "THE FREEZE CAUSE, defused (bean fable 04). The D3D 'HSIO training "
++                    "failed' flag @0x8308855C is computed ONCE at device init from "
++                    "VdIsHSIOTrainingSucceeded (always success under ReXGlue, so its true "
++                    "value is 0 forever) and is read by the command-buffer kick "
++                    "(sub_8219D6D8): nonzero => the kick latches render-skip bit 0x02 in "
++                    "dev+10941 and D3D deliberately never renders again -- the XEX's own "
++                    "string: 'D3D: GPU initialization (HSIO training) has failed so no "
++                    "graphics will render.' Every organic specimen latched 0x14->0x16 "
++                    "through exactly this path; poking the flag nonzero on a healthy bench "
++                    "reproduces the organic freeze instantly, and restoring 0 lets the "
++                    "marker-clear heal stick (full recovery, bench-verified). Something "
++                    "corrupts the flag mid-session; until the writer is caught, restore "
++                    "the boot-truth every vdswap tick and log the poisoned value.");
++
+ REXCVAR_DEFINE_BOOL(ge_tick_heal, true, "GPU",
+                     "Per-tick wedge heal (M-079): when the guest's submit-vs-credited gap has "
+                     "wedged the frame limiter (ring and fences drained, nothing in flight), "
+@@ -1396,7 +1411,24 @@
+   // refresh-dependent -- 4 on the ~30 fps bench but 6 on the 60 fps device --
+   // so on device the guard fired 43 times in 5 seconds INTO A HEALTHY ledger
+   // and may have hastened the latch. No heuristic writer goes here again; the
+-  // fix is at the source of the crediting race.
++  // fix is at the source, below.
++  //
++  // THE HSIO GUARD (the source). See the ge_hsio_guard cvar comment for the
++  // full anatomy. This is not a heuristic ledger writer (the M-077 class): the
++  // flag is a boot-time constant whose only legitimate writer runs once at
++  // device init and, under ReXGlue, always writes 0. A nonzero read is
++  // corruption, and restoring 0 is restoring truth. This hook runs on the
++  // guest thread that also runs the command-buffer kick, so there is no
++  // cross-thread race with the latch; a scribble landing between ticks can
++  // latch bit 0x02 once, and the existing marker-clear heal releases it as
++  // soon as the flag is clean (the bench recovery sequence, verified).
++  uint32_t hsio_flag = LD32(base, 0x8308855Cu);
++  if (hsio_flag != 0 && REXCVAR_GET(ge_hsio_guard)) {
++    ST32(base, 0x8308855Cu, 0u);
++    REXKRNL_INFO("GEHSIO: flag @0x8308855C poisoned to {:#x} at tick {} -- restored 0 "
++                 "(render-blackout latch defused)",
++                 hsio_flag, s_heal_tick);
++  }
+   ++s_heal_tick;
+   // Freeze flight recorder (M-092). Every dissection so far has read the
+   // PARKED steady state; nobody has ever seen the moment of ENTRY -- which
+@@ -1409,7 +1441,7 @@
+   {
+     struct FlightSample {
+       uint32_t tick, submit, credited, progress, target;
+-      uint32_t skipbits;
++      uint32_t skipbits, hsio;
+       uint64_t guest_frames, host_presents;
+     };
+     static FlightSample s_flight[1024];
+@@ -1423,6 +1455,7 @@
+     fs.progress = (fp && fp < 0xFFFFFFFEu) ? LD32(base, fp) : 0;
+     fs.target = a1 ? LD32(base, a1 + 10908) : 0;
+     fs.skipbits = a1 ? WD8(base, a1 + 10941) : 0;
++    fs.hsio = hsio_flag;
+     fs.guest_frames = RexGetGuestFrameCount();
+     fs.host_presents = host_presents;
+     if ((guest_nearly_dead || presents_nearly_dead) && s_heal_armed && !s_flight_dumped) {
+@@ -1432,12 +1465,12 @@
+       char name[64];
+       std::snprintf(name, sizeof(name), "freeze-flight-%u.txt", s_heal_tick);
+       std::ofstream f(dir / name);
+-      f << "tick submit credited progress target skipbits guest_frames host_presents\n";
++      f << "tick submit credited progress target skipbits hsio guest_frames host_presents\n";
+       for (uint32_t i = 0; i < n; ++i) {
+         const FlightSample& s = s_flight[(s_flight_n - n + i) % 1024u];
+         f << s.tick << ' ' << s.submit << ' ' << s.credited << ' ' << s.progress << ' '
+-          << s.target << ' ' << s.skipbits << ' ' << s.guest_frames << ' ' << s.host_presents
+-          << '\n';
++          << s.target << ' ' << s.skipbits << ' ' << s.hsio << ' ' << s.guest_frames << ' '
++          << s.host_presents << '\n';
+       }
+       f.close();
+       REXKRNL_INFO("GEFLIGHT: wedge onset -- wrote {} samples to {}", n, name);

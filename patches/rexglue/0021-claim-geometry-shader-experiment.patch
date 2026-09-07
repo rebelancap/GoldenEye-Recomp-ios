@@ -1,0 +1,36 @@
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -33,6 +33,10 @@
+                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
+                     "fallback primitive emulation paths)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(vulkan_claim_geometry_shader, false, "Vulkan",
++                    "Report geometryShader as supported to the GPU emulation even when the driver "
++                    "lacks it (matches what CrossOver's layer does on macOS; see M-030). Device "
++                    "creation still does not enable the feature, so draws using it fail.");
+ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, true, "UI/Vulkan",
+                     "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
+                     "allow fallback to solid fill for line/point polygon modes)")
+@@ -639,6 +643,22 @@
+     XE_UI_VULKAN_FEATURE(shaderCullDistance)
+     XE_UI_VULKAN_FEATURE(sparseBinding)
+     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
++
++    // EXPERIMENT (GoldenEye-Recomp-ios, M-030): Metal has no geometry shaders,
++    // so MoltenVK reports geometryShader = false and the runtime falls back to
++    // its primitive conversion/expansion paths -- which upstream has apparently
++    // never exercised for this title (Windows and Linux both report true).
++    //
++    // CrossOver's Vulkan layer ADVERTISES geometryShader on macOS even though
++    // MoltenVK cannot compile one; the upstream Windows build therefore takes
++    // the geometry-shader path, individual draws fail at pipeline creation, and
++    // it still runs a full frame loop (M-029). Replicate that: claim the feature
++    // in the properties the emulation reads, while leaving it OUT of
++    // enabled_features so vkCreateDevice still succeeds.
++    if (REXCVAR_GET(vulkan_claim_geometry_shader) && !supported_features.geometryShader) {
++      device->properties_.geometryShader = VK_TRUE;
++      REXLOG_INFO("* geometryShader (CLAIMED -- not actually supported; see M-030)");
++    }
+   }
+ 
+   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {

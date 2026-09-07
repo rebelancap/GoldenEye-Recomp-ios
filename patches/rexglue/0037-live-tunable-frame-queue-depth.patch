@@ -1,0 +1,37 @@
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -67,6 +67,14 @@
+ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
+                     "device (falls back to render passes otherwise)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_UINT32(vulkan_max_queued_frames, 2, "GPU/Vulkan",
++                      "Guest frames queued on the GPU before the command processor waits for "
++                      "completion (clamped to 1..kMaxFramesInFlight). 1 = wait for the previous "
++                      "frame before opening a new one: lowest input latency and no deep-queue "
++                      "cost amplification on thermally clamped mobile GPUs, at the price of "
++                      "CPU/GPU overlap.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ namespace rex::graphics::vulkan {
+@@ -5142,8 +5150,17 @@
+   // resources early) and specifically for frames (not to queue too many), and
+   // await the availability of the current frame. Also check whether the device
+   // is still available, and whether the await was successful.
+-  uint64_t await_submission =
+-      is_opening_frame ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight] : 0;
++  uint64_t await_submission = 0;
++  if (is_opening_frame) {
++    // Effective frame queue depth: kMaxFramesInFlight normally, lowered live
++    // via cvar. On a thermally clamped mobile TBDR GPU a deep queue amplifies
++    // per-frame cost instead of adding overlap (M-054), so depth 1 -- await
++    // the previous frame before opening a new one -- is the graceful mode.
++    uint32_t depth = uint32_t(REXCVAR_GET(vulkan_max_queued_frames));
++    depth = std::min(uint32_t(kMaxFramesInFlight), std::max(1u, depth));
++    await_submission = closed_frame_submissions_[
++        (frame_current_ + (kMaxFramesInFlight - depth)) % kMaxFramesInFlight];
++  }
+   CheckSubmissionFenceAndDeviceLoss(await_submission);
+   if (device_lost_ || submission_completed_ < await_submission) {
+     return false;

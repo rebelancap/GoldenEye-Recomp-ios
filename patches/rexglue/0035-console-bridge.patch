@@ -1,0 +1,69 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -243,6 +243,17 @@
+ )
+ 
+ # Output directories (multi-config appends /<Config>/ automatically)
++# Remote console on port 8773 (rex/console_bridge.h). ON for OTA/dev builds,
++# and it must be OFF for any public release: it binds all interfaces and takes
++# unauthenticated commands, which is only acceptable on a private network.
++option(REX_CONSOLE_BRIDGE "Build the remote console bridge (dev builds only)" ON)
++if(REX_CONSOLE_BRIDGE)
++    add_compile_definitions(REX_CONSOLE_BRIDGE=1)
++else()
++    add_compile_definitions(REX_CONSOLE_BRIDGE=0)
++endif()
++message(STATUS "  Console bridge: ${REX_CONSOLE_BRIDGE}")
++
+ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -1,5 +1,7 @@
+ set(REXSYSTEM_SOURCES
+     runtime.cpp
++    console_bridge.cpp
++    sampling_profiler.cpp
+     kernel_state.cpp
+     xmemory.cpp
+     kernel_module.cpp
+@@ -46,6 +48,13 @@
+ )
+ 
+ add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
++
++# PUBLIC, not a directory-scoped add_compile_definitions(): the consumer's own
++# sources (ge_app.h, rex_app.cpp) are compiled in the *parent* project and hold
++# the call site. A directory-scoped define never reaches them, and because
++# `#if UNDEFINED_MACRO` is silently 0 the console simply did not start, with
++# nothing anywhere saying why.
++target_compile_definitions(rexruntime PUBLIC REX_CONSOLE_BRIDGE=$<BOOL:${REX_CONSOLE_BRIDGE}>)
+ add_library(rex::runtime ALIAS rexruntime)
+ add_library(rex::system ALIAS rexruntime)
+ add_library(rex::kernel ALIAS rexruntime)
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -22,6 +22,9 @@
+ // silently take the desktop branch, and the iOS build would then try to write
+ // its config and logs into the read-only bundle.
+ #include <rex/platform.h>
++#if REX_CONSOLE_BRIDGE
++#include <rex/sampling_profiler.h>
++#endif
+ #include <rex/ui/screen_capture.h>
+ #include <rex/ui/overlay/console_overlay.h>
+ #include <rex/ui/overlay/debug_overlay.h>
+@@ -314,6 +317,12 @@
+     static_cast<rex::input::InputSystem*>(runtime_->input_system())->AttachWindow(window_.get());
+   }
+ 
++#if REX_CONSOLE_BRIDGE
++  // The recompiled function table lives in this executable, so hand it to the
++  // profiler here -- it is what turns a hot address into a guest function name.
++  rex::profiler::SetGuestFunctionTable(ppc_info_.func_mappings);
++#endif
++
+   if (ppc_info_.register_modules) {
+     ppc_info_.register_modules(runtime_->kernel_state());
+   }

@@ -1,0 +1,17 @@
+--- a/src/ui/touch_overlay_uikit.mm
++++ b/src/ui/touch_overlay_uikit.mm
+@@ -835,9 +835,13 @@
+       _hud.textColor = _fps >= 55.0   ? UIColor.systemGreenColor
+                        : _fps >= 30.0 ? UIColor.systemYellowColor
+                                       : UIColor.systemRedColor;
+-      [_hud sizeToFit];
++      // Not sizeToFit: with numberOfLines = 0 that wraps at the label's CURRENT
++      // width, and a label born CGRectZero (or shrunk by an earlier short text)
++      // wraps "34 fps 29.0 ms" one word per line -- the five-line readout the user
++      // saw on 0.1.0.61. Measure unconstrained, then place.
+       UIEdgeInsets safe = self.safeAreaInsets;
+       CGRect f = _hud.frame;
++      f.size = [_hud sizeThatFits:CGSizeMake(CGFLOAT_MAX, CGFLOAT_MAX)];
+       f.origin = CGPointMake(safe.left + 8, safe.top + 6);
+       _hud.frame = f;
+     }

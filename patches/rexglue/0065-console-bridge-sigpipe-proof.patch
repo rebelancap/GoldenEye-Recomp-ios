@@ -1,0 +1,69 @@
+--- a/src/system/console_bridge.cpp
++++ b/src/system/console_bridge.cpp
+@@ -27,6 +27,7 @@
+ #include <dlfcn.h>
+ #include <errno.h>
+ #include <netinet/in.h>
++#include <signal.h>
+ #include <sys/socket.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+@@ -489,10 +490,32 @@
+ 
+ namespace {
+ 
++// A client that hangs up mid-reply (`log 2000 | head`, a dropped network link)
++// must never take the game with it. Without this, the next ::send into the
++// closed socket raised SIGPIPE and iOS killed the process with signal 13 --
++// 0.1.0.59 died exactly that way on the user's phone (2026-09-04) while the
++// console was tailing its own log. Two layers: the accepted socket is marked
++// SO_NOSIGPIPE, and the whole process ignores SIGPIPE (nothing in this runtime
++// relies on it -- EPIPE from send() is the only signal we want).
++void SendAll(int fd, const char* data, size_t size) {
++  while (size > 0) {
++    const ssize_t n = ::send(fd, data, size, 0);
++    if (n <= 0) {
++      return;  // EPIPE / reset: the client is gone; the caller closes the fd.
++    }
++    data += size_t(n);
++    size -= size_t(n);
++  }
++}
++
+ void ServeClient(int fd) {
++  {
++    const int one = 1;
++    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
++  }
+   const std::string banner =
+       "GoldenEye console. 'help' for commands.\n";
+-  ::send(fd, banner.data(), banner.size(), 0);
++  SendAll(fd, banner.data(), banner.size());
+ 
+   std::string pending;
+   char buf[1024];
+@@ -507,13 +530,13 @@
+       pending.erase(0, nl + 1);
+       if (Trim(line) == "quit") {
+         const char* bye = "bye\n";
+-        ::send(fd, bye, 4, 0);
++        SendAll(fd, bye, 4);
+         ::close(fd);
+         return;
+       }
+       std::string reply = Execute(line);
+       if (!reply.empty()) {
+-        ::send(fd, reply.data(), reply.size(), 0);
++        SendAll(fd, reply.data(), reply.size());
+       }
+     }
+   }
+@@ -543,6 +566,8 @@
+     return;
+   }
+   g_stats = std::move(stats_provider);
++  // See ServeClient: a hung-up console client must not be able to kill the game.
++  ::signal(SIGPIPE, SIG_IGN);
+ 
+   g_listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+   if (g_listen_fd < 0) {

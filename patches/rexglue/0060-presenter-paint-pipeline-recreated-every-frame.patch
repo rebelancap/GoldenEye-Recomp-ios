@@ -1,0 +1,20 @@
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1879,6 +1879,17 @@
+             assert_true(guest_output_paint_fs_[size_t(swapchain_effect)] != VK_NULL_HANDLE);
+             swapchain_effect_pipeline.swapchain_pipeline = CreateGuestOutputPaintPipeline(
+                 swapchain_effect, paint_context_.swapchain_render_pass);
++            // Record which format this pipeline was built for. Without this
++            // (the field was compared above but never written, so it stayed
++            // VK_FORMAT_UNDEFINED), the mismatch check was true on EVERY
++            // paint: full AwaitSubmissionCompletion sync + vkDestroyPipeline +
++            // vkCreateGraphicsPipelines, once per presented frame, on every
++            // platform, since bring-up. That was the per-frame MoltenVK
++            // "primitive restart" warning flood, a standing energy tax on the
++            // phone, and -- under load-time driver contention -- the ~1 fps
++            // present collapse of the M-074 boot stall.
++            swapchain_effect_pipeline.swapchain_format =
++                paint_context_.swapchain_render_pass_format;
+             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
+               guest_output_flow.effect_count = 0;
+             }

@@ -1,0 +1,171 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -22,6 +22,9 @@
+ #==========================================================
+ option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
+ option(REXGLUE_TOOLS_ONLY        "Build only the recompiler CLI and its libs (no window/renderer/audio/input backends)" OFF)
++# Set for device targets (iOS/visionOS): drops the host-only recompiler CLI and
++# the install/devenv rules, which assume a host layout.
++option(REXGLUE_HOST_TOOLS_OFF    "Do not build the host recompiler CLI or host install rules" OFF)
+ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
+ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
+ option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
+@@ -168,12 +171,21 @@
+     else()
+         set(REX_PLATFORM_OS "macos")
+     endif()
+-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
++    # CMAKE_SYSTEM_PROCESSOR is empty when cross-compiling to iOS/visionOS, so
++    # fall back to the requested architectures.
++    set(REX_APPLE_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
++    if(NOT REX_APPLE_ARCH AND CMAKE_OSX_ARCHITECTURES)
++        list(GET CMAKE_OSX_ARCHITECTURES 0 REX_APPLE_ARCH)
++    endif()
++    if(NOT REX_APPLE_ARCH)
++        set(REX_APPLE_ARCH "arm64")
++    endif()
++    if(REX_APPLE_ARCH MATCHES "aarch64|arm64|ARM64")
+         set(REX_PLATFORM "${REX_PLATFORM_OS}-arm64")
+-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
++    elseif(REX_APPLE_ARCH MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "${REX_PLATFORM_OS}-amd64")
+     else()
+-        set(REX_PLATFORM "${REX_PLATFORM_OS}-${CMAKE_SYSTEM_PROCESSOR}")
++        set(REX_PLATFORM "${REX_PLATFORM_OS}-${REX_APPLE_ARCH}")
+     endif()
+     # rex/platform.h derives REX_PLATFORM_MAC from TargetConditionals.h. Note
+     # TARGET_OS_MAC is 1 on EVERY Apple platform (it is the umbrella macro), so
+@@ -276,7 +288,11 @@
+ add_subdirectory(src/system)
+ add_subdirectory(src/kernel)
+ add_subdirectory(src/codegen)
+-add_subdirectory(src/rexglue)
++# The `rexglue` CLI is a build-time host tool. Cross-compiling it for a device
++# is meaningless, and its install rules assume a host layout.
++if(NOT REXGLUE_HOST_TOOLS_OFF)
++    add_subdirectory(src/rexglue)
++endif()
+ 
+ # Add tests subdirectory if tests are enabled
+ if(REXGLUE_BUILD_TESTS)
+@@ -300,7 +316,9 @@
+ message(STATUS "===========================================")
+ 
+ # SDK install/export rules (skipped when consumed as a subdirectory)
+-if(PROJECT_IS_TOP_LEVEL AND REXGLUE_TOOLS_ONLY)
++if(PROJECT_IS_TOP_LEVEL AND REXGLUE_HOST_TOOLS_OFF)
++    # Device build: no CLI, and the install/devenv rules address host targets.
++elseif(PROJECT_IS_TOP_LEVEL AND REXGLUE_TOOLS_ONLY)
+     # Tools-only builds have no rexui/rexinput/rexaudio/rexgraphics targets, and
+     # the install/devenv rules address them by name. Nothing to install here --
+     # the only artifact is the `rexglue` CLI in out/.
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -5,10 +5,18 @@
+ #=============================================================================
+ # Architecture detection
+ #=============================================================================
+-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
++# CMAKE_SYSTEM_PROCESSOR is empty when cross-compiling to iOS/visionOS; fall
++# back to the requested architectures (see the same fallback in the top-level
++# CMakeLists). Getting this wrong silently drops FFmpeg's NEON sources and only
++# shows up as unresolved ff_*_aarch64 at link time.
++set(REX_TP_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
++if(NOT REX_TP_ARCH AND CMAKE_OSX_ARCHITECTURES)
++    list(GET CMAKE_OSX_ARCHITECTURES 0 REX_TP_ARCH)
++endif()
++if(REX_TP_ARCH MATCHES "^(x86_64|AMD64)$")
+     set(IS_ARM64 FALSE)
+     set(IS_X86_64 TRUE)
+-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
++elseif(REX_TP_ARCH MATCHES "^(aarch64|arm64|ARM64)$")
+     set(IS_ARM64 TRUE)
+     set(IS_X86_64 FALSE)
+ else()
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -63,12 +63,22 @@
+         windowed_app_context_win.cpp
+     )
+ elseif(APPLE)
+-    # Cocoa/AppKit + CAMetalLayer. Objective-C++; see the ObjC flags below.
+-    set(REXUI_PLATFORM_SOURCES
+-        surface_apple.mm
+-        window_apple.mm
+-        windowed_app_context_apple.mm
+-    )
++    # Objective-C++ (see the ObjC flags below). surface_apple.mm is shared: both
++    # Apple families present a CAMetalLayer to Vulkan; only windowing differs.
++    if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++        set(REXUI_PLATFORM_SOURCES
++            surface_apple.mm
++            window_uikit.mm
++            windowed_app_context_uikit.mm
++            sdl_ios_device_idiom.mm
++        )
++    else()
++        set(REXUI_PLATFORM_SOURCES
++            surface_apple.mm
++            window_apple.mm
++            windowed_app_context_apple.mm
++        )
++    endif()
+ else()
+     set(REXUI_PLATFORM_SOURCES
+         surface_gnulinux.cpp
+@@ -148,12 +158,21 @@
+     # ARC for the .mm sources; the C++ ones must not get -fobjc-arc.
+     set_source_files_properties(${REXUI_PLATFORM_SOURCES}
+         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+-    target_link_libraries(rexui PUBLIC
+-        "-framework AppKit"
+-        "-framework QuartzCore"
+-        "-framework Metal"
+-        "-framework Foundation"
+-    )
++    if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++        target_link_libraries(rexui PUBLIC
++            "-framework UIKit"
++            "-framework QuartzCore"
++            "-framework Metal"
++            "-framework Foundation"
++        )
++    else()
++        target_link_libraries(rexui PUBLIC
++            "-framework AppKit"
++            "-framework QuartzCore"
++            "-framework Metal"
++            "-framework Foundation"
++        )
++    endif()
+ else()
+     find_package(PkgConfig REQUIRED)
+     pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -53,13 +53,20 @@
+             ${REXGLUE_SHARE_DIR}/windowed_app_main_win.cpp)
+     elseif(APPLE)
+         # windowed_app_main_posix.cpp is GTK-bound despite the name; Apple gets
+-        # its own AppKit entry point.
+-        target_sources(${target_name} PRIVATE
+-            ${REXGLUE_SHARE_DIR}/windowed_app_main_apple.mm)
+-        set_source_files_properties(${REXGLUE_SHARE_DIR}/windowed_app_main_apple.mm
++        # its own entry point, and UIKit's differs from AppKit's because
++        # UIApplicationMain never returns.
++        if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++            set(REX_APPLE_MAIN ${REXGLUE_SHARE_DIR}/windowed_app_main_uikit.mm)
++            set(REX_APPLE_UI_FRAMEWORK "-framework UIKit")
++        else()
++            set(REX_APPLE_MAIN ${REXGLUE_SHARE_DIR}/windowed_app_main_apple.mm)
++            set(REX_APPLE_UI_FRAMEWORK "-framework AppKit")
++        endif()
++        target_sources(${target_name} PRIVATE ${REX_APPLE_MAIN})
++        set_source_files_properties(${REX_APPLE_MAIN}
+             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+         target_link_libraries(${target_name} PRIVATE
+-            "-framework AppKit"
++            ${REX_APPLE_UI_FRAMEWORK}
+             "-framework QuartzCore"
+             "-framework Metal"
+             "-framework Foundation")

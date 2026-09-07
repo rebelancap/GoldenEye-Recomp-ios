@@ -1,0 +1,20 @@
+--- a/src/system/console_bridge.cpp
++++ b/src/system/console_bridge.cpp
+@@ -6,6 +6,11 @@
+  * See rex/console_bridge.h for why this exists and why it is not shipped.
+  */
+ 
++// The whole translation unit is dev-only: REX_CONSOLE_BRIDGE is 0 in PUBLIC=1
++// builds (build-ios.sh), and make-ipa.sh refuses a public bundle that still
++// carries the console banner string.
++#if REX_CONSOLE_BRIDGE
++
+ #include <rex/console_bridge.h>
+ 
+ #include <rex/graphics/gpu_dispatch_stats.h>
+@@ -745,3 +750,5 @@
+ 
+ }  // namespace console
+ }  // namespace rex
++
++#endif  // REX_CONSOLE_BRIDGE

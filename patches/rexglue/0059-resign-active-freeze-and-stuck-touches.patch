@@ -1,0 +1,158 @@
+--- a/src/ui/windowed_app_main_uikit.mm
++++ b/src/ui/windowed_app_main_uikit.mm
+@@ -24,6 +24,10 @@
+ #include <rex/cvar.h>
+ #include <rex/filesystem.h>
+ #include <rex/logging.h>
++
++// Flush every logger's queued lines to disk (core/logging.cpp). C linkage —
++// it is also the console bridge's dlsym surface.
++extern "C" void RexFlushLogs(void);
+ #include <rex/ui/settings_uikit.h>
+ #include <rex/ui/windowed_app.h>
+ #include <rex/ui/windowed_app_context_uikit.h>
+@@ -77,10 +81,23 @@
+   // this is the belt to that braces -- and it also catches anything set over the
+   // console bridge.
+   rex::ui::PersistSettingsNow();
+-  rex::ShutdownLogging();
+-  rex::InitLoggingEarly();
++  // FLUSH the logs -- never tear the logging system down here. This used to
++  // call ShutdownLogging()+InitLoggingEarly(), which destroys spdlog's async
++  // worker while a dozen engine threads are logging concurrently; whichever
++  // thread lost that race parked forever. When it was the vsync worker, guest
++  // interrupts stopped and the whole game froze -- the "froze after taking a
++  // screenshot" bug (screenshots resign the app): frozen at 23:26:51.653 on
++  // the very line after this handler's own log write, every time. A flush
++  // gives suspend-safety (the file is complete if iOS kills us) without
++  // touching live machinery.
++  RexFlushLogs();
+ }
+ 
++- (void)applicationDidBecomeActive:(UIApplication*)application {
++  (void)application;
++  REXLOG_INFO("iOS: became active");
++}
++
+ @end
+ 
+ extern "C" int main(int argc, char** argv) {
+--- a/src/ui/touch_overlay_uikit.mm
++++ b/src/ui/touch_overlay_uikit.mm
+@@ -151,6 +151,10 @@
+   // life, so sliding off a button does not silently become a look drag.
+   UITouch* _stickTouch;
+   CGPoint _stickOrigin;
++  // The last stick rect handed to setNeedsDisplayInRect, unioned into every
++  // subsequent invalidation so a moved or released stick erases its old
++  // pixels (the ghost-ring bug). CGRectNull when nothing was drawn.
++  CGRect _stickPrevDirty;
+   CGPoint _stickCurrent;
+ 
+   UITouch* _lookTouch;
+@@ -236,6 +240,7 @@
+   self.userInteractionEnabled = YES;
+   _buttonTouches = [NSMutableDictionary dictionary];
+   _heldButtons = [NSMutableSet set];
++  _stickPrevDirty = CGRectNull;
+   _haptics = [[UIImpactFeedbackGenerator alloc]
+       initWithStyle:UIImpactFeedbackStyleLight];
+ 
+@@ -249,10 +254,32 @@
+ 
+   _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+   [_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
++
++  // System gestures -- the screenshot chord above all -- can steal an active
++  // touch without delivering touchesEnded OR touchesCancelled. The stick then
++  // stays latched with its ring painted at the last position ("sticky
++  // duplicated joystick"). Every such steal resigns the app, so clearing all
++  // touch state on resign releases the stick, the look drag, and any held
++  // buttons at exactly the right moment.
++  [[NSNotificationCenter defaultCenter] addObserver:self
++                                           selector:@selector(clearAllTouchState)
++                                               name:UIApplicationWillResignActiveNotification
++                                             object:nil];
+   return self;
+ }
+ 
++- (void)clearAllTouchState {
++  _stickTouch = nil;
++  _stickOrigin = _stickCurrent = CGPointZero;
++  _lookTouch = nil;
++  _lookAccumX = _lookAccumY = 0.0f;
++  [_buttonTouches removeAllObjects];
++  [_heldButtons removeAllObjects];
++  [self invalidateControls];
++}
++
+ - (void)dealloc {
++  [[NSNotificationCenter defaultCenter] removeObserver:self];
+   [_link invalidate];
+ }
+ 
+@@ -263,17 +290,23 @@
+ // and a full-screen invalidation re-rasterises the entire backing store on the
+ // CPU, which during a drag happened every single frame.
+ - (void)invalidateControls {
+-  UIEdgeInsets safe = self.safeAreaInsets;
+-  const CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+   const CGFloat r = [self stickRadius] + 40.0;
+-  if (_stickTouch) {
+-    [self setNeedsDisplayInRect:CGRectMake(_stickOrigin.x - r, _stickOrigin.y - r, r * 2, r * 2)];
+-  } else {
+-    // The resting ring, drawn at a fixed fraction of the safe area.
+-    CGPoint home = CGPointMake(safe.left + (w - safe.left - safe.right) * 0.16,
+-                               h - safe.bottom - (h - safe.top - safe.bottom) * 0.26);
+-    [self setNeedsDisplayInRect:CGRectMake(home.x - r, home.y - r, r * 2, r * 2)];
++  // The stick draws ONLY while a thumb is down (it appears wherever the thumb
++  // lands, so there is nothing to show at rest). Every invalidation unions the
++  // PREVIOUS stick rect with the current one: state changes -- release above
++  // all -- must repaint where the ring USED to be, or its pixels stay on the
++  // backing store forever. That was the "paint sticky joysticks by touching"
++  // bug: endTouches zeroed the origin before invalidating, so the old rect
++  // was never repainted and every release left a permanent ghost ring.
++  CGRect stick_now = CGRectNull;
++  if (_stickTouch) {
++    stick_now = CGRectMake(_stickOrigin.x - r, _stickOrigin.y - r, r * 2, r * 2);
++  }
++  CGRect stick_dirty = CGRectUnion(stick_now, _stickPrevDirty);
++  if (!CGRectIsNull(stick_dirty)) {
++    [self setNeedsDisplayInRect:stick_dirty];
+   }
++  _stickPrevDirty = stick_now;
+   // The button cluster's bounding box, from the same table the buttons draw
+   // from, so the two cannot drift apart.
+   CGRect cluster = CGRectNull;
+@@ -604,28 +637,11 @@
+     CGSize size = [label sizeWithAttributes:attrs];
+     [label drawAtPoint:CGPointMake(c.x - size.width / 2, c.y - size.height / 2)
+         withAttributes:attrs];
+-  }
+-
+-  // With no thumb down the stick has nowhere to be, but a completely blank left
+-  // half reads as "nothing here". A faint resting ring in the natural thumb
+-  // position says otherwise without becoming clutter; it is replaced by the
+-  // real stick the moment a thumb lands anywhere in the region.
+-  if (!_stickTouch) {
+-    UIEdgeInsets safe = self.safeAreaInsets;
+-    CGPoint home = CGPointMake(safe.left + (self.bounds.size.width - safe.left - safe.right) * 0.16,
+-                               self.bounds.size.height - safe.bottom -
+-                                   (self.bounds.size.height - safe.top - safe.bottom) * 0.26);
+-    stroke(home, [self stickRadius], alpha * 0.55, NO);
+-    NSDictionary* hint = @{
+-      NSFontAttributeName : [UIFont systemFontOfSize:10 weight:UIFontWeightMedium],
+-      NSForegroundColorAttributeName : [UIColor colorWithWhite:1.0 alpha:alpha * 1.2],
+-    };
+-    NSString* label = @"MOVE";
+-    CGSize size = [label sizeWithAttributes:hint];
+-    [label drawAtPoint:CGPointMake(home.x - size.width / 2, home.y - size.height / 2)
+-        withAttributes:hint];
+   }
+ 
++  // No resting visual: the stick exists only under a thumb (the user, 2026-08-05
++  // -- "as originally intended"). The left half being blank is the design; the
++  // stick materialises wherever the thumb lands.
+   if (_stickTouch) {
+     const CGFloat r = [self stickRadius];
+     stroke(_stickOrigin, r, alpha * 1.6, NO);

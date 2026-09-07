@@ -1,0 +1,335 @@
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1709,8 +1709,16 @@
+                                                    0, 2, direct_sets, 0, nullptr);
+             DirectResolvePushConstants direct_push;
+             direct_push.resolve = copy_shader_constants;
+-            direct_push.resolve.dest_base -=
+-                uint32_t(write_descriptor_set_dest_buffer_info.offset);
++            if (draw_resolution_scaled) {
++              // Scaled destinations address relative to the binding (which is
++              // already based at the scaled resolve range) -- the fused shader
++              // has no dest_base term, exactly like the scaled copy shaders,
++              // whose push range stops at dest_relative.
++              direct_push.resolve.dest_base = 0;
++            } else {
++              direct_push.resolve.dest_base -=
++                  uint32_t(write_descriptor_set_dest_buffer_info.offset);
++            }
+             direct_push.source_base_tiles = direct_prep.source_base_tiles;
+             direct_push.source_pitch_tiles = direct_prep.source_pitch_tiles;
+             direct_push.dispatch_first_tile = direct_prep.dispatch_first_tile;
+@@ -6544,10 +6552,31 @@
+   // depth is meaningless) -- census-confirmed. kFull stays color-only.
+   bool depth_shape_ok =
+       !dump_key.is_depth || key.copy_shader != draw_util::ResolveCopyShaderIndex::kFull32bpp;
+-  if (!msaa_shader_ok || !format_ok || !depth_shape_ok || key.draw_resolution_scaled) {
++  if (!msaa_shader_ok || !format_ok || !depth_shape_ok) {
+     direct_resolve_pipelines_.emplace(key, VK_NULL_HANDLE);
+     return VK_NULL_HANDLE;
+   }
++  // M-106: draw resolution scaling. The scaled prebuilt copy shaders differ
++  // from the unscaled ones in exactly five places (constant-diff of
++  // resolve_fast_32bpp_1x2xmsaa[_scaled]_cs and resolve_full_32bpp[_scaled]_cs
++  // -- both scaled variants share the SAME destination math):
++  //   1. scale = (coordinate_info >> {16,19}) & 7 (per axis), read at runtime;
++  //   2. the EDRAM/dest offsets and the x guard extent are multiplied by it;
++  //   3. the EDRAM tile is (80,16)*scale samples (matching the dump generator,
++  //      which uses the same scaled tile size), and the depth column swap
++  //      pivots on tile_width/2 instead of a constant 40;
++  //   4. the "fill half pixel offset" gap fill (edram_info bit 29): the source
++  //      y is clamped to at least scale_y/2 and, in the leftmost invocation,
++  //      source lane i reads lane max(i, scale_x/2);
++  //   5. the destination address becomes
++  //      guest_tiled_address * scale_x*scale_y +
++  //      ((sub_x*scale_y + sub_y)*4 + (dest_x & 3)) * 4,
++  //      with NO dest_base term (the scaled binding is already based at the
++  //      resolve destination), and the second uint4 of the fast classes lands
++  //      at a scale-dependent stride instead of a flat +32 bytes.
++  // Everything else -- packing, channel swap, endian, the source image fetch
++  // -- is scale-independent.
++  bool scaled = key.draw_resolution_scaled;
+   // Guest MSAA mode for the EDRAM sample -> (pixel, sample) mapping; host
+   // sample count for the image declaration, the fetch and the kFull average.
+   bool source_is_multisampled = dump_key.msaa_samples != xenos::MsaaSamples::k1X;
+@@ -6674,6 +6703,39 @@
+   // of the same word).
+   spv::Id w1_pair = builder.createCompositeConstruct(
+       type_uint2, std::vector<spv::Id>{w1, w1});
++  // Draw resolution scale (coordinate_info bits 16-18 / 19-21) and the
++  // half-pixel-offset gap fill (edram_info bit 29), verbatim from the scaled
++  // copy shaders. Both are runtime values there, and stay runtime here.
++  spv::Id scale_xy = spv::NoResult;
++  spv::Id scale_x = spv::NoResult;
++  spv::Id scale_y = spv::NoResult;
++  spv::Id half_offset = spv::NoResult;
++  if (scaled) {
++    scale_xy = builder.createBinOp(
++        spv::OpBitwiseAnd, type_uint2,
++        builder.createBinOp(
++            spv::OpShiftRightLogical, type_uint2, w1_pair,
++            builder.createCompositeConstruct(
++                type_uint2, std::vector<spv::Id>{builder.makeUintConstant(16),
++                                                 builder.makeUintConstant(19)})),
++        builder.createCompositeConstruct(
++            type_uint2, std::vector<spv::Id>{builder.makeUintConstant(7),
++                                             builder.makeUintConstant(7)}));
++    scale_x = builder.createCompositeExtract(scale_xy, type_uint, 0);
++    scale_y = builder.createCompositeExtract(scale_xy, type_uint, 1);
++    spv::Id fill_half_pixel_offset = builder.createBinOp(
++        spv::OpINotEqual, type_bool,
++        builder.createBinOp(spv::OpBitwiseAnd, type_uint, w0,
++                            builder.makeUintConstant(536870912u)),
++        const_uint_0);
++    half_offset = builder.createTriOp(
++        spv::OpSelect, type_uint2, fill_half_pixel_offset,
++        builder.createBinOp(spv::OpShiftRightLogical, type_uint2, scale_xy,
++                            builder.createCompositeConstruct(
++                                type_uint2, std::vector<spv::Id>{const_uint_1, const_uint_1})),
++        builder.createCompositeConstruct(type_uint2,
++                                         std::vector<spv::Id>{const_uint_0, const_uint_0}));
++  }
+   id_vector_temp.clear();
+   id_vector_temp.push_back(const_uint_0);
+   id_vector_temp.push_back(builder.makeUintConstant(4));
+@@ -6692,6 +6754,10 @@
+       spv::OpBitwiseAnd, type_uint,
+       builder.createBinOp(spv::OpShiftRightLogical, type_uint, w1, builder.makeUintConstant(5)),
+       builder.makeUintConstant(2047));
++  if (scaled) {
++    source_offset = builder.createBinOp(spv::OpIMul, type_uint2, source_offset, scale_xy);
++    extent_x_blocks = builder.createBinOp(spv::OpIMul, type_uint, extent_x_blocks, scale_x);
++  }
+ 
+   spv::Id w2 = load_push(2);  // dest_info
+   spv::Id dest_endian =
+@@ -6738,6 +6804,9 @@
+                                                builder.makeUintConstant(15)})),
+       builder.createCompositeConstruct(type_uint2,
+                                        std::vector<spv::Id>{const_uint_3, const_uint_3}));
++  if (scaled) {
++    dest_offset = builder.createBinOp(spv::OpIMul, type_uint2, dest_offset, scale_xy);
++  }
+   spv::Id sample_swap_class_raw = builder.createBinOp(
+       spv::OpBitwiseAnd, type_uint,
+       builder.createBinOp(spv::OpShiftRightLogical, type_uint, w3, builder.makeUintConstant(28)),
+@@ -6770,7 +6839,21 @@
+       builder.createCompositeConstruct(
+           type_uint2, std::vector<spv::Id>{builder.makeUintConstant(pixel_base_shift),
+                                            const_uint_0}));
+-  spv::Id pos = builder.createBinOp(spv::OpIAdd, type_uint2, pos_blocks, source_offset);
++  // The scaled shaders clamp the SOURCE y to the half-pixel-offset gap fill
++  // (max(y, scale_y/2)) while leaving the DESTINATION y alone -- keep the two
++  // block origins separate.
++  spv::Id source_pos_blocks = pos_blocks;
++  if (scaled) {
++    source_pos_blocks = builder.createCompositeConstruct(
++        type_uint2,
++        std::vector<spv::Id>{
++            builder.createCompositeExtract(pos_blocks, type_uint, 0),
++            builder.createBinBuiltinCall(
++                type_uint, ext_inst_glsl_std_450, GLSLstd450UMax,
++                builder.createCompositeExtract(pos_blocks, type_uint, 1),
++                builder.createCompositeExtract(half_offset, type_uint, 1))});
++  }
++  spv::Id pos = builder.createBinOp(spv::OpIAdd, type_uint2, source_pos_blocks, source_offset);
+   // Sample-swap class: <=3 as-is, ==5 -> 2, else 0 (%23776 phi).
+   spv::Id class_le3 = builder.createBinOp(spv::OpULessThanEqual, type_bool, sample_swap_class_raw,
+                                           const_uint_3);
+@@ -6805,21 +6888,37 @@
+   spv::Id sample_pos = builder.createBinOp(spv::OpIAdd, type_uint2, pos_scaled, swap_add);
+ 
+   // --- EDRAM tile decomposition (80x16) ---
++  // With resolution scaling a 32bpp tile holds (80,16)*scale samples -- the
++  // same tile size the dump generator uses, so the two still agree sample for
++  // sample.
+   spv::Id tile_dims = builder.createCompositeConstruct(
+       type_uint2, std::vector<spv::Id>{builder.makeUintConstant(80),
+                                        builder.makeUintConstant(16)});
++  if (scaled) {
++    tile_dims = builder.createBinOp(spv::OpIMul, type_uint2, tile_dims, scale_xy);
++  }
++  spv::Id tile_width = builder.createCompositeExtract(tile_dims, type_uint, 0);
++  spv::Id tile_height = builder.createCompositeExtract(tile_dims, type_uint, 1);
+   spv::Id tile_xy = builder.createBinOp(spv::OpUDiv, type_uint2, sample_pos, tile_dims);
+   spv::Id in_tile = builder.createBinOp(
+       spv::OpISub, type_uint2, sample_pos,
+       builder.createBinOp(spv::OpIMul, type_uint2, tile_xy, tile_dims));
+-  // Depth column swap (in.x +/- 40) -- gated on is_depth at runtime, verbatim.
++  // Depth column swap (in.x +/- tile_width/2, i.e. +/-40 unscaled) -- gated on
++  // is_depth at runtime, verbatim.
+   spv::Id in_x = builder.createCompositeExtract(in_tile, type_uint, 0);
+-  spv::Id in_x_ge40 = builder.createBinOp(spv::OpUGreaterThanEqual, type_bool, in_x,
+-                                          builder.makeUintConstant(40));
+-  spv::Id in_x_depth = builder.createBinOp(
+-      spv::OpIAdd, type_uint, in_x,
+-      builder.createTriOp(spv::OpSelect, type_uint, in_x_ge40,
+-                          builder.makeUintConstant(uint32_t(-40)), builder.makeUintConstant(40)));
++  spv::Id tile_width_half =
++      builder.createBinOp(spv::OpShiftRightLogical, type_uint, tile_width, const_uint_1);
++  spv::Id tile_width_half_int = builder.createUnaryOp(spv::OpBitcast, type_int, tile_width_half);
++  spv::Id in_x_ge_half =
++      builder.createBinOp(spv::OpUGreaterThanEqual, type_bool, in_x, tile_width_half);
++  spv::Id in_x_depth = builder.createUnaryOp(
++      spv::OpBitcast, type_uint,
++      builder.createBinOp(
++          spv::OpIAdd, type_int, builder.createUnaryOp(spv::OpBitcast, type_int, in_x),
++          builder.createTriOp(
++              spv::OpSelect, type_int, in_x_ge_half,
++              builder.createUnaryOp(spv::OpSNegate, type_int, tile_width_half_int),
++              tile_width_half_int)));
+   in_x = builder.createTriOp(spv::OpSelect, type_uint, edram_is_depth, in_x_depth, in_x);
+   spv::Id in_y = builder.createCompositeExtract(in_tile, type_uint, 1);
+   spv::Id tile_x = builder.createCompositeExtract(tile_xy, type_uint, 0);
+@@ -6836,10 +6935,10 @@
+   spv::Id rt_tile_x = builder.createBinOp(spv::OpUMod, type_uint, rt_tile, src_pitch_tiles);
+   spv::Id texel_base_x = builder.createBinOp(
+       spv::OpIAdd, type_uint,
+-      builder.createBinOp(spv::OpIMul, type_uint, rt_tile_x, builder.makeUintConstant(80)), in_x);
++      builder.createBinOp(spv::OpIMul, type_uint, rt_tile_x, tile_width), in_x);
+   spv::Id texel_y = builder.createBinOp(
+       spv::OpIAdd, type_uint,
+-      builder.createBinOp(spv::OpIMul, type_uint, rt_tile_y, builder.makeUintConstant(16)), in_y);
++      builder.createBinOp(spv::OpIMul, type_uint, rt_tile_y, tile_height), in_y);
+   spv::Id texel_y_int = builder.createUnaryOp(spv::OpBitcast, type_int, texel_y);
+ 
+   // Fetch 8 texels, pack each with the dump's k_8_8_8_8 packing.
+@@ -6855,10 +6954,26 @@
+     // the guest->Vulkan standard-location remap; 1x -> identity.
+     // Pixel stride in SAMPLE space: at 4x MSAA each output pixel spans two
+     // sample columns (the M-080 black-thumbnail bug was stepping one).
+-    uint32_t sample_step =
+-        dump_key.msaa_samples >= xenos::MsaaSamples::k4X ? (i << 1) : i;
+-    spv::Id sample_x = builder.createBinOp(spv::OpIAdd, type_uint, texel_base_x,
+-                                           builder.makeUintConstant(sample_step));
++    // The half-pixel-offset gap fill duplicates the first surely-covered
++    // column: in the leftmost invocation the scaled copy shaders rewrite
++    // lanes [0, scale_x/2) with lane scale_x/2, which on the fused source
++    // side is exactly reading lane max(i, scale_x/2). max() is a no-op for
++    // lanes at or past the fill width, so no extra guard is needed.
++    spv::Id lane = builder.makeUintConstant(i);
++    if (scaled) {
++      lane = builder.createTriOp(
++          spv::OpSelect, type_uint,
++          builder.createBinOp(spv::OpIEqual, type_bool, gid_x, const_uint_0),
++          builder.createBinBuiltinCall(
++              type_uint, ext_inst_glsl_std_450, GLSLstd450UMax, lane,
++              builder.createCompositeExtract(half_offset, type_uint, 0)),
++          lane);
++    }
++    spv::Id sample_step =
++        dump_key.msaa_samples >= xenos::MsaaSamples::k4X
++            ? builder.createBinOp(spv::OpShiftLeftLogical, type_uint, lane, const_uint_1)
++            : lane;
++    spv::Id sample_x = builder.createBinOp(spv::OpIAdd, type_uint, texel_base_x, sample_step);
+     spv::Id pixel_x = sample_x;
+     spv::Id pixel_y_id = texel_y;
+     spv::Id fetch_sample_id = spv::NoResult;
+@@ -7046,10 +7161,28 @@
+ 
+   // --- destination address (dest-space pixel = pos_blocks + dest_offset) ---
+   spv::Id dest_xy = builder.createBinOp(spv::OpIAdd, type_uint2, pos_blocks, dest_offset);
+-  spv::Id dx = builder.createUnaryOp(
+-      spv::OpBitcast, type_int, builder.createCompositeExtract(dest_xy, type_uint, 0));
+-  spv::Id dy = builder.createUnaryOp(
+-      spv::OpBitcast, type_int, builder.createCompositeExtract(dest_xy, type_uint, 1));
++  spv::Id dest_x_u = builder.createCompositeExtract(dest_xy, type_uint, 0);
++  spv::Id dest_y_u = builder.createCompositeExtract(dest_xy, type_uint, 1);
++  // With scaling the tiled address is computed in GUEST pixels: the scaled x
++  // is taken in groups of four (the granularity the 32bpp classes address the
++  // destination at) and both axes are divided by the scale; the remainder
++  // selects the sub-pixel inside the guest pixel's scale_x*scale_y block.
++  spv::Id dest_group_xy = spv::NoResult;
++  spv::Id dest_guest_xy = spv::NoResult;
++  if (scaled) {
++    dest_group_xy = builder.createCompositeConstruct(
++        type_uint2,
++        std::vector<spv::Id>{
++            builder.createBinOp(spv::OpShiftRightLogical, type_uint, dest_x_u, const_uint_2),
++            dest_y_u});
++    dest_guest_xy = builder.createBinOp(spv::OpUDiv, type_uint2, dest_group_xy, scale_xy);
++    dest_x_u = builder.createBinOp(
++        spv::OpShiftLeftLogical, type_uint,
++        builder.createCompositeExtract(dest_guest_xy, type_uint, 0), const_uint_2);
++    dest_y_u = builder.createCompositeExtract(dest_guest_xy, type_uint, 1);
++  }
++  spv::Id dx = builder.createUnaryOp(spv::OpBitcast, type_int, dest_x_u);
++  spv::Id dy = builder.createUnaryOp(spv::OpBitcast, type_int, dest_y_u);
+   spv::Id const_int_3 = builder.makeIntConstant(3);
+   spv::Id const_int_5 = builder.makeIntConstant(5);
+ 
+@@ -7242,7 +7375,33 @@
+   spv::Id addr_3d = builder.createUnaryOp(spv::OpBitcast, type_uint, s_final);
+ 
+   spv::Id tiled_addr = builder.createTriOp(spv::OpSelect, type_uint, dest_is_3d, addr_3d, addr_2d);
+-  spv::Id dest_addr = builder.createBinOp(spv::OpIAdd, type_uint, tiled_addr, dest_base);
++  spv::Id dest_addr;
++  spv::Id scale_area = spv::NoResult;
++  if (scaled) {
++    // The scaled destination has no dest_base term -- the binding is already
++    // based at the resolve destination, and every guest pixel expands to
++    // scale_x*scale_y dwords in place.
++    scale_area = builder.createBinOp(spv::OpIMul, type_uint, scale_x, scale_y);
++    spv::Id sub_xy = builder.createBinOp(
++        spv::OpISub, type_uint2, dest_group_xy,
++        builder.createBinOp(spv::OpIMul, type_uint2, dest_guest_xy, scale_xy));
++    spv::Id sub_linear = builder.createBinOp(
++        spv::OpIAdd, type_uint,
++        builder.createBinOp(spv::OpIMul, type_uint,
++                            builder.createCompositeExtract(sub_xy, type_uint, 0), scale_y),
++        builder.createCompositeExtract(sub_xy, type_uint, 1));
++    spv::Id in_group = builder.createBinOp(
++        spv::OpIAdd, type_uint,
++        builder.createBinOp(spv::OpShiftLeftLogical, type_uint, sub_linear, const_uint_2),
++        builder.createBinOp(spv::OpBitwiseAnd, type_uint,
++                            builder.createCompositeExtract(dest_xy, type_uint, 0), const_uint_3));
++    dest_addr = builder.createBinOp(
++        spv::OpIAdd, type_uint,
++        builder.createBinOp(spv::OpIMul, type_uint, tiled_addr, scale_area),
++        builder.createBinOp(spv::OpShiftLeftLogical, type_uint, in_group, const_uint_2));
++  } else {
++    dest_addr = builder.createBinOp(spv::OpIAdd, type_uint, tiled_addr, dest_base);
++  }
+   spv::Id dest_index = builder.createBinOp(spv::OpShiftRightLogical, type_uint, dest_addr,
+                                            builder.makeUintConstant(4));
+ 
+@@ -7287,8 +7446,37 @@
+   builder.createStore(data_lo, builder.createAccessChain(spv::StorageClassUniform, dest_buffer,
+                                                          id_vector_temp));
+   if (!full_shape) {
+-    spv::Id dest_index_hi =
+-        builder.createBinOp(spv::OpIAdd, type_uint, dest_index, const_uint_2);
++    // Unscaled the second uint4 (dest pixels 4-7) sits a flat 32 bytes on.
++    // Scaled, the four-pixel groups of one guest pixel are packed together, so
++    // the stride is 16 bytes inside a guest pixel and 32*scale_x - sub*16 when
++    // stepping out of the last group of one (which collapses to 32 at
++    // scale_x == 1 -- the same expression covers both).
++    spv::Id dest_index_hi;
++    if (scaled) {
++      spv::Id group = builder.createBinOp(spv::OpShiftRightLogical, type_uint,
++                                          builder.createCompositeExtract(pos_blocks, type_uint, 0),
++                                          const_uint_2);
++      spv::Id sub_group = builder.createBinOp(spv::OpUMod, type_uint, group, scale_x);
++      spv::Id at_group_end = builder.createBinOp(
++          spv::OpIEqual, type_bool,
++          builder.createBinOp(spv::OpIAdd, type_uint, sub_group, const_uint_1), scale_x);
++      spv::Id delta_bytes = builder.createTriOp(
++          spv::OpSelect, type_uint, at_group_end,
++          builder.createBinOp(
++              spv::OpISub, type_uint,
++              builder.createBinOp(spv::OpIMul, type_uint, builder.makeUintConstant(32), scale_x),
++              builder.createBinOp(spv::OpShiftLeftLogical, type_uint, sub_group,
++                                  builder.makeUintConstant(4))),
++          builder.makeUintConstant(16));
++      dest_index_hi = builder.createBinOp(
++          spv::OpIAdd, type_uint, dest_index,
++          builder.createBinOp(
++              spv::OpShiftRightLogical, type_uint,
++              builder.createBinOp(spv::OpIMul, type_uint, delta_bytes, scale_y),
++              builder.makeUintConstant(4)));
++    } else {
++      dest_index_hi = builder.createBinOp(spv::OpIAdd, type_uint, dest_index, const_uint_2);
++    }
+     id_vector_temp.clear();
+     id_vector_temp.push_back(const_int_0);
+     id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, dest_index_hi));

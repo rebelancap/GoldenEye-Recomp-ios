@@ -1,0 +1,118 @@
+--- a/src/graphics/pipeline/shader/spirv_builder.cpp
++++ b/src/graphics/pipeline/shader/spirv_builder.cpp
+@@ -124,8 +124,13 @@
+   assert_true(currentBranch == Branch::kThen);
+ #endif
+ 
+-  if (branchToMerge) {
+-    // Close out the "then" by having it jump to the mergeBlock.
++  if (branchToMerge && !builder.getBuildPoint()->isTerminated()) {
++    // Close out the "then" by having it jump to the mergeBlock — unless the
++    // caller already terminated it (the rect-list vertex loop's then-branch
++    // ends with an explicit branch to the main loop's continue block).
++    // Without this guard the extra OpBranch lands after the terminator,
++    // producing invalid SPIR-V ("Branch must appear in a block") that
++    // SPIRV-Cross rejects as "Trying to end a non-existing block".
+     thenPhiParent = builder.getBuildPoint()->getId();
+     builder.createBranch(mergeBlock);
+   }
+@@ -147,8 +152,8 @@
+   assert_true(currentBranch == Branch::kThen || currentBranch == Branch::kElse);
+ #endif
+ 
+-  if (branchToMerge) {
+-    // Jump to the merge block.
++  if (branchToMerge && !builder.getBuildPoint()->isTerminated()) {
++    // Jump to the merge block (same guard as makeBeginElse).
+     (elseBlock ? elsePhiParent : thenPhiParent) = builder.getBuildPoint()->getId();
+     builder.createBranch(mergeBlock);
+   }
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -514,8 +514,34 @@
+       var_main_rectangle_guest_vertex_index_ =
+           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
+                                    "xe_var_rectangle_guest_vertex_index", const_uint_0_);
++      // Mirror of the per-vertex output struct for Function storage. The real
++      // type_output_per_vertex_ carries interface decorations (Block, BuiltIn
++      // members, ArrayStride on the clip/cull arrays) which are invalid on a
++      // Function-storage variable (VUID-StandaloneSpirv-None-10684) and make
++      // SPIRV-Cross (MoltenVK) reject the module. Build an undecorated twin
++      // with the same member indices. Nonzero stride arguments to
++      // makeArrayType bypass the type cache so the shared, decorated clip/cull
++      // array types are not reused (the stride itself is not emitted).
++      std::vector<spv::Id> rectangle_per_vertex_members;
++      rectangle_per_vertex_members.reserve(output_per_vertex_member_count_);
++      rectangle_per_vertex_members.push_back(type_float4_);
++      Modification rectangle_modification = GetSpirvShaderModification();
++      if (output_per_vertex_member_clip_distance_ != UINT32_MAX) {
++        rectangle_per_vertex_members.push_back(builder_->makeArrayType(
++            type_float_,
++            builder_->makeUintConstant(rectangle_modification.GetVertexClipDistanceCount()),
++            sizeof(float)));
++      }
++      if (output_per_vertex_member_cull_distance_ != UINT32_MAX) {
++        rectangle_per_vertex_members.push_back(builder_->makeArrayType(
++            type_float_,
++            builder_->makeUintConstant(rectangle_modification.GetVertexCullDistanceCount()),
++            sizeof(float)));
++      }
++      spv::Id type_rectangle_per_vertex = builder_->makeStructType(
++          rectangle_per_vertex_members, "xe_rectangle_per_vertex_type");
+       spv::Id type_rectangle_per_vertex_array =
+-          builder_->makeArrayType(type_output_per_vertex_, builder_->makeUintConstant(3), 0);
++          builder_->makeArrayType(type_rectangle_per_vertex, builder_->makeUintConstant(3), 0);
+       var_main_rectangle_per_vertex_ =
+           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
+                                    type_rectangle_per_vertex_array, "xe_var_rectangle_per_vertex");
+@@ -693,13 +719,43 @@
+       spv::Id rectangle_guest_vertex_index_int =
+           builder_->createUnaryOp(spv::OpBitcast, type_int_, rectangle_guest_vertex_index);
+ 
+-      // Store current iteration outputs.
+-      id_vector_temp_.clear();
+-      id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
+-      builder_->createStore(
+-          builder_->createLoad(output_per_vertex_, spv::NoPrecision),
+-          builder_->createAccessChain(spv::StorageClassFunction, var_main_rectangle_per_vertex_,
+-                                      id_vector_temp_));
++      // Store current iteration outputs. Member-wise (and element-wise for the
++      // distance arrays): the Function-storage mirror is deliberately a
++      // different, undecorated type, so a whole-struct OpStore would not
++      // type-match the interface gl_PerVertex.
++      auto copy_per_vertex_member_to_mirror = [&](uint32_t member_index, uint32_t array_size) {
++        uint32_t element_count = array_size ? array_size : 1;
++        for (uint32_t element = 0; element < element_count; ++element) {
++          id_vector_temp_.clear();
++          id_vector_temp_.push_back(builder_->makeIntConstant(int(member_index)));
++          if (array_size) {
++            id_vector_temp_.push_back(builder_->makeIntConstant(int(element)));
++          }
++          spv::Id member_value = builder_->createLoad(
++              builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
++                                          id_vector_temp_),
++              spv::NoPrecision);
++          id_vector_temp_.clear();
++          id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
++          id_vector_temp_.push_back(builder_->makeIntConstant(int(member_index)));
++          if (array_size) {
++            id_vector_temp_.push_back(builder_->makeIntConstant(int(element)));
++          }
++          builder_->createStore(
++              member_value,
++              builder_->createAccessChain(spv::StorageClassFunction,
++                                          var_main_rectangle_per_vertex_, id_vector_temp_));
++        }
++      };
++      copy_per_vertex_member_to_mirror(kOutputPerVertexMemberPosition, 0);
++      if (output_per_vertex_member_clip_distance_ != UINT32_MAX) {
++        copy_per_vertex_member_to_mirror(output_per_vertex_member_clip_distance_,
++                                         clip_distance_count);
++      }
++      if (output_per_vertex_member_cull_distance_ != UINT32_MAX) {
++        copy_per_vertex_member_to_mirror(output_per_vertex_member_cull_distance_,
++                                         cull_distance_count);
++      }
+       uint32_t interpolators_remaining = GetModificationInterpolatorMask();
+       uint32_t interpolator_index;
+       while (rex::bit_scan_forward(interpolators_remaining, &interpolator_index)) {

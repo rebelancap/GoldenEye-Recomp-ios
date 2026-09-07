@@ -1,0 +1,164 @@
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -95,6 +95,20 @@
+                     "pipelines are being prepared.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(gpu_diag, false, "GPU",
++                    "Log command-processor diagnostics (CPDIAG). Bring-up instrumentation: it "
++                    "emits a few hundred lines a second during play, which costs frame time on "
++                    "a device and buries everything else in the log.");
++
++// Compiled in, off by default. The check is a relaxed atomic read, so the cost
++// when disabled is a predictable branch rather than a formatted string.
++#define REXGPU_CPDIAG(...)                \
++  do {                                    \
++    if (REXCVAR_GET(gpu_diag)) {          \
++      REXGPU_INFO(__VA_ARGS__);           \
++    }                                     \
++  } while (0)
++
+ namespace rex::graphics {
+ 
+ using namespace rex::graphics::xenos;
+@@ -158,7 +172,18 @@
+         return 0;
+       }));
+   worker_thread_->set_name("GPU Commands");
+-  worker_thread_->Create();
++  // Checked, unlike before. Without the GPU worker there is no command
++  // processing at all -- the guest writes to the ring and nothing ever reads
++  // it, which presents as a black screen with a healthy-looking boot log and no
++  // error anywhere. Reporting failure here makes it a graphics setup failure,
++  // which the runtime already knows how to surface.
++  X_STATUS worker_status = worker_thread_->Create();
++  if (XFAILED(worker_status)) {
++    REXGPU_ERROR("CommandProcessor: failed to create the GPU Commands thread: {:08X}",
++                 worker_status);
++    worker_running_ = false;
++    return false;
++  }
+ 
+   return true;
+ }
+@@ -1174,7 +1199,7 @@
+     static std::atomic<uint64_t> n{0};
+     const uint64_t i = n.fetch_add(1) + 1;
+     if (i <= 24 || (i % 200) == 0) {
+-      REXGPU_INFO("CPDIAG WRM #{} poll={:08X} ref={:08X} mask={:08X} op={} mem={}", i,
++      REXGPU_CPDIAG("CPDIAG WRM #{} poll={:08X} ref={:08X} mask={:08X} op={} mem={}", i,
+                   poll_reg_addr, ref, mask, wait_info & 0x7, is_memory);
+     }
+   }
+@@ -1341,7 +1366,7 @@
+     static std::atomic<uint64_t> n{0};
+     const uint64_t i = n.fetch_add(1) + 1;
+     if (i <= 8 || (i % 500) == 0) {
+-      REXGPU_INFO("CPDIAG MEM_WRITE #{} addr={:08X} count={}", i, write_addr, count);
++      REXGPU_CPDIAG("CPDIAG MEM_WRITE #{} addr={:08X} count={}", i, write_addr, count);
+     }
+   }
+   for (uint32_t i = 0; i < count - 1; i++) {
+@@ -1432,7 +1457,7 @@
+                                                       uint32_t count) {
+   {
+     const uint64_t i = g_cpdiag_event_write.fetch_add(1) + 1;
+-    if (i <= 8 || (i % 500) == 0) REXGPU_INFO("CPDIAG EVENT_WRITE #{}", i);
++    if (i <= 8 || (i % 500) == 0) REXGPU_CPDIAG("CPDIAG EVENT_WRITE #{}", i);
+   }
+   // generate an event that creates a write to memory when completed
+   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+@@ -1452,7 +1477,7 @@
+                                                           uint32_t packet, uint32_t count) {
+   {
+     const uint64_t i = g_cpdiag_event_write_shd.fetch_add(1) + 1;
+-    if (i <= 8 || (i % 500) == 0) REXGPU_INFO("CPDIAG EVENT_WRITE_SHD #{}", i);
++    if (i <= 8 || (i % 500) == 0) REXGPU_CPDIAG("CPDIAG EVENT_WRITE_SHD #{}", i);
+   }
+   // generate a VS|PS_done event
+   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+@@ -1473,7 +1498,7 @@
+   address &= ~0x3;
+   data_value = GpuSwap(data_value, endianness);
+   memory::store(memory_->TranslatePhysical(address), data_value);
+-  REXGPU_INFO("CPDIAG EVENT_WRITE_SHD addr={:08X} host={} value={:08X} (initiator={:08X})", address,
++  REXGPU_CPDIAG("CPDIAG EVENT_WRITE_SHD addr={:08X} host={} value={:08X} (initiator={:08X})", address,
+               static_cast<void*>(memory_->TranslatePhysical<uint8_t*>(address)), data_value,
+               initiator);
+   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
+@@ -1484,7 +1509,7 @@
+                                                           uint32_t packet, uint32_t count) {
+   {
+     const uint64_t i = g_cpdiag_event_write_ext.fetch_add(1) + 1;
+-    if (i <= 8 || (i % 500) == 0) REXGPU_INFO("CPDIAG EVENT_WRITE_EXT #{}", i);
++    if (i <= 8 || (i % 500) == 0) REXGPU_CPDIAG("CPDIAG EVENT_WRITE_EXT #{}", i);
+   }
+   // generate a screen extent event
+   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -71,6 +71,14 @@
+ }
+ }  // namespace
+ 
++REXCVAR_DECLARE(bool, gpu_diag);
++#define REXGPU_CPDIAG(...)                \
++  do {                                    \
++    if (REXCVAR_GET(gpu_diag)) {          \
++      REXGPU_INFO(__VA_ARGS__);           \
++    }                                     \
++  } while (0)
++
+ namespace rex::graphics {
+ 
+ // Nvidia Optimus/AMD PowerXpress support.
+@@ -238,7 +246,15 @@
+   // TODO: set_can_debugger_suspend not yet ported
+   // vsync_worker_thread_->set_can_debugger_suspend(true);
+   vsync_worker_thread_->set_name("GPU VSync");
+-  vsync_worker_thread_->Create();
++  // Checked for the same reason as the GPU Commands thread: without vblank the
++  // guest waits forever for a frame boundary that never arrives, and the boot
++  // log says nothing is wrong.
++  X_STATUS vsync_status = vsync_worker_thread_->Create();
++  if (XFAILED(vsync_status)) {
++    REXGPU_ERROR("GraphicsSystem: failed to create the GPU VSync thread: {:08X}", vsync_status);
++    vsync_worker_running_ = false;
++    return X_STATUS_UNSUCCESSFUL;
++  }
+ 
+   if (REXCVAR_GET(trace_gpu_stream)) {
+     BeginTracing();
+@@ -347,7 +363,7 @@
+       // (M-027). Log it so it can be correlated with the parked WRM.
+       static std::atomic<uint64_t> n{0};
+       const uint64_t i = n.fetch_add(1) + 1;
+-      REXGPU_INFO("CPDIAG FLIP(0x1844) #{} value={:08X}", i, value);
++      REXGPU_CPDIAG("CPDIAG FLIP(0x1844) #{} value={:08X}", i, value);
+       break;
+     }
+     default:
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -21,7 +21,20 @@
+ #include <rex/ui/vulkan/instance.h>
+ #include <rex/ui/vulkan/presenter.h>
+ 
+-REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
++// Off by default on iOS. The debug messenger is a per-call reporting path, and
++// MoltenVK drives it hard: a single unavoidable condition ("Metal does not
++// support disabling primitive restart") produced 2,775 warning lines in one
++// minute of play, each one formatted and written to flash on the device. It
++// costs frame time to produce diagnostics that say the same thing every frame.
++// Desktop keeps it on, where the log goes to a disk nobody is holding.
++#if REX_PLATFORM_IOS
++inline constexpr bool kLogVulkanDebugMessagesDefault = false;
++#else
++inline constexpr bool kLogVulkanDebugMessagesDefault = true;
++#endif
++REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, kLogVulkanDebugMessagesDefault, "UI/Vulkan",
++                    "Log Vulkan debug messages (off by default on iOS -- see the note in "
++                    "vulkan_instance.cpp; turn on to debug the graphics backend)");
+ 
+ namespace rex {
+ namespace ui {

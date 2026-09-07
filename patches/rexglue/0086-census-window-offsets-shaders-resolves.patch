@@ -1,0 +1,243 @@
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -234,6 +234,9 @@
+ // This file's anonymous namespace is at global scope, so `xenos::` does not
+ // resolve here the way it does inside rex::graphics.
+ constexpr uint32_t kCensusMaxColorRts = rex::graphics::xenos::kMaxColorRenderTargets;
++constexpr uint32_t kCensusMaxWofs = 4;      // rx-0086
++constexpr uint32_t kCensusMaxShaders = 6;   // rx-0086
++constexpr uint32_t kCensusMaxResolves = 32; // rx-0086
+ enum : uint32_t {
+   kCensusIdle = 0,
+   kCensusArmed = 1,    // start at the next swap
+@@ -257,12 +260,42 @@
+   int32_t sc_x0, sc_y0, sc_x1, sc_y1;
+   int32_t vp_x0, vp_y0, vp_x1, vp_y1;
+   uint32_t window_offset_reg;
++  // rx-0086 (M-109): the frame map needs to prove WHICH third of the screen a
++  // pass draws. window_offset_reg above is the FIRST draw's value only, which
++  // is why M-100 could not name tile C. These are the distinct values seen
++  // across the whole pass, and the distinct pixel shaders that ran in it --
++  // two passes that render the same geometry with the same shaders at
++  // different window offsets are two TILES, not two versions of the image.
++  uint32_t wofs_values[kCensusMaxWofs];
++  uint32_t wofs_count;
++  uint32_t wofs_extra;
++  uint64_t ps_hashes[kCensusMaxShaders];
++  uint32_t ps_count;
++  uint32_t ps_extra;
++  uint64_t vs_hashes[kCensusMaxShaders];
++  uint32_t vs_count;
++  uint32_t vs_extra;
+   uint32_t pre_dispatches[kCensusDispatchKinds];
+ };
++
++// rx-0086: one record per PM4 copy (resolve), captured where the resolve info
++// is already decoded (VulkanRenderTargetCache::Resolve) and attributed to the
++// pass that had just closed. Names the EDRAM source rect and the guest memory
++// destination, which is what says whether three resolves write three thirds of
++// one image or three whole images.
++struct CensusResolve {
++  uint32_t pass_index;
++  uint32_t dest_base, dest_off_x, dest_off_y, dest_pitch, dest_height, dest_format;
++  uint32_t src_off_x, src_off_y, width, height;
++  uint32_t edram_base, edram_pitch, msaa, is_depth;
++  uint32_t copy_src_select, sample_select, clears;
++};
+ std::atomic<uint32_t> g_census_state{kCensusIdle};
+ CensusPass g_census_passes[kCensusMaxPasses];
+ uint32_t g_census_pass_count = 0;
+ int32_t g_census_current = -1;
++CensusResolve g_census_resolves[kCensusMaxResolves];  // rx-0086
++uint32_t g_census_resolve_count = 0;
+ uint32_t g_census_pending_dispatches[kCensusDispatchKinds] = {};
+ uint32_t g_census_dropped = 0;
+ 
+@@ -298,12 +331,33 @@
+   ++g_census_pass_count;
+ }
+ 
++// rx-0086: append `value` to a small distinct-value set, counting overflow.
++template <typename T>
++void CensusAddDistinct(T* values, uint32_t& count, uint32_t& extra, uint32_t capacity, T value) {
++  for (uint32_t i = 0; i < count; ++i) {
++    if (values[i] == value) {
++      return;
++    }
++  }
++  if (count < capacity) {
++    values[count++] = value;
++  } else {
++    ++extra;
++  }
++}
++
+ void CensusCountDraw(uint32_t vertices, bool blend, uint32_t scissor_w, uint32_t scissor_h,
+-                     const VkRect2D& sc, const VkViewport& vp, uint32_t window_offset_reg) {
++                     const VkRect2D& sc, const VkViewport& vp, uint32_t window_offset_reg,
++                     uint64_t vs_hash, uint64_t ps_hash) {
+   if (g_census_current < 0) {
+     return;
+   }
+   CensusPass& p = g_census_passes[g_census_current];
++  CensusAddDistinct(p.wofs_values, p.wofs_count, p.wofs_extra, kCensusMaxWofs, window_offset_reg);
++  CensusAddDistinct(p.vs_hashes, p.vs_count, p.vs_extra, kCensusMaxShaders, vs_hash);
++  if (ps_hash) {
++    CensusAddDistinct(p.ps_hashes, p.ps_count, p.ps_extra, kCensusMaxShaders, ps_hash);
++  }
+   if (p.draws == 0) {
+     p.sc_x0 = sc.offset.x; p.sc_y0 = sc.offset.y;
+     p.sc_x1 = sc.offset.x + int32_t(sc.extent.width); p.sc_y1 = sc.offset.y + int32_t(sc.extent.height);
+@@ -334,6 +388,7 @@
+     g_census_pass_count = 0;
+     g_census_current = -1;
+     g_census_dropped = 0;
++    g_census_resolve_count = 0;  // rx-0086
+     std::memset(g_census_pending_dispatches, 0, sizeof(g_census_pending_dispatches));
+     g_census_state.store(kCensusCapturing, std::memory_order_release);
+   } else if (state == kCensusCapturing) {
+@@ -348,6 +403,40 @@
+   }
+ }
+ }  // namespace
++
++// rx-0086 (M-109): called from VulkanRenderTargetCache::Resolve once the
++// resolve info is decoded. Attributed to the pass that most recently closed --
++// the resolve always follows the pass whose EDRAM it reads.
++extern "C" void RexCensusRecordResolve(uint32_t dest_base, uint32_t dest_off_x,
++                                       uint32_t dest_off_y, uint32_t dest_pitch,
++                                       uint32_t dest_height, uint32_t dest_format,
++                                       uint32_t src_off_x, uint32_t src_off_y, uint32_t width,
++                                       uint32_t height, uint32_t edram_base, uint32_t edram_pitch,
++                                       uint32_t msaa, uint32_t is_depth, uint32_t copy_src_select,
++                                       uint32_t sample_select, uint32_t clears) {
++  if (!CensusCapturing() || g_census_resolve_count >= kCensusMaxResolves) {
++    return;
++  }
++  CensusResolve& r = g_census_resolves[g_census_resolve_count++];
++  r.pass_index = g_census_pass_count ? g_census_pass_count - 1 : 0;
++  r.dest_base = dest_base;
++  r.dest_off_x = dest_off_x;
++  r.dest_off_y = dest_off_y;
++  r.dest_pitch = dest_pitch;
++  r.dest_height = dest_height;
++  r.dest_format = dest_format;
++  r.src_off_x = src_off_x;
++  r.src_off_y = src_off_y;
++  r.width = width;
++  r.height = height;
++  r.edram_base = edram_base;
++  r.edram_pitch = edram_pitch;
++  r.msaa = msaa;
++  r.is_depth = is_depth;
++  r.copy_src_select = copy_src_select;
++  r.sample_select = sample_select;
++  r.clears = clears;
++}
+ 
+ namespace rex::graphics::vulkan {
+ 
+@@ -4819,7 +4908,9 @@
+     CensusCountDraw(primitive_processing_result.host_draw_vertex_count, blend,
+                     dynamic_scissor_.extent.width, dynamic_scissor_.extent.height,
+                     dynamic_scissor_, dynamic_viewport_,
+-                    regs.Get<reg::PA_SC_WINDOW_OFFSET>().value);
++                    regs.Get<reg::PA_SC_WINDOW_OFFSET>().value,
++                    vertex_shader ? vertex_shader->ucode_data_hash() : 0,
++                    pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+   }
+ 
+   // Invalidate textures in memexported memory and watch for changes.
+@@ -7776,8 +7867,47 @@
+       s += buf;
+     }
+     CensusAppendDispatches(s, " pre=", p.pre_dispatches);
++    // rx-0086: the distinct window offsets and shaders of the pass.
++    if (p.wofs_count) {
++      s += " wofsU=[";
++      for (uint32_t w = 0; w < p.wofs_count; ++w) {
++        std::snprintf(buf, sizeof(buf), "%s%#x", w ? "," : "", p.wofs_values[w]);
++        s += buf;
++      }
++      if (p.wofs_extra) {
++        std::snprintf(buf, sizeof(buf), ",+%u", p.wofs_extra);
++        s += buf;
++      }
++      s += "]";
++    }
++    if (p.vs_count) {
++      std::snprintf(buf, sizeof(buf), " vs=%u+%u", p.vs_count, p.vs_extra);
++      s += buf;
++    }
++    if (p.ps_count) {
++      std::snprintf(buf, sizeof(buf), " ps=%u+%u[", p.ps_count, p.ps_extra);
++      s += buf;
++      for (uint32_t h = 0; h < p.ps_count; ++h) {
++        std::snprintf(buf, sizeof(buf), "%s%016llx", h ? "," : "",
++                      static_cast<unsigned long long>(p.ps_hashes[h]));
++        s += buf;
++      }
++      s += "]";
++    }
+     s += "\n";
+   }
++  // rx-0086: the resolves, with the guest memory rect each one writes.
++  for (uint32_t i = 0; i < g_census_resolve_count; ++i) {
++    const CensusResolve& r = g_census_resolves[i];
++    std::snprintf(buf, sizeof(buf),
++                  "GERESOLVE[%02u] after-pass=%02u %s src=[edram b=%ut p=%ut s=%ux +%u,%u %ux%u] "
++                  "dst=[0x%08X +%u,%u pitch=%u height=%u fmt=%u] srcsel=%u samplesel=%u clears=%u\n",
++                  i, r.pass_index, r.is_depth ? "depth" : "color", r.edram_base, r.edram_pitch,
++                  r.msaa, r.src_off_x, r.src_off_y, r.width, r.height, r.dest_base, r.dest_off_x,
++                  r.dest_off_y, r.dest_pitch, r.dest_height, r.dest_format, r.copy_src_select,
++                  r.sample_select, r.clears);
++    s += buf;
++  }
+   bool trailing = false;
+   for (uint32_t k = 0; k < kCensusDispatchKinds; ++k) {
+     trailing |= g_census_pending_dispatches[k] != 0;
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1557,6 +1557,12 @@
+   }
+ }
+ 
++// rx-0086 (M-109): the one-frame pass census lives in command_processor.cpp
++// (only it knows what a RenderTargetKey means); this is its resolve sink.
++extern "C" void RexCensusRecordResolve(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
++                                       uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
++                                       uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
++
+ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                                       VulkanSharedMemory& shared_memory,
+                                       VulkanTextureCache& texture_cache,
+@@ -1578,6 +1584,29 @@
+     return true;
+   }
+ 
++  // rx-0086 (M-109): feed the one-frame pass census the decoded resolve, so
++  // the frame map can say where each of bean's three scene resolves lands.
++  {
++    const draw_util::ResolveEdramInfo& edram_info = resolve_info.IsCopyingDepth()
++                                                        ? resolve_info.depth_edram_info
++                                                        : resolve_info.color_edram_info;
++    RexCensusRecordResolve(
++        resolve_info.copy_dest_base,
++        uint32_t(resolve_info.copy_dest_coordinate_info.offset_x_div_8) << 3,
++        uint32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8) << 3,
++        uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) << 5,
++        uint32_t(resolve_info.copy_dest_coordinate_info.height_aligned_div_32) << 5,
++        uint32_t(resolve_info.copy_dest_info.copy_dest_format),
++        uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) << 3,
++        uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) << 3,
++        uint32_t(resolve_info.coordinate_info.width_div_8) << 3, resolve_info.height_div_8 << 3,
++        uint32_t(edram_info.base_tiles), uint32_t(edram_info.pitch_tiles),
++        uint32_t(1) << uint32_t(edram_info.msaa_samples), uint32_t(edram_info.is_depth),
++        uint32_t(resolve_info.rb_copy_control.copy_src_select),
++        uint32_t(resolve_info.copy_dest_coordinate_info.copy_sample_select),
++        (resolve_info.IsClearingColor() ? 1u : 0u) | (resolve_info.IsClearingDepth() ? 2u : 0u));
++  }
++
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();

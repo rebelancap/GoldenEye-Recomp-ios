@@ -1,0 +1,68 @@
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -96,6 +96,24 @@
+                     "pipelines are being prepared.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_INT32(
++    gpu_wait_reg_mem_spin_iters, 64, "GPU",
++    "How many times a blocking WAIT_REG_MEM spins on sched_yield before it starts sleeping "
++    "instead. A fence that is about to be written is best caught immediately; past that the "
++    "spin is pure heat.")
++    .range(0, 100000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(
++    gpu_wait_reg_mem_sleep_us, 125, "GPU",
++    "Sleep, in microseconds, between polls of a blocking WAIT_REG_MEM once the spin budget "
++    "above is spent. 0 restores the original behaviour of spinning for the whole wait. The "
++    "awaited value comes from the guest's vblank ISR (M-052), so this loop typically has "
++    "milliseconds to cover, and spinning through them burns a core -- on a phone that heat is "
++    "what clamps the GPU, and M-054 measured the collapse that follows the clamp.")
++    .range(0, 16000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(gpu_diag, false, "GPU",
+                     "Log command-processor diagnostics (CPDIAG). Bring-up instrumentation: it "
+                     "emits a few hundred lines a second during play, which costs frame time on "
+@@ -1272,6 +1290,18 @@
+   }
+   auto last_wrm_interrupt = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+   bool matched = false;
++  // Spin count for the backoff below. Per packet, not per frame: each
++  // WAIT_REG_MEM gets its own short spin window before it settles into sleeping.
++  uint32_t wrm_spins = 0;
++  const auto backoff = [&wrm_spins]() {
++    const uint32_t sleep_us = uint32_t(REXCVAR_GET(gpu_wait_reg_mem_sleep_us));
++    if (sleep_us && wrm_spins > uint32_t(REXCVAR_GET(gpu_wait_reg_mem_spin_iters))) {
++      rex::thread::Sleep(std::chrono::microseconds(sleep_us));
++    } else {
++      rex::thread::MaybeYield();
++    }
++    ++wrm_spins;
++  };
+   do {
+     uint32_t value = 0;
+     if (is_memory) {
+@@ -1357,8 +1387,10 @@
+       if (wait >= 0x100) {
+         PrepareForWait();
+         if (!REXCVAR_GET(vsync)) {
+-          // User wants it fast and dangerous.
+-          rex::thread::MaybeYield();
++          // Was an unconditional sched_yield spin. It is still a spin for the
++          // first few dozen polls -- catching the fence immediately matters
++          // inside a vblank-quantised frame (M-052) -- and a sleep after that.
++          backoff();
+         } else {
+           // Cap the poll interval. The packet's `wait` field can encode a huge
+           // delay (wait/0x100 ms = many minutes/hours); sleeping that long in
+@@ -1375,7 +1407,7 @@
+           return false;
+         }
+       } else {
+-        rex::thread::MaybeYield();
++        backoff();
+       }
+     }
+   } while (!matched);

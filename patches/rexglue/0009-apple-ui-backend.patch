@@ -1,0 +1,219 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -7,6 +7,13 @@
+     LANGUAGES C CXX
+     DESCRIPTION "Xbox 360 Recompilation SDK"
+ )
++
++# The Apple window/surface/app-context backends are Objective-C++.
++if(APPLE)
++    enable_language(OBJCXX)
++    set(CMAKE_OBJCXX_STANDARD 23)
++    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
++endif()
+ # Floor only: bump MAJOR.MINOR for API changes. Patch is derived from git tags
+ # in cmake/rex_version.cmake. See docs/RELEASING.md.
+ 
+@@ -173,6 +180,9 @@
+     # iOS/visionOS also take the MAC path there -- intentional for now; anything
+     # that must distinguish them uses TARGET_OS_IPHONE / TARGET_OS_VISION.
+     add_compile_definitions(REX_PLATFORM_APPLE=1)
++    # MoltenVK's WSI. Must be visible to every target that includes the Vulkan
++    # headers or rex/ui/vulkan/instance.h -- not just rexui.
++    add_compile_definitions(VK_USE_PLATFORM_METAL_EXT=1)
+ else()
+     message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows, Linux and Apple platforms.")
+ endif()
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -51,6 +51,18 @@
+     if(WIN32)
+         target_sources(${target_name} PRIVATE
+             ${REXGLUE_SHARE_DIR}/windowed_app_main_win.cpp)
++    elseif(APPLE)
++        # windowed_app_main_posix.cpp is GTK-bound despite the name; Apple gets
++        # its own AppKit entry point.
++        target_sources(${target_name} PRIVATE
++            ${REXGLUE_SHARE_DIR}/windowed_app_main_apple.mm)
++        set_source_files_properties(${REXGLUE_SHARE_DIR}/windowed_app_main_apple.mm
++            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
++        target_link_libraries(${target_name} PRIVATE
++            "-framework AppKit"
++            "-framework QuartzCore"
++            "-framework Metal"
++            "-framework Foundation")
+     else()
+         target_sources(${target_name} PRIVATE
+             ${REXGLUE_SHARE_DIR}/windowed_app_main_posix.cpp)
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -61,6 +61,13 @@
+         window_win.cpp
+         windowed_app_context_win.cpp
+     )
++elseif(APPLE)
++    # Cocoa/AppKit + CAMetalLayer. Objective-C++; see the ObjC flags below.
++    set(REXUI_PLATFORM_SOURCES
++        surface_apple.mm
++        window_apple.mm
++        windowed_app_context_apple.mm
++    )
+ else()
+     set(REXUI_PLATFORM_SOURCES
+         surface_gnulinux.cpp
+@@ -136,6 +143,16 @@
+         dwmapi
+         Shcore
+     )
++elseif(APPLE)
++    # ARC for the .mm sources; the C++ ones must not get -fobjc-arc.
++    set_source_files_properties(${REXUI_PLATFORM_SOURCES}
++        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
++    target_link_libraries(rexui PUBLIC
++        "-framework AppKit"
++        "-framework QuartzCore"
++        "-framework Metal"
++        "-framework Foundation"
++    )
+ else()
+     find_package(PkgConfig REQUIRED)
+     pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+--- a/include/rex/ui/surface.h
++++ b/include/rex/ui/surface.h
+@@ -33,12 +33,16 @@
+     kTypeIndex_XcbWindow,
+     // Windows.
+     kTypeIndex_Win32Hwnd,
++    // Apple (macOS, iOS, visionOS) -- a CAMetalLayer, consumed by Vulkan via
++    // VK_EXT_metal_surface today and usable directly by a native Metal backend.
++    kTypeIndex_AppleMetalLayer,
+   };
+   using TypeFlags = uint32_t;
+   enum : TypeFlags {
+     kTypeFlag_AndroidNativeWindow = TypeFlags(1) << kTypeIndex_AndroidNativeWindow,
+     kTypeFlag_XcbWindow = TypeFlags(1) << kTypeIndex_XcbWindow,
+     kTypeFlag_Win32Hwnd = TypeFlags(1) << kTypeIndex_Win32Hwnd,
++    kTypeFlag_AppleMetalLayer = TypeFlags(1) << kTypeIndex_AppleMetalLayer,
+   };
+ 
+   Surface(const Surface& surface) = delete;
+--- a/include/rex/ui/vulkan/instance.h
++++ b/include/rex/ui/vulkan/instance.h
+@@ -67,6 +67,10 @@
+ #ifdef VK_USE_PLATFORM_WIN32_KHR
+ #include <rex/ui/vulkan/functions/instance_khr_win32_surface.inc>
+ #endif
++    // VK_EXT_metal_surface (#218)
++#ifdef VK_USE_PLATFORM_METAL_EXT
++#include <rex/ui/vulkan/functions/instance_ext_metal_surface.inc>
++#endif
+     // VK_KHR_get_physical_device_properties2 (#60, promoted to 1.1)
+ #include <rex/ui/vulkan/functions/instance_1_1_khr_get_physical_device_properties2.inc>
+     // VK_EXT_debug_utils (#129)
+@@ -92,6 +96,9 @@
+ #ifdef VK_USE_PLATFORM_WIN32_KHR
+     bool ext_KHR_win32_surface = false;  // #10
+ #endif
++#ifdef VK_USE_PLATFORM_METAL_EXT
++    bool ext_EXT_metal_surface = false;  // #218 (Apple, via MoltenVK)
++#endif
+     bool ext_1_1_KHR_get_physical_device_properties2 = false;  // #60
+     bool ext_EXT_debug_utils = false;                          // #129
+     bool ext_KHR_portability_enumeration = false;              // #395
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -117,6 +117,12 @@
+     requested_extensions.emplace("VK_KHR_win32_surface",
+                                  &vulkan_instance->extensions_.ext_KHR_win32_surface);
+ #endif
++#ifdef VK_USE_PLATFORM_METAL_EXT
++    // #218. Apple platforms have no WSI of their own; MoltenVK exposes
++    // VK_EXT_metal_surface, which takes a CAMetalLayer directly.
++    requested_extensions.emplace("VK_EXT_metal_surface",
++                                 &vulkan_instance->extensions_.ext_EXT_metal_surface);
++#endif
+   }
+ 
+   std::vector<const char*> enabled_extensions;
+@@ -375,6 +381,11 @@
+ #include <rex/ui/vulkan/functions/instance_khr_android_surface.inc>
+   }
+ #endif
++#ifdef VK_USE_PLATFORM_METAL_EXT
++  if (vulkan_instance->extensions_.ext_EXT_metal_surface) {
++#include <rex/ui/vulkan/functions/instance_ext_metal_surface.inc>
++  }
++#endif
+ #ifdef VK_USE_PLATFORM_WIN32_KHR
+   if (vulkan_instance->extensions_.ext_KHR_win32_surface) {
+ #include <rex/ui/vulkan/functions/instance_khr_win32_surface.inc>
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -24,6 +24,9 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/platform.h>
++#if REX_PLATFORM_MAC
++#include <rex/ui/surface_apple.h>
++#endif
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
+ 
+@@ -433,6 +436,11 @@
+ #if REX_PLATFORM_WIN32
+   if (instance_extensions.ext_KHR_win32_surface) {
+     type_flags |= Surface::kTypeFlag_Win32Hwnd;
++  }
++#endif
++#if REX_PLATFORM_MAC
++  if (instance_extensions.ext_EXT_metal_surface) {
++    type_flags |= Surface::kTypeFlag_AppleMetalLayer;
+   }
+ #endif
+   return type_flags;
+@@ -824,6 +832,19 @@
+             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+       } break;
+ #endif
++#if REX_PLATFORM_MAC
++      case Surface::kTypeIndex_AppleMetalLayer: {
++        auto& metal_window_surface = static_cast<const MetalWindowSurface&>(new_surface);
++        VkMetalSurfaceCreateInfoEXT surface_create_info;
++        surface_create_info.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
++        surface_create_info.pNext = nullptr;
++        surface_create_info.flags = 0;
++        surface_create_info.pLayer =
++            static_cast<const CAMetalLayer*>(metal_window_surface.metal_layer());
++        vulkan_surface_create_result = ifn.vkCreateMetalSurfaceEXT(
++            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
++      } break;
++#endif
+       default:
+         assert_unhandled_case(surface_type);
+         REXLOG_ERROR(
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -8,7 +8,7 @@
+ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+     set(IS_ARM64 FALSE)
+     set(IS_X86_64 TRUE)
+-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|ARM64)$")
++elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+     set(IS_ARM64 TRUE)
+     set(IS_X86_64 FALSE)
+ else()
+--- a/thirdparty/renderdoc/renderdoc_app.h
++++ b/thirdparty/renderdoc/renderdoc_app.h
+@@ -30,7 +30,11 @@
+ 
+ #if defined(WIN32) || defined(_WIN32)
+ 	#define RENDERDOC_CC __cdecl
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__APPLE__)
++	// RenderDoc has no Apple build, so the dlopen in renderdoc_api.cpp always
++	// fails and the capture API stays disabled -- but the header still has to
++	// compile, since rexui references the types unconditionally. The calling
++	// convention is the default one, same as Linux.
+ 	#define RENDERDOC_CC
+ #else
+ 	#error "Unknown platform"

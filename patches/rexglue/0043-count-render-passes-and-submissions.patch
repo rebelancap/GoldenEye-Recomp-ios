@@ -1,0 +1,69 @@
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -77,7 +77,27 @@
+                       "CPU/GPU overlap.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++namespace {
++// Render-pass and submission accounting. On a tile-based GPU every render pass
++// costs a full tile load and store of its attachment, so pass COUNT is a
++// first-order cost and not a detail -- M-054 needed a 432 MB Instruments trace
++// to establish it was around 18 per frame. Having it in `stat` makes the next
++// round of that work cost nothing.
++std::atomic<uint64_t> g_render_passes{0};
++std::atomic<uint64_t> g_submissions{0};
++std::atomic<uint64_t> g_swaps{0};
++}  // namespace
++
+ namespace rex::graphics::vulkan {
++
++void GetGpuPassStats(uint64_t* passes, uint64_t* submissions, uint64_t* swaps) {
++  // exchange: reported over the interval since the last read, so it divides
++  // cleanly into a per-frame number.
++  if (passes) *passes = g_render_passes.exchange(0, std::memory_order_relaxed);
++  if (submissions) *submissions = g_submissions.exchange(0, std::memory_order_relaxed);
++  if (swaps) *swaps = g_swaps.exchange(0, std::memory_order_relaxed);
++}
++
+ 
+ namespace {
+ 
+@@ -3179,6 +3199,7 @@
+     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                                   VK_SUBPASS_CONTENTS_INLINE);
+   }
++  g_render_passes.fetch_add(1, std::memory_order_relaxed);
+   in_render_pass_ = true;
+ }
+ 
+@@ -3271,6 +3292,7 @@
+     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                                   VK_SUBPASS_CONTENTS_INLINE);
+   }
++  g_render_passes.fetch_add(1, std::memory_order_relaxed);
+   in_render_pass_ = true;
+ }
+ 
+@@ -5280,6 +5302,12 @@
+ }
+ 
+ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
++  if (submission_open_) {
++    g_submissions.fetch_add(1, std::memory_order_relaxed);
++  }
++  if (is_swap) {
++    g_swaps.fetch_add(1, std::memory_order_relaxed);
++  }
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -6875,3 +6903,9 @@
+ }
+ 
+ }  // namespace rex::graphics::vulkan
++
++// Unmangled alias; see rex/ui/vulkan/presenter_timings.h for why the console
++// bridge reaches these by name rather than by linking rexgraphics.
++extern "C" void RexGetGpuPassStats(uint64_t* passes, uint64_t* submissions, uint64_t* swaps) {
++  rex::graphics::vulkan::GetGpuPassStats(passes, submissions, swaps);
++}

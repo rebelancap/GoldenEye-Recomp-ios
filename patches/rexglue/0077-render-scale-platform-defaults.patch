@@ -1,0 +1,54 @@
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -25,6 +25,32 @@
+ #include <rex/graphics/xenos.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
++
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++
++// Default render scale, per platform. The guest renders 1280x720; the scale is
++// an integer multiplier applied to every render target, opaque to the game.
++//
++// visionOS defaults to 2 because the Vision Pro's window is 1280x720 POINTS at
++// a 2x display scale -- 2560x1440 real pixels -- so 1x is a 720p image
++// upscaled onto a 1440p panel, and 2x is exactly one guest pixel per panel
++// pixel (the user, headset, 0.1.0.70: "the Vision Pro can take it, I'd like
++// fidelity maximised; can we match the Vision Pro's resolution?"). iOS keeps 1
++// (D-025).
++//
++// This is the DEFAULT, not a forced value, and that matters: SaveConfig writes
++// only cvars that differ from their default, so a platform default of 2 lets a
++// player who picks 720p on visionOS have that choice written to ge.toml and
++// honoured, exactly as the fullscreen/vsync defaults are handled (ge_app.h).
++// All three scale cvars move together because GetConfigDrawResolutionScale
++// only lets the combined `resolution_scale` win when it is NON-default.
++#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
++#define REX_DEFAULT_DRAW_RESOLUTION_SCALE 2
++#else
++#define REX_DEFAULT_DRAW_RESOLUTION_SCALE 1
++#endif
+ 
+ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
+                      "Texture cache memory limit for render-to-texture (MB)")
+@@ -63,15 +89,15 @@
+     .range(-1, 5)
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+-REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X (1 = no scaling)")
++REXCVAR_DEFINE_INT32(draw_resolution_scale_x, REX_DEFAULT_DRAW_RESOLUTION_SCALE, "GPU", "Draw resolution scale X (1 = no scaling)")
+     .range(1, 8)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+-REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y (1 = no scaling)")
++REXCVAR_DEFINE_INT32(draw_resolution_scale_y, REX_DEFAULT_DRAW_RESOLUTION_SCALE, "GPU", "Draw resolution scale Y (1 = no scaling)")
+     .range(1, 8)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+-REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
++REXCVAR_DEFINE_INT32(resolution_scale, REX_DEFAULT_DRAW_RESOLUTION_SCALE, "GPU",
+                      "Draw resolution scale for both X and Y axes (same as setting "
+                      "draw_resolution_scale_x and draw_resolution_scale_y)")
+     .range(1, 8)

@@ -1,0 +1,82 @@
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -241,6 +241,15 @@
+         using SwapCadenceFn = void (*)(uint64_t*, uint32_t*, uint32_t*, uint32_t*);
+         SwapCadenceFn swap_cadence_fn =
+             reinterpret_cast<SwapCadenceFn>(dlsym(RTLD_DEFAULT, "RexGetSwapCadence"));
++        // rx-0071: a window in which pipelines were compiled is not evidence
++        // of sustained GPU load -- it is a one-off hitch, and stepping the
++        // guest vblank down for 5-10 s to "fix" a 150 ms compile is strictly
++        // worse than the compile. Resolved by name like the cadence counter.
++        using PipelinesCreatedFn = uint64_t (*)();
++        PipelinesCreatedFn pipelines_created_fn = reinterpret_cast<PipelinesCreatedFn>(
++            dlsym(RTLD_DEFAULT, "RexGetPipelinesCreated"));
++        uint64_t governor_window_pipelines = pipelines_created_fn ? pipelines_created_fn() : 0;
++        uint32_t governor_bad_windows = 0;  // consecutive; two are needed to step down
+         uint32_t governor_extra_division = 0;  // rungs below the base target
+         uint64_t governor_window_start_us = 0;
+         uint64_t governor_window_swaps = 0;
+@@ -311,41 +320,60 @@
+                   uint64_t swaps_now = 0;
+                   uint32_t unused_p50, unused_p95, unused_max;
+                   swap_cadence_fn(&swaps_now, &unused_p50, &unused_p95, &unused_max);
++                  uint64_t pipelines_now =
++                      pipelines_created_fn ? pipelines_created_fn() : 0;
+                   if (!governor_window_start_us) {
+                     governor_window_start_us = now_us;
+                     governor_window_swaps = swaps_now;
+                     governor_window_vblanks = link_vblanks_fired;
++                    governor_window_pipelines = pipelines_now;
+                   } else if (now_us - governor_window_start_us >= 1000000) {
+                     uint64_t delivered = swaps_now - governor_window_swaps;
+                     uint64_t expected = link_vblanks_fired - governor_window_vblanks;
+-                    if (expected >= 20) {
++                    uint64_t compiled = pipelines_now - governor_window_pipelines;
++                    if (compiled) {
++                      // Hitch window: the misses are shader compiles, not load.
++                      // Ignore it entirely and forget any bad window before it.
++                      REXGPU_INFO(
++                          "pace governor: hitch window ignored ({} pipelines; {} of {} delivered)",
++                          compiled, delivered, expected);
++                      governor_bad_windows = 0;
++                      governor_clean_since_us = 0;
++                    } else if (expected >= 20) {
+                       if (delivered * 10 < expected * 9) {
++                        // Two consecutive bad windows before acting: one bad
++                        // window is almost always a hitch, and a needless rung
++                        // costs 3-10 s of visibly halved cadence.
++                        ++governor_bad_windows;
+                         // Floor at the second rung (30 Hz on a 120 Hz panel):
+                         // the first device session (M-069) showed pipeline
+                         // compile storms spiralling the governor to 20 Hz and
+                         // pinning there, which reads as "broken", not "paced".
+-                        if (governor_extra_division < 2) {
++                        if (governor_bad_windows >= 2 && governor_extra_division < 2) {
+                           ++governor_extra_division;
+                           REXGPU_INFO("pace governor: down a rung (now +{}; {} of {} delivered)",
+                                       governor_extra_division, delivered, expected);
+                         }
+                         governor_clean_since_us = 0;
+                       } else if (delivered * 100 >= expected * 98) {
++                        governor_bad_windows = 0;
+                         if (!governor_clean_since_us) {
+                           governor_clean_since_us = now_us;
+                         } else if (governor_extra_division &&
+-                                   now_us - governor_clean_since_us >= 5000000) {
++                                   now_us - governor_clean_since_us >= 3000000) {
+                           --governor_extra_division;
+                           governor_clean_since_us = now_us;
+                           REXGPU_INFO("pace governor: up a rung ({})", governor_extra_division);
+                         }
+                       } else {
++                        governor_bad_windows = 0;
+                         governor_clean_since_us = 0;
+                       }
+                     }
+                     governor_window_start_us = now_us;
+                     governor_window_swaps = swaps_now;
+                     governor_window_vblanks = link_vblanks_fired;
++                    governor_window_pipelines = pipelines_now;
+                   }
+                 }
+               }

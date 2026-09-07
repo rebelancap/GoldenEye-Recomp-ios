@@ -1,0 +1,43 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -448,6 +448,10 @@
+ // Exported by the runtime's command processor: the physical address the CP's
+ // WAIT_REG_MEM is polling right now (0 = none). See M-072.
+ extern "C" uint32_t RexGetWaitRegMemActiveAddr();
++// Host GPU suspend gate (rex/host_suspend.h, M-111): 1 while the app is
++// backgrounded and the GPU worker is parked, and through the short grace
++// window after it comes back.
++extern "C" int RexHostGpuIsSuspendedOrResuming();
+ extern "C" void RexGetSwapCadence(uint64_t*, uint32_t*, uint32_t*, uint32_t*);
+ extern "C" uint64_t RexGetGuestFrameCount();
+ 
+@@ -679,6 +683,29 @@
+       }
+     }
+ 
++    // HOST GPU SUSPENDED (M-111): the app is in the background, the GPU worker
++    // is parked at the suspend gate, and the ring is frozen BY DESIGN. To this
++    // watchdog that is indistinguishable from the CPU<->GPU semaphore deadlock
++    // it exists to break -- and a 30 s Digital Crown press would walk it
++    // straight through the semaphore release and then the completion re-credit,
++    // fabricating credit for frames that were never skipped and corrupting the
++    // guest's ledger exactly the way M-077 documents. So: while suspended (and
++    // through the resume grace window) the episode state is held reset. Nothing
++    // is frozen that is not meant to be, and the first real sample after the
++    // resume starts from zero.
++    if (RexHostGpuIsSuspendedOrResuming()) {
++      stall = 0;
++      logged = false;
++      recover_fired = false;
++      recredit_fired = false;
++      credited_pinned = 0;
++      fc_pinned = 0;
++      last_wpi = wpi;
++      last_rpi = rpi;
++      last_present = present;
++      continue;
++    }
++
+     bool present_alive = (present != last_present);
+     bool ring_moved = (wpi != last_wpi) || (rpi != last_rpi);
+     // M-069: only real ring progress ends an episode. The old logic reset on

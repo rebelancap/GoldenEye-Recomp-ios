@@ -1,0 +1,17 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -170,6 +170,14 @@
+         set(REX_PLATFORM_OS "visionos")
+     else()
+         set(REX_PLATFORM_OS "macos")
++    endif()
++    # The simulator is a different platform from the device even at the same
++    # architecture: its Mach-O objects carry a distinct LC_BUILD_VERSION and are
++    # not interchangeable. Without this suffix an arm64 simulator build writes
++    # over the arm64 device build in out/, and the next IPA silently packages a
++    # library that cannot be installed on a phone.
++    if(CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
++        set(REX_PLATFORM_OS "${REX_PLATFORM_OS}sim")
+     endif()
+     # CMAKE_SYSTEM_PROCESSOR is empty when cross-compiling to iOS/visionOS, so
+     # fall back to the requested architectures.

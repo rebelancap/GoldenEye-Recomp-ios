@@ -1,0 +1,495 @@
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
+@@ -113,6 +114,10 @@
+   // Returns true if any downloads were submitted to the command processor.
+   bool InitializeTraceSubmitDownloads();
+   void InitializeTraceCompleteDownloads();
++  // Diagnostic (GoldenEye-Recomp-ios overlay): after
++  // InitializeTraceSubmitDownloads and queue completion, write the raw EDRAM
++  // snapshot to a file instead of the trace stream. Frees the download buffer.
++  bool WriteEdramSnapshotToFile(const char* path);
+   void RestoreEdramSnapshot(const void* snapshot);
+ 
+   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+@@ -158,10 +163,16 @@
+   // A render pass managed by the render target cache may be ended and resumed
+   // at any time (to allow for things like copying and texture loading).
+   VkRenderPass GetHostRenderTargetsRenderPass(RenderPassKey key);
+-  VkRenderPass GetFragmentShaderInterlockRenderPass() const {
++  // The FSI render pass carries a write-masked dummy attachment whose sample
++  // count sets the rasterization rate (see the comment at fsi_pass_slots_), so
++  // it is per-guest-MSAA rather than common.
++  VkRenderPass GetFragmentShaderInterlockRenderPass(xenos::MsaaSamples msaa_samples) const {
+     assert_true(GetPath() == Path::kPixelShaderInterlock);
+-    return fsi_render_pass_;
++    return fsi_pass_slots_[GetFsiPassSlotIndex(msaa_samples)].render_pass;
+   }
++  // Format of the FSI dummy color attachment - the pipeline cache must declare
++  // the same in its color blend state and dynamic rendering formats.
++  static constexpr VkFormat kFsiDummyAttachmentFormat = VK_FORMAT_R8_UNORM;
+ 
+   VkFormat GetDepthVulkanFormat(xenos::DepthRenderTargetFormat format) const;
+   VkFormat GetColorVulkanFormat(xenos::ColorRenderTargetFormat format) const;
+@@ -889,9 +900,46 @@
+   void ResetTraceDownload();
+ 
+   // For pixel (fragment) shader interlock.
++  //
++  // GoldenEye-Recomp-ios overlay (M-066): upstream used one common
++  // zero-attachment render pass for all FSI drawing and relied on the
++  // pipeline's rasterizationSamples for multisampling. Metal cannot express
++  // that - a pass with no attachments needs defaultRasterSampleCount, which
++  // MoltenVK does not derive from later-bound pipelines - so on MoltenVK every
++  // FSI draw was rasterized at 1x and only sample 0 of the guest's MSAA
++  // surfaces was ever covered (proven by EDRAM snapshots: samples 1-3 exactly
++  // zero). With the game's averaging resolves that quartered the image per
++  // band. Instead, keep one render pass + framebuffer per host sample count,
++  // each carrying a small write-masked dummy color attachment whose sample
++  // count makes the rasterization rate explicit. The attachment is
++  // transient-usage, load/store DONT_CARE, and never written (color write
++  // mask 0), so on a TBDR GPU it exists only in tile memory.
+ 
+-  VkRenderPass fsi_render_pass_ = VK_NULL_HANDLE;
+-  Framebuffer fsi_framebuffer_;
++  // Slots indexed by host sample count log2: 0 = 1x, 1 = 2x, 2 = 4x (the 2x
++  // slot is created only when 2x is supported; guest 2x falls back to the 4x
++  // slot then, matching the pipeline cache's rasterizationSamples fallback).
++  struct FsiPassSlot {
++    VkImage dummy_image = VK_NULL_HANDLE;
++    VkDeviceMemory dummy_image_memory = VK_NULL_HANDLE;
++    VkImageView dummy_image_view = VK_NULL_HANDLE;
++    VkRenderPass render_pass = VK_NULL_HANDLE;
++    Framebuffer framebuffer;
++    // Whether the one-time UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL transition
++    // was recorded (needed by the dynamic rendering path, which performs no
++    // automatic layout transitions).
++    bool layout_initialized = false;
++  };
++  FsiPassSlot fsi_pass_slots_[3];
++  // The slot selected by the last successful FSI Update.
++  uint32_t last_update_fsi_slot_ = 0;
++  // Maps guest MSAA sample count to the slot index, applying the 2x -> 4x
++  // fallback the same way the pipeline cache does.
++  uint32_t GetFsiPassSlotIndex(xenos::MsaaSamples msaa_samples) const {
++    if (msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_no_attachments_supported_) {
++      return 2;
++    }
++    return std::min(uint32_t(msaa_samples), uint32_t(2));
++  }
+ 
+   VkPipelineLayout resolve_fsi_clear_pipeline_layout_ = VK_NULL_HANDLE;
+   VkPipeline resolve_fsi_clear_32bpp_pipeline_ = VK_NULL_HANDLE;
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -13,6 +13,7 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstring>
+ #include <memory>
+ #include <tuple>
+@@ -890,70 +891,141 @@
+       return false;
+     }
+ 
+-    // Common render pass.
+-    VkSubpassDescription fsi_subpass = {};
+-    fsi_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+-    // Fragment shader interlock provides synchronization and ordering within a
+-    // subpass, create an external by-region dependency to maintain interlocking
+-    // between passes. Framebuffer-global dependencies will be made with
+-    // explicit barriers when the addressing of the EDRAM buffer relatively to
+-    // the fragment coordinates is changed.
+-    VkSubpassDependency fsi_subpass_dependencies[2];
+-    fsi_subpass_dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+-    fsi_subpass_dependencies[0].dstSubpass = 0;
+-    fsi_subpass_dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+-    fsi_subpass_dependencies[0].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+-    fsi_subpass_dependencies[0].srcAccessMask =
+-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+-    fsi_subpass_dependencies[0].dstAccessMask =
+-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+-    fsi_subpass_dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+-    fsi_subpass_dependencies[1] = fsi_subpass_dependencies[0];
+-    std::swap(fsi_subpass_dependencies[1].srcSubpass, fsi_subpass_dependencies[1].dstSubpass);
+-    VkRenderPassCreateInfo fsi_render_pass_create_info;
+-    fsi_render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+-    fsi_render_pass_create_info.pNext = nullptr;
+-    fsi_render_pass_create_info.flags = 0;
+-    fsi_render_pass_create_info.attachmentCount = 0;
+-    fsi_render_pass_create_info.pAttachments = nullptr;
+-    fsi_render_pass_create_info.subpassCount = 1;
+-    fsi_render_pass_create_info.pSubpasses = &fsi_subpass;
+-    fsi_render_pass_create_info.dependencyCount = uint32_t(rex::countof(fsi_subpass_dependencies));
+-    fsi_render_pass_create_info.pDependencies = fsi_subpass_dependencies;
+-    if (dfn.vkCreateRenderPass(device, &fsi_render_pass_create_info, nullptr, &fsi_render_pass_) !=
+-        VK_SUCCESS) {
+-      REXGPU_ERROR(
+-          "VulkanRenderTargetCache: Failed to create the fragment shader "
+-          "interlock render backend render pass");
+-      Shutdown();
+-      return false;
+-    }
++    // Per-sample-count render passes, dummy attachments and framebuffers (see
++    // fsi_pass_slots_ in the header: the dummy attachment's sample count is
++    // what makes MoltenVK rasterize FSI passes at the guest's MSAA rate, M-066).
++    // Extent: covers every EDRAM-addressable surface bean can configure (pitch
++    // up to 2560 pixels, heights bounded well below 2048 pixels) without the
++    // 8192-wide worst case, since the attachment is a real image now.
++    VkExtent2D fsi_extent;
++    fsi_extent.width = std::min(2560u * draw_resolution_scale_x(),
++                                std::min(device_properties.maxFramebufferWidth,
++                                         device_properties.maxImageDimension2D));
++    fsi_extent.height = std::min(2048u * draw_resolution_scale_y(),
++                                 std::min(device_properties.maxFramebufferHeight,
++                                          device_properties.maxImageDimension2D));
++    for (uint32_t slot = 0; slot < 3; ++slot) {
++      if (slot == 1 && !msaa_2x_no_attachments_supported_) {
++        // Guest 2x uses the 4x slot, matching the pipeline sample fallback.
++        continue;
++      }
++      FsiPassSlot& pass_slot = fsi_pass_slots_[slot];
++      VkSampleCountFlagBits slot_samples = VkSampleCountFlagBits(uint32_t(1) << slot);
+ 
+-    // Common framebuffer.
+-    VkFramebufferCreateInfo fsi_framebuffer_create_info;
+-    fsi_framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+-    fsi_framebuffer_create_info.pNext = nullptr;
+-    fsi_framebuffer_create_info.flags = 0;
+-    fsi_framebuffer_create_info.renderPass = fsi_render_pass_;
+-    fsi_framebuffer_create_info.attachmentCount = 0;
+-    fsi_framebuffer_create_info.pAttachments = nullptr;
+-    fsi_framebuffer_create_info.width =
+-        std::min(xenos::kTexture2DCubeMaxWidthHeight * draw_resolution_scale_x(),
+-                 device_properties.maxFramebufferWidth);
+-    fsi_framebuffer_create_info.height =
+-        std::min(xenos::kTexture2DCubeMaxWidthHeight * draw_resolution_scale_y(),
+-                 device_properties.maxFramebufferHeight);
+-    fsi_framebuffer_create_info.layers = 1;
+-    if (dfn.vkCreateFramebuffer(device, &fsi_framebuffer_create_info, nullptr,
+-                                &fsi_framebuffer_.framebuffer) != VK_SUCCESS) {
+-      REXGPU_ERROR(
+-          "VulkanRenderTargetCache: Failed to create the fragment shader "
+-          "interlock render backend framebuffer");
+-      Shutdown();
+-      return false;
++      VkImageCreateInfo dummy_image_create_info = {};
++      dummy_image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++      dummy_image_create_info.imageType = VK_IMAGE_TYPE_2D;
++      dummy_image_create_info.format = kFsiDummyAttachmentFormat;
++      dummy_image_create_info.extent.width = fsi_extent.width;
++      dummy_image_create_info.extent.height = fsi_extent.height;
++      dummy_image_create_info.extent.depth = 1;
++      dummy_image_create_info.mipLevels = 1;
++      dummy_image_create_info.arrayLayers = 1;
++      dummy_image_create_info.samples = slot_samples;
++      dummy_image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++      // Transient: never loaded, never stored - tile-memory-only on TBDR.
++      dummy_image_create_info.usage =
++          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
++      dummy_image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++      dummy_image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      if (!ui::vulkan::util::CreateDedicatedAllocationImage(
++              vulkan_device, dummy_image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
++              pass_slot.dummy_image, pass_slot.dummy_image_memory)) {
++        REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the {}x FSI dummy attachment",
++                     uint32_t(slot_samples));
++        Shutdown();
++        return false;
++      }
++      VkImageViewCreateInfo dummy_view_create_info = {};
++      dummy_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++      dummy_view_create_info.image = pass_slot.dummy_image;
++      dummy_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++      dummy_view_create_info.format = kFsiDummyAttachmentFormat;
++      dummy_view_create_info.subresourceRange =
++          ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
++      if (dfn.vkCreateImageView(device, &dummy_view_create_info, nullptr,
++                                &pass_slot.dummy_image_view) != VK_SUCCESS) {
++        REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the {}x FSI dummy attachment view",
++                     uint32_t(slot_samples));
++        Shutdown();
++        return false;
++      }
++
++      VkAttachmentDescription fsi_attachment = {};
++      fsi_attachment.format = kFsiDummyAttachmentFormat;
++      fsi_attachment.samples = slot_samples;
++      fsi_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++      fsi_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++      fsi_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++      fsi_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++      fsi_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      fsi_attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      VkAttachmentReference fsi_color_ref;
++      fsi_color_ref.attachment = 0;
++      fsi_color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      VkSubpassDescription fsi_subpass = {};
++      fsi_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++      fsi_subpass.colorAttachmentCount = 1;
++      fsi_subpass.pColorAttachments = &fsi_color_ref;
++      // Fragment shader interlock provides synchronization and ordering within
++      // a subpass, create an external by-region dependency to maintain
++      // interlocking between passes. Framebuffer-global dependencies will be
++      // made with explicit barriers when the addressing of the EDRAM buffer
++      // relatively to the fragment coordinates is changed.
++      VkSubpassDependency fsi_subpass_dependencies[2];
++      fsi_subpass_dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
++      fsi_subpass_dependencies[0].dstSubpass = 0;
++      fsi_subpass_dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++      fsi_subpass_dependencies[0].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++      fsi_subpass_dependencies[0].srcAccessMask =
++          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++      fsi_subpass_dependencies[0].dstAccessMask =
++          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++      fsi_subpass_dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
++      fsi_subpass_dependencies[1] = fsi_subpass_dependencies[0];
++      std::swap(fsi_subpass_dependencies[1].srcSubpass, fsi_subpass_dependencies[1].dstSubpass);
++      VkRenderPassCreateInfo fsi_render_pass_create_info;
++      fsi_render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
++      fsi_render_pass_create_info.pNext = nullptr;
++      fsi_render_pass_create_info.flags = 0;
++      fsi_render_pass_create_info.attachmentCount = 1;
++      fsi_render_pass_create_info.pAttachments = &fsi_attachment;
++      fsi_render_pass_create_info.subpassCount = 1;
++      fsi_render_pass_create_info.pSubpasses = &fsi_subpass;
++      fsi_render_pass_create_info.dependencyCount =
++          uint32_t(rex::countof(fsi_subpass_dependencies));
++      fsi_render_pass_create_info.pDependencies = fsi_subpass_dependencies;
++      if (dfn.vkCreateRenderPass(device, &fsi_render_pass_create_info, nullptr,
++                                 &pass_slot.render_pass) != VK_SUCCESS) {
++        REXGPU_ERROR(
++            "VulkanRenderTargetCache: Failed to create the {}x fragment shader "
++            "interlock render backend render pass",
++            uint32_t(slot_samples));
++        Shutdown();
++        return false;
++      }
++
++      VkFramebufferCreateInfo fsi_framebuffer_create_info;
++      fsi_framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
++      fsi_framebuffer_create_info.pNext = nullptr;
++      fsi_framebuffer_create_info.flags = 0;
++      fsi_framebuffer_create_info.renderPass = pass_slot.render_pass;
++      fsi_framebuffer_create_info.attachmentCount = 1;
++      fsi_framebuffer_create_info.pAttachments = &pass_slot.dummy_image_view;
++      fsi_framebuffer_create_info.width = fsi_extent.width;
++      fsi_framebuffer_create_info.height = fsi_extent.height;
++      fsi_framebuffer_create_info.layers = 1;
++      if (dfn.vkCreateFramebuffer(device, &fsi_framebuffer_create_info, nullptr,
++                                  &pass_slot.framebuffer.framebuffer) != VK_SUCCESS) {
++        REXGPU_ERROR(
++            "VulkanRenderTargetCache: Failed to create the {}x fragment shader "
++            "interlock render backend framebuffer",
++            uint32_t(slot_samples));
++        Shutdown();
++        return false;
++      }
++      pass_slot.framebuffer.host_extent = fsi_extent;
+     }
+-    fsi_framebuffer_.host_extent.width = fsi_framebuffer_create_info.width;
+-    fsi_framebuffer_.host_extent.height = fsi_framebuffer_create_info.height;
+   } else {
+     assert_unhandled_case(path_);
+     Shutdown();
+@@ -992,9 +1064,18 @@
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                          resolve_fsi_clear_pipeline_layout_);
+ 
+-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device,
+-                                         fsi_framebuffer_.framebuffer);
+-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device, fsi_render_pass_);
++  for (FsiPassSlot& fsi_pass_slot : fsi_pass_slots_) {
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device,
++                                           fsi_pass_slot.framebuffer.framebuffer);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
++                                           fsi_pass_slot.render_pass);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device,
++                                           fsi_pass_slot.dummy_image_view);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, fsi_pass_slot.dummy_image);
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
++                                           fsi_pass_slot.dummy_image_memory);
++    fsi_pass_slot.layout_initialized = false;
++  }
+ 
+   for (const auto& dump_pipeline_pair : dump_pipelines_) {
+     // May be null to prevent recreation attempts.
+@@ -1228,6 +1309,50 @@
+   ResetTraceDownload();
+ }
+ 
++bool VulkanRenderTargetCache::WriteEdramSnapshotToFile(const char* path) {
++  if (edram_snapshot_download_buffer_memory_ == VK_NULL_HANDLE) {
++    return false;
++  }
++
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  bool written = false;
++  void* edram_snapshot_download_mapping = nullptr;
++  if (dfn.vkMapMemory(device, edram_snapshot_download_buffer_memory_, 0, VK_WHOLE_SIZE, 0,
++                      &edram_snapshot_download_mapping) == VK_SUCCESS) {
++    if (!(vulkan_device->memory_types().host_coherent &
++          (uint32_t(1) << edram_snapshot_download_buffer_memory_type_))) {
++      VkMappedMemoryRange edram_snapshot_download_memory_range = {};
++      edram_snapshot_download_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++      edram_snapshot_download_memory_range.memory = edram_snapshot_download_buffer_memory_;
++      edram_snapshot_download_memory_range.offset = 0;
++      edram_snapshot_download_memory_range.size =
++          std::min(rex::round_up(VkDeviceSize(xenos::kEdramSizeBytes),
++                                 vulkan_device->properties().nonCoherentAtomSize),
++                   edram_snapshot_download_buffer_memory_size_);
++      dfn.vkInvalidateMappedMemoryRanges(device, 1, &edram_snapshot_download_memory_range);
++    }
++
++    if (FILE* file = std::fopen(path, "wb")) {
++      written = std::fwrite(edram_snapshot_download_mapping, 1, xenos::kEdramSizeBytes, file) ==
++                xenos::kEdramSizeBytes;
++      std::fclose(file);
++    }
++    if (!written) {
++      REXGPU_ERROR("VulkanRenderTargetCache: Failed to write the EDRAM snapshot to {}", path);
++    }
++    dfn.vkUnmapMemory(device, edram_snapshot_download_buffer_memory_);
++  } else {
++    REXGPU_ERROR(
++        "VulkanRenderTargetCache: Failed to map the EDRAM snapshot download "
++        "buffer");
++  }
++
++  ResetTraceDownload();
++  return written;
++}
++
+ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
+   if (IsDrawResolutionScaled()) {
+     // No 1:1 mapping.
+@@ -1708,8 +1833,24 @@
+       // stencil, at least coarsely, to prevent useless barriers.
+       MarkEdramBufferModified(EdramBufferModificationStatus::kViaFragmentShaderInterlock);
+       last_update_render_pass_key_ = render_pass_key;
+-      last_update_render_pass_ = fsi_render_pass_;
+-      last_update_framebuffer_ = &fsi_framebuffer_;
++      uint32_t fsi_slot = GetFsiPassSlotIndex(render_pass_key.msaa_samples);
++      FsiPassSlot& fsi_pass_slot = fsi_pass_slots_[fsi_slot];
++      if (!fsi_pass_slot.layout_initialized) {
++        // One-time transition of the dummy attachment for the dynamic
++        // rendering path, which performs no automatic layout transitions
++        // (the legacy render pass path transitions from UNDEFINED itself,
++        // and this barrier is harmless there).
++        command_processor_.PushImageMemoryBarrier(
++            fsi_pass_slot.dummy_image,
++            ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
++            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
++            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++        fsi_pass_slot.layout_initialized = true;
++      }
++      last_update_fsi_slot_ = fsi_slot;
++      last_update_render_pass_ = fsi_pass_slot.render_pass;
++      last_update_framebuffer_ = &fsi_pass_slot.framebuffer;
+     } break;
+ 
+     default:
+@@ -1725,11 +1866,29 @@
+     VkRenderingAttachmentInfo* depth_attachment,
+     VkRenderingAttachmentInfo* stencil_attachment) const {
+   RenderPassKey key = last_update_render_pass_key_;
+-  RenderTarget* const* rts = last_update_accumulated_render_targets();
+ 
+   std::memset(depth_attachment, 0, sizeof(VkRenderingAttachmentInfo));
+   std::memset(stencil_attachment, 0, sizeof(VkRenderingAttachmentInfo));
++
++  if (GetPath() == Path::kPixelShaderInterlock) {
++    // The write-masked dummy attachment that sets the rasterization sample
++    // count (see fsi_pass_slots_; the pipelines declare the matching format
++    // and a zero color write mask).
++    const FsiPassSlot& fsi_pass_slot = fsi_pass_slots_[last_update_fsi_slot_];
++    VkRenderingAttachmentInfo& color_attachment = color_attachments[0];
++    std::memset(&color_attachment, 0, sizeof(VkRenderingAttachmentInfo));
++    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++    color_attachment.imageView = fsi_pass_slot.dummy_image_view;
++    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    color_attachment.resolveMode = VK_RESOLVE_MODE_NONE;
++    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++    *color_attachment_count_out = 1;
++    return;
++  }
+ 
++  RenderTarget* const* rts = last_update_accumulated_render_targets();
++
+   if ((key.depth_and_color_used & 0b1) && rts[0]) {
+     const auto* vulkan_rt = static_cast<const VulkanRenderTarget*>(rts[0]);
+     depth_attachment->sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -2980,7 +2980,8 @@
+   if (!use_dynamic_rendering) {
+     render_pass =
+         render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock
+-            ? render_target_cache_.GetFragmentShaderInterlockRenderPass()
++            ? render_target_cache_.GetFragmentShaderInterlockRenderPass(
++                  description.render_pass_key.msaa_samples)
+             : render_target_cache_.GetHostRenderTargetsRenderPass(description.render_pass_key);
+     if (render_pass == VK_NULL_HANDLE) {
+       return fail("render_pass_unavailable");
+@@ -3403,6 +3404,13 @@
+       }
+     }
+     color_blend_state.attachmentCount = 32 - rex::lzcnt(color_rts_used);
++    color_blend_state.pAttachments = color_blend_attachments;
++  } else {
++    // FSI: the render pass carries the write-masked dummy attachment that
++    // sets the rasterization sample count (see the render target cache's
++    // fsi_pass_slots_). Zero-initialized attachment state: blending disabled,
++    // color write mask 0 - nothing is ever written to it.
++    color_blend_state.attachmentCount = 1;
+     color_blend_state.pAttachments = color_blend_attachments;
+   }
+ 
+@@ -3444,20 +3452,26 @@
+ 
+     uint32_t color_attachment_count = 0;
+     const auto& key = description.render_pass_key;
+-    xenos::ColorRenderTargetFormat color_formats[] = {
+-        key.color_0_view_format, key.color_1_view_format, key.color_2_view_format,
+-        key.color_3_view_format};
+-    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+-      if (key.depth_and_color_used & (1 << (1 + i))) {
+-        color_attachment_formats[i] = render_target_cache_.GetColorVulkanFormat(color_formats[i]);
+-        color_attachment_count = i + 1;
++    if (edram_fragment_shader_interlock) {
++      // FSI: the dummy sample-count-setting attachment only.
++      color_attachment_formats[0] = VulkanRenderTargetCache::kFsiDummyAttachmentFormat;
++      color_attachment_count = 1;
++    } else {
++      xenos::ColorRenderTargetFormat color_formats[] = {
++          key.color_0_view_format, key.color_1_view_format, key.color_2_view_format,
++          key.color_3_view_format};
++      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
++        if (key.depth_and_color_used & (1 << (1 + i))) {
++          color_attachment_formats[i] = render_target_cache_.GetColorVulkanFormat(color_formats[i]);
++          color_attachment_count = i + 1;
++        }
+       }
+     }
+     pipeline_rendering_create_info.colorAttachmentCount = color_attachment_count;
+     pipeline_rendering_create_info.pColorAttachmentFormats =
+         color_attachment_count ? color_attachment_formats : nullptr;
+ 
+-    if (key.depth_and_color_used & 0b1) {
++    if (!edram_fragment_shader_interlock && (key.depth_and_color_used & 0b1)) {
+       VkFormat depth_format = render_target_cache_.GetDepthVulkanFormat(key.depth_format);
+       pipeline_rendering_create_info.depthAttachmentFormat = depth_format;
+       pipeline_rendering_create_info.stencilAttachmentFormat = depth_format;

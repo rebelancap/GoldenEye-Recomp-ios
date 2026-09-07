@@ -1,0 +1,53 @@
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -37,6 +37,12 @@
+ bool signal_handlers_installed_ = false;
+ struct sigaction original_sigill_handler_;
+ struct sigaction original_sigsegv_handler_;
++#if REX_PLATFORM_MAC
++// Darwin raises SIGBUS (not SIGSEGV) for a PROT_NONE access, which is exactly
++// how guest memory protection faults arrive. Without this the MMIO handler and
++// the GPU write-watch never see them.
++struct sigaction original_sigbus_handler_;
++#endif
+ 
+ // This can be as large as needed, but isn't often needed.
+ // As we will be sometimes firing many exceptions we want to avoid having to
+@@ -141,6 +147,9 @@
+     case SIGILL:
+       ex.InitializeIllegalInstruction(&thread_context);
+       break;
++#if REX_PLATFORM_MAC
++    case SIGBUS:
++#endif
+     case SIGSEGV: {
+       Exception::AccessViolationOperation access_violation_operation;
+ #if REX_PLATFORM_MAC
+@@ -303,7 +312,15 @@
+     }
+     if (sigaction(SIGSEGV, &signal_handler, &original_sigsegv_handler_) != 0) {
+       assert_always("Failed to install new SIGSEGV handler");
++    }
++#if REX_PLATFORM_MAC
++    // See original_sigbus_handler_ above: on Darwin, protection faults on guest
++    // memory arrive as SIGBUS. Linux delivers SIGSEGV for the same access, which
++    // is why upstream only installs the two.
++    if (sigaction(SIGBUS, &signal_handler, &original_sigbus_handler_) != 0) {
++      assert_always("Failed to install new SIGBUS handler");
+     }
++#endif
+     signal_handlers_installed_ = true;
+   }
+ 
+@@ -341,6 +358,11 @@
+       if (sigaction(SIGILL, &original_sigill_handler_, NULL) != 0) {
+         assert_always("Failed to restore original SIGILL handler");
+       }
++#if REX_PLATFORM_MAC
++      if (sigaction(SIGBUS, &original_sigbus_handler_, NULL) != 0) {
++        assert_always("Failed to restore original SIGBUS handler");
++      }
++#endif
+       if (sigaction(SIGSEGV, &original_sigsegv_handler_, NULL) != 0) {
+         assert_always("Failed to restore original SIGSEGV handler");
+       }

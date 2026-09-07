@@ -1,0 +1,120 @@
+--- a/src/ui/touch_overlay_uikit.mm
++++ b/src/ui/touch_overlay_uikit.mm
+@@ -228,6 +228,16 @@
+   double _fps;
+   BOOL _loggedLayout;
+   BOOL _wroteSelftest;
++  // Whether the on-screen controls are WANTED (touch_controls, and whether a
++  // pad is connected). The view itself stays unhidden regardless, because the
++  // frame-rate readout is one of its subviews and has to land somewhere -- so
++  // this flag, not self.hidden, is what drawRect and hitTest consult. Hiding
++  // the view for the readout's sake was what painted the whole button set over
++  // a pad-driven game (the user, headset + phone, 0.1.0.70).
++  BOOL _controlsVisible;
++  // -1 until the first visibility decision, then 0/1. Only used to write the
++  // selftest PNG once per state (touch_overlay_selftest).
++  int _selftestVisible;
+ 
+   // Layout editor. Saved positions are unit coords of the full view bounds,
+   // label -> CGPoint, mirrored from NSUserDefaults at init and kept current by
+@@ -297,6 +307,10 @@
+   // must also not swallow anything outside its controls -- hitTest below draws
+   // that line.
+   self.userInteractionEnabled = YES;
++  // Visible until the first tick says otherwise: the boot-time selftest render
++  // happens before any tick, and it exists to show the controls.
++  _controlsVisible = YES;
++  _selftestVisible = -1;
+   _buttonTouches = [NSMutableDictionary dictionary];
+   _heldButtons = [NSMutableSet set];
+   _stickPrevDirty = CGRectNull;
+@@ -443,6 +457,11 @@
+ 
+ - (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+   (void)event;
++  // Belt and braces with hitTest: nothing on the glass drives the game while
++  // the controls are not wanted.
++  if (!_controlsVisible) {
++    return;
++  }
+   if (_editing) {
+     CGPoint p = [[touches anyObject] locationInView:self];
+     NSString* label = [self buttonLabelAtPoint:p];
+@@ -732,6 +751,12 @@
+ // so the game still sees taps the overlay has no use for.
+ - (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
+   if (self.hidden || self.alpha < 0.01) {
++    return nil;
++  }
++  if (!_controlsVisible) {
++    // Controls are not wanted (a pad is driving, or touch_controls=off), but
++    // the view is still in the hierarchy for the readout label. It must not
++    // swallow a single touch: everything goes to whatever is underneath.
+     return nil;
+   }
+   return [super hitTest:point withEvent:event];
+@@ -772,6 +797,10 @@
+     // not hide what is being edited), game input silenced, HUD out of the way.
+     _hud.hidden = YES;
+     self.hidden = NO;
++    if (!_controlsVisible) {
++      _controlsVisible = YES;
++      [self setNeedsDisplay];
++    }
+     rex::ui::SetTouchPadState(rex::ui::TouchPadState{});
+     return;
+   }
+@@ -861,19 +890,35 @@
+   // (pad in hand, thumb on the glass for a button the pad lacks), and a
+   // simulator, which reports a controller whether or not one exists.
+   const BOOL wanted = (mode == "on") || (mode == "auto" && !pad);
+-  if (self.hidden == wanted) {
+-    self.hidden = !wanted;
++  if (_controlsVisible != wanted) {
++    _controlsVisible = wanted;
+     if (!wanted) {
++      [self clearAllTouchState];
+       rex::ui::SetTouchPadState(rex::ui::TouchPadState{});
+       rex::ui::SetTouchControlsActive(false);
+     }
++    // Everything the view draws appears or disappears at once, so this is the
++    // one place a full-screen invalidation is right.
++    [self setNeedsDisplay];
+     REXLOG_INFO("touch controls: {} (mode={}, controller={})", wanted ? "shown" : "hidden",
+                 mode, pad ? "yes" : "no");
++  }
++  // Photograph the overlay's own pixels once per visibility state. "Hidden" is
++  // a claim about what is DRAWN, and the only honest evidence for it is the
++  // view's own rasterisation -- an external screenshot cannot reach UIKit
++  // content once the GPU worker is down (M-042/M-044), which on the simulator
++  // is always.
++  if (REXCVAR_GET(touch_overlay_selftest) && _selftestVisible != int(wanted)) {
++    _selftestVisible = int(wanted);
++    [self writeSelftestNamed:(wanted ? @"touch-overlay-shown.png" : @"touch-overlay-hidden.png")];
+   }
++  // The VIEW is never hidden: it hosts the frame-rate readout, a subview, and
++  // hiding it would take the readout with it. Hiding it for the readout's sake
++  // and un-hiding it whenever show_fps was on is what put the whole button set
++  // back on screen with a pad connected -- drawRect and hitTest own the
++  // controls now, and both consult _controlsVisible.
++  if (self.hidden) self.hidden = NO;
+   if (!wanted) {
+-    // Still visible as a view when only the readout is on, so the FPS text has
+-    // somewhere to land.
+-    self.hidden = !(REXCVAR_GET(show_fps) || REXCVAR_GET(show_perf_hud));
+     return;
+   }
+ 
+@@ -953,6 +998,12 @@
+ 
+ - (void)drawRect:(CGRect)rect {
+   (void)rect;
++  if (!_controlsVisible) {
++    // A pad is driving (or the player turned the controls off): draw nothing.
++    // The view is still here only so the frame-rate readout subview has a
++    // place to live, and that label draws itself.
++    return;
++  }
+   CGContextRef ctx = UIGraphicsGetCurrentContext();
+   const CGFloat alpha = std::clamp(REXCVAR_GET(touch_button_opacity), 0.0, 1.0);
+ 

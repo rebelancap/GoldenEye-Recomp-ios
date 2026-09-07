@@ -1,0 +1,1050 @@
+--- a/src/ui/touch_overlay_uikit.mm
++++ b/src/ui/touch_overlay_uikit.mm
+@@ -56,6 +56,18 @@
+                     "Tap the Taptic Engine when an on-screen button is pressed. A glass button "
+                     "gives no other confirmation that a press registered.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_STRING(touch_crosshair, "off", "Input",
++                      "Always-on subtle crosshair at the centre of the screen -- where hip "
++                      "fire aims (auto-aim may still bend shots toward targets). off, "
++                      "cross (thin quake-style plus), or circle (dot + hairline ring). The "
++                      "game's own crosshair appears in aim mode regardless.")
++    .allowed({"off", "cross", "circle"})
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(ge_n64_graphics, false, "GPU",
++                    "The player's remembered graphics choice: true = the original N64 look, "
++                    "false = remastered. The settings switch writes it and presses the game's "
++                    "RB shortcut; the overlay re-applies it once per launch after the guest "
++                    "is up (the game itself always boots remastered).");
+ REXCVAR_DEFINE_BOOL(show_fps, false, "GPU",
+                     "Draw a frame-rate readout over the game. Reads the guest's own present "
+                     "counter, so it reports what the player actually sees rather than what the "
+@@ -71,6 +83,11 @@
+                     "on-screen controls are UIKit, not guest output, so nothing else can "
+                     "photograph them -- and on the simulator the GPU worker aborts before "
+                     "any external screenshot lands.");
++REXCVAR_DEFINE_BOOL(touch_edit_selftest, false, "Input",
++                    "Enter the touch-layout editor a few seconds after launch and write "
++                    "Documents/touch-overlay-edit.png. Same reasoning as "
++                    "touch_overlay_selftest: no synthetic tap can open it on this runtime, "
++                    "and an editor the gate cannot photograph is an editor nobody checked.");
+ 
+ extern "C" const char* RexThermalStateName() {
+   // Fable M-049: the paused benchmark drifted 30.7 -> 17 fps over minutes with
+@@ -95,6 +112,7 @@
+ constexpr uint16_t kBtnY = 0x8000;
+ constexpr uint16_t kBtnStart = 0x0010;
+ constexpr uint16_t kBtnBack = 0x0020;
++constexpr uint16_t kBtnLThumb = 0x0040;  // L3: crouch toggle (bench-verified, M-089)
+ 
+ // Triggers are analogue on the 360 pad and GoldenEye fires on the right one.
+ // A touch button is binary, so it reports full deflection.
+@@ -102,37 +120,56 @@
+ constexpr uint16_t kTriggerLeft = 0xF002;
+ 
+ struct ButtonSpec {
++  // Identity: the persistence key for a player-customised position, and what
++  // the touch handlers track. Never shown -- the glyph is the face.
+   const char* label;
++  // SF Symbol drawn in the circle. Glyphs, not words (the user, 2026-08-08):
++  // words need reading mid-firefight and don't localise.
++  const char* glyph;
+   uint16_t bits;
+-  // Position as a fraction of the safe-area size, measured from the RIGHT and
+-  // BOTTOM edges, so the cluster stays anchored to the thumb on any screen.
+-  CGFloat right_frac;
+-  CGFloat bottom_frac;
++  // DEFAULT position in unit coordinates of the FULL view -- the same
++  // representation the layout editor saves, so a baked-in layout and a saved
++  // one land pixel-identically. A saved position overrides this.
++  CGFloat unit_x;
++  CGFloat unit_y;
+   CGFloat radius;
+ };
+ 
+-// Fire and Aim are largest and outermost, stacked on the right edge: they are
+-// held rather than tapped, and are what the thumb must find without looking.
+-// The four face buttons sit in a compact diamond just inboard of them, in the
+-// same arrangement as the pad they map to (A bottom, B right, X left, Y top),
+-// so muscle memory from the console layout carries over.
+-//
+-// Everything stays low and right. The first version of this table spread the
+-// buttons up and across the screen, which put SWAP out of thumb reach and left
+-// RELOAD sitting in the middle of the look area -- obvious the moment it was
+-// drawn, invisible in the numbers (M-045).
++// The defaults ARE the user's tuned layout, exported from his device on
++// 0.1.0.56 (2026-08-09) after real play: FIRE large under the thumb; AIM /
++// RELOAD up the right edge; USE / CROUCH along the bottom; START parked
++// top-right, far from the fight (the gear owns top-left). Unit coords of the
++// full screen, so the shape carries proportionally to any device; the editor
++// exists for everyone else's thumbs.
+ const ButtonSpec kButtons[] = {
+-    {"FIRE", kTriggerRight, 0.09f, 0.18f, 46.0f},
+-    {"AIM", kTriggerLeft, 0.09f, 0.42f, 38.0f},
+-    {"USE", kBtnA, 0.25f, 0.18f, 28.0f},
+-    {"CROUCH", kBtnB, 0.19f, 0.30f, 28.0f},
+-    {"RELOAD", kBtnX, 0.31f, 0.30f, 28.0f},
+-    {"SWAP", kBtnY, 0.25f, 0.42f, 28.0f},
+-    // Pause is deliberately far from everything else and small: it is pressed
+-    // between fights, and a mis-hit during one is a disaster.
+-    {"II", kBtnStart, 0.04f, 0.90f, 20.0f},
++    {"FIRE", "scope", kTriggerRight, 0.8609f, 0.7548f, 46.0f},
++    // AIM at the small size (the user, 2026-08-08): it is a mode toggle, not a
++    // held-in-panic button -- only FIRE earns the big target. Press-and-drag
++    // on it aims.
++    {"AIM", "target", kTriggerLeft, 0.9315f, 0.5484f, 28.0f},
++    {"USE", "hand.raised.fill", kBtnA, 0.8030f, 0.9278f, 28.0f},
++    // Crouch is L3, NOT B -- B holsters to unarmed, which is exactly what the
++    // old mapping did every time the button was pressed (the user, 2026-08-08;
++    // verified on the bench with camera-height captures, M-089).
++    {"CROUCH", "arrow.down", kBtnLThumb, 0.9443f, 0.9175f, 28.0f},
++    {"RELOAD", "arrow.triangle.2.circlepath", kBtnX, 0.8521f, 0.5119f, 28.0f},
++    {"SWAP", "arrow.left.arrow.right", kBtnY, 0.9554f, 0.7214f, 28.0f},
++    // The ≡ glyph, not a pause bar: the same button is START in the front-end
++    // menus, and ≡ is the family's established "menu" mark (quake ports).
++    {"START", "line.3.horizontal", kBtnStart, 0.9400f, 0.0992f, 20.0f},
+ };
+ 
++// Layout persistence (the editor's output). Unit coordinates of the FULL view
++// bounds, one pair per button label, NSUserDefaults -- the same shape as the
++// quake ports' editor, so a future maintainer meets one convention.
++NSString* GePosKey(const char* label, const char* axis) {
++  return [NSString stringWithFormat:@"ge_ctl_%s_%s", label, axis];
++}
++
++// The settings gear (a sibling of the overlay -- see AttachTouchOverlay).
++// Referenced from the overlay's tick to drive its menu-only visibility.
++UIButton* g_settings_gear = nil;
++
+ constexpr CGFloat kStickRadius = 62.0f;    // travel to full deflection
+ constexpr CGFloat kStickRegionFrac = 0.45f;  // left share of the screen
+ // The family's look feel is expressed per-120-Hz-frame, so a delta measured
+@@ -161,6 +198,11 @@
+   CGPoint _lookLast;
+   CGFloat _lookAccumX;
+   CGFloat _lookAccumY;
++  // The finger holding AIM doubles as an aim-drag surface (the user,
++  // 2026-08-08): press-and-drag moves the red crosshair without a second
++  // finger. Its deltas feed the same look accumulators.
++  UITouch* _aimDragTouch;
++  CGPoint _aimDragLast;
+   // Fractional mouse counts not yet emitted, so slow drags are not quantized
+   // away by the integer injector interface.
+   double _lookCarryX;
+@@ -184,12 +226,27 @@
+   double _fps;
+   BOOL _loggedLayout;
+   BOOL _wroteSelftest;
++
++  // Layout editor. Saved positions are unit coords of the full view bounds,
++  // label -> CGPoint, mirrored from NSUserDefaults at init and kept current by
++  // the editor; centreForButton consults this before the defaults table.
++  NSMutableDictionary<NSString*, NSValue*>* _savedUnit;
++  BOOL _editing;
++  NSString* _dragLabel;
++  CGSize _dragOffset;
++  UIView* _editBar;
++  UISlider* _editSlider;
++  UILabel* _editPct;
+ }
+ 
+ // Render the overlay to a PNG in Documents. Its own pixels, not the screen's:
+ // the controls are the thing being checked, and this runs whether or not the
+ // game underneath ever produced a frame.
+ - (void)writeSelftest {
++  [self writeSelftestNamed:@"touch-overlay.png"];
++}
++
++- (void)writeSelftestNamed:(NSString*)filename {
+   const CGSize size = self.bounds.size;
+   if (size.width < 1 || size.height < 1) return;
+ 
+@@ -222,7 +279,7 @@
+   CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), image.CGImage);
+   CGContextRelease(ctx);
+ 
+-  auto path = rex::filesystem::GetDocumentsFolder() / "touch-overlay.png";
++  auto path = rex::filesystem::GetDocumentsFolder() / filename.UTF8String;
+   if (rex::ui::WriteRawImagePng(path, raw)) {
+     REXLOG_INFO("touch overlay selftest: wrote {} ({}x{})", path.string(), w, h);
+   }
+@@ -241,6 +298,27 @@
+   _buttonTouches = [NSMutableDictionary dictionary];
+   _heldButtons = [NSMutableSet set];
+   _stickPrevDirty = CGRectNull;
++  _savedUnit = [NSMutableDictionary dictionary];
++  {
++    NSUserDefaults* d = NSUserDefaults.standardUserDefaults;
++    for (const auto& spec : kButtons) {
++      NSNumber* x = [d objectForKey:GePosKey(spec.label, "x")];
++      NSNumber* y = [d objectForKey:GePosKey(spec.label, "y")];
++      if (x && y) {
++        _savedUnit[@(spec.label)] =
++            [NSValue valueWithCGPoint:CGPointMake(x.doubleValue, y.doubleValue)];
++      }
++    }
++    if (_savedUnit.count) {
++      // One line per button, so a customised layout can be read back over the
++      // bridge and baked into the defaults table (the user's layouts ARE the
++      // defaults pipeline) -- the count alone made that impossible.
++      for (NSString* label in _savedUnit) {
++        const CGPoint u = _savedUnit[label].CGPointValue;
++        REXLOG_INFO("touch layout: saved {} at ({:.3f}, {:.3f})", label.UTF8String, u.x, u.y);
++      }
++    }
++  }
+   _haptics = [[UIImpactFeedbackGenerator alloc]
+       initWithStyle:UIImpactFeedbackStyleLight];
+ 
+@@ -272,6 +350,7 @@
+   _stickTouch = nil;
+   _stickOrigin = _stickCurrent = CGPointZero;
+   _lookTouch = nil;
++  _aimDragTouch = nil;
+   _lookAccumX = _lookAccumY = 0.0f;
+   [_buttonTouches removeAllObjects];
+   [_heldButtons removeAllObjects];
+@@ -319,11 +398,11 @@
+ }
+ 
+ - (CGPoint)centreForButton:(const ButtonSpec&)spec {
+-  UIEdgeInsets safe = self.safeAreaInsets;
+-  CGFloat w = self.bounds.size.width - safe.left - safe.right;
+-  CGFloat h = self.bounds.size.height - safe.top - safe.bottom;
+-  return CGPointMake(safe.left + w * (1.0f - spec.right_frac),
+-                     safe.top + h * (1.0f - spec.bottom_frac));
++  // A position the player placed wins over the table; both are unit coords of
++  // the full bounds, matching what commitDrag saves.
++  NSValue* saved = _savedUnit[@(spec.label)];
++  const CGPoint u = saved ? saved.CGPointValue : CGPointMake(spec.unit_x, spec.unit_y);
++  return CGPointMake(u.x * self.bounds.size.width, u.y * self.bounds.size.height);
+ }
+ 
+ // Both radii are scaled by touch_button_scale rather than baked, because thumb
+@@ -360,6 +439,19 @@
+ 
+ - (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+   (void)event;
++  if (_editing) {
++    CGPoint p = [[touches anyObject] locationInView:self];
++    NSString* label = [self buttonLabelAtPoint:p];
++    if (label) {
++      for (const auto& spec : kButtons) {
++        if (![label isEqualToString:@(spec.label)]) continue;
++        CGPoint c = [self centreForButton:spec];
++        _dragLabel = label;
++        _dragOffset = CGSizeMake(c.x - p.x, c.y - p.y);
++      }
++    }
++    return;
++  }
+   for (UITouch* t in touches) {
+     CGPoint p = [t locationInView:self];
+     NSString* label = [self buttonLabelAtPoint:p];
+@@ -367,6 +459,10 @@
+       const BOOL wasHeld = [_heldButtons containsObject:label];
+       _buttonTouches[[NSValue valueWithNonretainedObject:t]] = label;
+       [_heldButtons addObject:label];
++      if ([label isEqualToString:@"AIM"] && !_aimDragTouch) {
++        _aimDragTouch = t;
++        _aimDragLast = p;
++      }
+       // Only on the transition to held: a second finger landing on an
+       // already-held button is not a new press, and buzzing for it would make
+       // held-fire feel like a fault.
+@@ -393,6 +489,20 @@
+ 
+ - (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+   (void)event;
++  if (_editing) {
++    if (_dragLabel) {
++      CGPoint p = [[touches anyObject] locationInView:self];
++      const CGSize sz = self.bounds.size;
++      if (sz.width > 0 && sz.height > 0) {
++        const CGFloat cx = std::clamp(p.x + _dragOffset.width, CGFloat(0), sz.width);
++        const CGFloat cy = std::clamp(p.y + _dragOffset.height, CGFloat(0), sz.height);
++        _savedUnit[_dragLabel] =
++            [NSValue valueWithCGPoint:CGPointMake(cx / sz.width, cy / sz.height)];
++        [self setNeedsDisplay];  // editing repaints whole-view; it is not a hot path
++      }
++    }
++    return;
++  }
+   for (UITouch* t in touches) {
+     CGPoint p = [t locationInView:self];
+     if (t == _stickTouch) {
+@@ -401,9 +511,16 @@
+       _lookAccumX += p.x - _lookLast.x;
+       _lookAccumY += p.y - _lookLast.y;
+       _lookLast = p;
++    } else if (t == _aimDragTouch) {
++      // The AIM finger aims: its drag feeds the same look path (which, in aim
++      // mode, is exactly what moves the red crosshair). The trigger stays held
++      // through _heldButtons regardless of where the finger wanders.
++      _lookAccumX += p.x - _aimDragLast.x;
++      _lookAccumY += p.y - _aimDragLast.y;
++      _aimDragLast = p;
+     }
+-    // Button touches deliberately ignore movement: sliding a held finger off
+-    // FIRE should not release it mid-firefight.
++    // Other button touches deliberately ignore movement: sliding a held finger
++    // off FIRE should not release it mid-firefight.
+   }
+   [self invalidateControls];
+ }
+@@ -429,20 +546,182 @@
+       _lookTouch = nil;
+       _lookAccumX = _lookAccumY = 0.0f;
+     }
++    if (t == _aimDragTouch) {
++      _aimDragTouch = nil;
++    }
+   }
+   [self invalidateControls];
+ }
+ 
+ - (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+   (void)event;
++  if (_editing) { [self commitDrag]; return; }
+   [self endTouches:touches];
+ }
+ 
+ - (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+   (void)event;
++  if (_editing) { [self commitDrag]; return; }
+   [self endTouches:touches];
+ }
+ 
++// --- layout editor -------------------------------------------------------
++// The chrome and behavior mirror the family's editors (quake ports / vkQuake
++// lineage): reset pill, live scale slider with a percentage, done pill,
++// bottom-left; dragging is self-evident, so no instruction text.
++
++- (void)commitDrag {
++  if (!_dragLabel) return;
++  NSValue* v = _savedUnit[_dragLabel];
++  if (v) {
++    const CGPoint u = v.CGPointValue;
++    NSUserDefaults* d = NSUserDefaults.standardUserDefaults;
++    [d setDouble:u.x forKey:GePosKey(_dragLabel.UTF8String, "x")];
++    [d setDouble:u.y forKey:GePosKey(_dragLabel.UTF8String, "y")];
++    REXLOG_INFO("touch layout: {} -> ({:.3f}, {:.3f})", _dragLabel.UTF8String, u.x, u.y);
++  }
++  _dragLabel = nil;
++}
++
++- (void)updateScalePct {
++  _editPct.text =
++      [NSString stringWithFormat:@"%.0f%%", REXCVAR_GET(touch_button_scale) * 100.0];
++}
++
++- (void)editScaleChanged:(UISlider*)sl {
++  rex::cvar::SetFlagByName("touch_button_scale",
++                           [NSString stringWithFormat:@"%.3f", sl.value].UTF8String);
++  [self updateScalePct];
++  [self setNeedsDisplay];
++}
++
++- (void)editScaleReleased:(UISlider*)sl {
++  (void)sl;
++  rex::ui::PersistSettings();
++}
++
++- (void)resetLayout {
++  NSUserDefaults* d = NSUserDefaults.standardUserDefaults;
++  for (const auto& spec : kButtons) {
++    [d removeObjectForKey:GePosKey(spec.label, "x")];
++    [d removeObjectForKey:GePosKey(spec.label, "y")];
++  }
++  [_savedUnit removeAllObjects];
++  rex::cvar::SetFlagByName("touch_button_scale", "1.0");
++  rex::ui::PersistSettings();
++  _editSlider.value = 1.0f;
++  [self updateScalePct];
++  [self setNeedsDisplay];
++  REXLOG_INFO("touch layout: reset to defaults");
++}
++
++- (BOOL)isEditingLayout {
++  return _editing;
++}
++
++- (void)beginEditingLayout {
++  if (_editing) return;
++  _editing = YES;
++  [self clearAllTouchState];
++  rex::ui::SetTouchPadState(rex::ui::TouchPadState{});
++  // Dump the whole saved layout on entry, not just at attach: boot-time VFS
++  // warnings flood the bridge's log window within seconds, but opening the
++  // editor happens in a quiet moment -- so "open Customize" is all it takes
++  // to make a layout readable over the bridge.
++  for (const auto& spec : kButtons) {
++    NSValue* v = _savedUnit[@(spec.label)];
++    if (v) {
++      const CGPoint u = v.CGPointValue;
++      REXLOG_INFO("touch layout: saved {} at ({:.3f}, {:.3f})", spec.label, u.x, u.y);
++    } else {
++      REXLOG_INFO("touch layout: {} at table default", spec.label);
++    }
++  }
++
++  UIView* bar = [[UIView alloc] initWithFrame:CGRectZero];
++  bar.translatesAutoresizingMaskIntoConstraints = NO;
++  [self addSubview:bar];
++  _editBar = bar;
++
++  UIButton* (^pill)(NSString*, UIColor*, SEL) = ^UIButton*(NSString* sym, UIColor* bg, SEL act) {
++    UIButton* b = [UIButton buttonWithType:UIButtonTypeSystem];
++    b.backgroundColor = bg;
++    [b setImage:[[UIImage systemImageNamed:sym]
++                    imageWithConfiguration:[UIImageSymbolConfiguration
++                                               configurationWithPointSize:17
++                                                                   weight:UIImageSymbolWeightBold]]
++        forState:UIControlStateNormal];
++    b.tintColor = UIColor.whiteColor;
++    b.layer.cornerRadius = 21;
++    b.translatesAutoresizingMaskIntoConstraints = NO;
++    [b addTarget:self action:act forControlEvents:UIControlEventTouchUpInside];
++    [bar addSubview:b];
++    return b;
++  };
++  UIButton* reset = pill(@"arrow.uturn.backward",
++                         [UIColor colorWithRed:0.85 green:0.20 blue:0.22 alpha:0.95],
++                         @selector(resetLayout));
++  UIButton* done = pill(@"checkmark", [UIColor colorWithRed:0.18 green:0.78 blue:0.34 alpha:0.95],
++                        @selector(endEditingLayout));
++
++  UISlider* sl = [UISlider new];
++  sl.minimumValue = 0.6f;
++  sl.maximumValue = 1.8f;
++  sl.value = (float)std::clamp(REXCVAR_GET(touch_button_scale), 0.6, 1.8);
++  sl.minimumTrackTintColor = [UIColor colorWithWhite:1 alpha:0.9];
++  sl.translatesAutoresizingMaskIntoConstraints = NO;
++  [sl addTarget:self action:@selector(editScaleChanged:) forControlEvents:UIControlEventValueChanged];
++  [sl addTarget:self
++                action:@selector(editScaleReleased:)
++      forControlEvents:(UIControlEventTouchUpInside | UIControlEventTouchUpOutside |
++                        UIControlEventTouchCancel)];
++  [bar addSubview:sl];
++  _editSlider = sl;
++
++  UILabel* pct = [UILabel new];
++  pct.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightSemibold];
++  pct.textColor = [UIColor colorWithWhite:1 alpha:0.9];
++  pct.translatesAutoresizingMaskIntoConstraints = NO;
++  [bar addSubview:pct];
++  _editPct = pct;
++  [self updateScalePct];
++
++  UILayoutGuide* safe = self.safeAreaLayoutGuide;
++  [NSLayoutConstraint activateConstraints:@[
++    [bar.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:14],
++    [bar.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-14],
++    [bar.heightAnchor constraintEqualToConstant:42],
++    [bar.trailingAnchor constraintEqualToAnchor:done.trailingAnchor],
++    [reset.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor],
++    [reset.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
++    [reset.widthAnchor constraintEqualToConstant:42],
++    [reset.heightAnchor constraintEqualToConstant:42],
++    [sl.leadingAnchor constraintEqualToAnchor:reset.trailingAnchor constant:16],
++    [sl.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
++    [sl.widthAnchor constraintEqualToConstant:220],
++    [pct.centerXAnchor constraintEqualToAnchor:sl.centerXAnchor],
++    [pct.bottomAnchor constraintEqualToAnchor:sl.topAnchor constant:-2],
++    [done.leadingAnchor constraintEqualToAnchor:sl.trailingAnchor constant:16],
++    [done.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
++    [done.widthAnchor constraintEqualToConstant:42],
++    [done.heightAnchor constraintEqualToConstant:42],
++  ]];
++  [self setNeedsDisplay];
++  REXLOG_INFO("touch layout editor: entered");
++}
++
++- (void)endEditingLayout {
++  if (!_editing) return;
++  [self commitDrag];
++  _editing = NO;
++  [_editBar removeFromSuperview];
++  _editBar = nil;
++  _editSlider = nil;
++  _editPct = nil;
++  [self setNeedsDisplay];
++  REXLOG_INFO("touch layout editor: exited");
++}
++
+ // Let anything that is not one of our controls fall through to the view below,
+ // so the game still sees taps the overlay has no use for.
+ - (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
+@@ -467,6 +746,63 @@
+     return;
+   }
+ 
++  // The gear is ALWAYS visible (except while the layout editor owns the
++  // screen). The menu-only rule shipped in .53 hid it EVERYWHERE: its
++  // predicate (solo-fullscreen flag 3 + unpaused) turned out to be true in
++  // the front-end too -- 0x8272B424 means "not split-screen", the player
++  // structs are statically allocated, and neither pause flag, the watch
++  // flag, control-disabled, nor the viewport field differs between the
++  // dossier menus and live play (all bench-peeked, 2026-08-08). Until the
++  // real front-end/mission state is found by static analysis, reachability
++  // wins: at top-LEFT the gear overlaps nothing (buttons right, stick
++  // lower-left), so the mis-tap hazard that motivated hiding is gone.
++  if (g_settings_gear) {
++    const BOOL hide = _editing;
++    if (g_settings_gear.hidden != hide) g_settings_gear.hidden = hide;
++  }
++
++  if (_editing) {
++    // The editor owns the screen: overlay forced visible (a connected pad must
++    // not hide what is being edited), game input silenced, HUD out of the way.
++    _hud.hidden = YES;
++    self.hidden = NO;
++    rex::ui::SetTouchPadState(rex::ui::TouchPadState{});
++    return;
++  }
++
++  // Crosshair style changed from settings: repaint its little rect once. (The
++  // rest of the time it is static and costs nothing.)
++  {
++    static std::string last_ch = "off";
++    const std::string ch = REXCVAR_GET(touch_crosshair);
++    if (ch != last_ch) {
++      last_ch = ch;
++      const CGPoint c = CGPointMake(self.bounds.size.width / 2, self.bounds.size.height / 2);
++      [self setNeedsDisplayInRect:CGRectMake(c.x - 13, c.y - 13, 26, 26)];
++    }
++  }
++
++  // The remembered graphics choice, applied ONCE per launch: the game always
++  // boots remastered, so if the player chose N64, press RB for them when the
++  // guest has clearly reached the menus (~600 real frames). One attempt, no
++  // retry -- RB is a toggle, and a blind retry of a toggle can undo a success.
++  {
++    static BOOL n64_applied = NO;
++    if (!n64_applied && REXCVAR_GET(ge_n64_graphics)) {
++      uint64_t sub = 0, pres = 0;
++      rex::ui::GetGuestFrameCounters(&sub, &pres);
++      if (pres >= 600) {
++        n64_applied = YES;
++        static void (*pulse)(uint16_t, uint32_t) = reinterpret_cast<void (*)(uint16_t, uint32_t)>(
++            dlsym(RTLD_DEFAULT, "GeInjectButtonPulse"));
++        if (pulse) {
++          pulse((uint16_t)rex::cvar::Query<int32_t>("ge_graphics_toggle_mask"), 250);
++          REXLOG_INFO("touch overlay: re-applied N64 graphics choice (one RB pulse)");
++        }
++      }
++    }
++  }
++
+   const BOOL detail = REXCVAR_GET(show_perf_hud);
+   const BOOL readout = REXCVAR_GET(show_fps) || detail;
+   _hud.hidden = !readout;
+@@ -627,18 +963,64 @@
+   for (const auto& spec : kButtons) {
+     CGPoint c = [self centreForButton:spec];
+     NSString* label = @(spec.label);
+-    const BOOL held = [_heldButtons containsObject:label];
+-    stroke(c, [self radiusFor:spec], held ? alpha * 2.0 : alpha, held);
++    const CGFloat r = [self radiusFor:spec];
++    const BOOL held = [_heldButtons containsObject:label];
++    if (_editing) {
++      // Editor look: every control at full presence, yellow, so what is
++      // grabbable is unmistakable (the family's editor convention).
++      CGContextSetLineWidth(ctx, 2.5);
++      CGContextSetStrokeColorWithColor(
++          ctx, [UIColor colorWithRed:1 green:0.85 blue:0.4 alpha:0.95].CGColor);
++      CGContextStrokeEllipseInRect(ctx, CGRectMake(c.x - r, c.y - r, r * 2, r * 2));
++    } else {
++      stroke(c, r, held ? alpha * 2.0 : alpha, held);
++    }
+ 
+-    NSDictionary* attrs = @{
+-      NSFontAttributeName : [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold],
+-      NSForegroundColorAttributeName : [UIColor colorWithWhite:1.0 alpha:alpha * 2.2],
+-    };
+-    CGSize size = [label sizeWithAttributes:attrs];
+-    [label drawAtPoint:CGPointMake(c.x - size.width / 2, c.y - size.height / 2)
+-        withAttributes:attrs];
++    // The glyph, tinted like the old text labels were. SF Symbol images carry
++    // their own aspect ratio; scale to fit a box proportional to the circle.
++    UIImage* img = [UIImage systemImageNamed:@(spec.glyph)];
++    if (img) {
++      const CGFloat ga = _editing ? 0.95 : std::min(alpha * 2.2, 1.0);
++      img = [img imageByApplyingSymbolConfiguration:
++                     [UIImageSymbolConfiguration
++                         configurationWithPointSize:std::max(r * 0.62, 10.0)
++                                             weight:UIImageSymbolWeightSemibold]];
++      img = [img imageWithTintColor:[UIColor colorWithWhite:1.0 alpha:ga]
++                      renderingMode:UIImageRenderingModeAlwaysOriginal];
++      const CGSize is = img.size;
++      [img drawInRect:CGRectMake(c.x - is.width / 2, c.y - is.height / 2, is.width, is.height)];
++    }
+   }
+ 
++  // Always-on crosshair (off by default): drawn at the screen centre, where
++  // hip fire aims. Subtle on purpose -- it reads as HUD, not as a control.
++  if (!_editing) {
++    const std::string ch = REXCVAR_GET(touch_crosshair);
++    const CGPoint c = CGPointMake(self.bounds.size.width / 2, self.bounds.size.height / 2);
++    if (ch == "cross") {
++      // Quake-style plus: four thin arms with a centre gap, hairline weight.
++      const CGFloat arm = 7.0, gap = 3.0;
++      CGContextSetLineWidth(ctx, 1.5);
++      CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:1.0 alpha:0.65].CGColor);
++      CGContextBeginPath(ctx);
++      CGContextMoveToPoint(ctx, c.x - gap - arm, c.y);
++      CGContextAddLineToPoint(ctx, c.x - gap, c.y);
++      CGContextMoveToPoint(ctx, c.x + gap, c.y);
++      CGContextAddLineToPoint(ctx, c.x + gap + arm, c.y);
++      CGContextMoveToPoint(ctx, c.x, c.y - gap - arm);
++      CGContextAddLineToPoint(ctx, c.x, c.y - gap);
++      CGContextMoveToPoint(ctx, c.x, c.y + gap);
++      CGContextAddLineToPoint(ctx, c.x, c.y + gap + arm);
++      CGContextStrokePath(ctx);
++    } else if (ch == "circle") {
++      CGContextSetFillColorWithColor(ctx, [UIColor colorWithWhite:1.0 alpha:0.65].CGColor);
++      CGContextFillEllipseInRect(ctx, CGRectMake(c.x - 2, c.y - 2, 4, 4));
++      CGContextSetLineWidth(ctx, 1.0);
++      CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:1.0 alpha:0.35].CGColor);
++      CGContextStrokeEllipseInRect(ctx, CGRectMake(c.x - 9, c.y - 9, 18, 18));
++    }
++  }
++
+   // No resting visual: the stick exists only under a thumb (the user, 2026-08-05
+   // -- "as originally intended"). The left half being blank is the design; the
+   // stick materialises wherever the thumb lands.
+@@ -674,6 +1056,25 @@
+     _wroteSelftest = YES;
+     [self writeSelftest];
+   }
++  static BOOL edit_selftest_armed = NO;
++  if (!edit_selftest_armed && REXCVAR_GET(touch_edit_selftest) && self.bounds.size.width > 1) {
++    edit_selftest_armed = YES;
++    // Fast on purpose: on the simulator the GPU worker aborts the process a
++    // couple of seconds after boot (M-042/M-044), and a leisurely 4s+1s
++    // selftest lost that race every time. Enter, force the edit bar's layout
++    // synchronously, photograph, leave -- inside the survival window.
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{
++                     [self beginEditingLayout];
++                     [self setNeedsLayout];
++                     [self layoutIfNeeded];
++                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
++                                                  (int64_t)(0.3 * NSEC_PER_SEC)),
++                                    dispatch_get_main_queue(), ^{
++                                      [self writeSelftestNamed:@"touch-overlay-edit.png"];
++                                    });
++                   });
++  }
+ }
+ 
+ @end
+@@ -695,11 +1096,51 @@
+ // Held for the process lifetime: a UIButton does not retain its target, and the
+ // overlay is never torn down.
+ RexSettingsButtonTarget* g_settings_target = nil;
++// The overlay view, for the settings page's layout-editor entry point.
++__weak RexTouchOverlayView* g_overlay_view = nil;
+ }  // namespace
+ 
+ namespace rex {
+ namespace ui {
+ 
++void BeginTouchLayoutEdit() {
++  dispatch_async(dispatch_get_main_queue(), ^{
++    [g_overlay_view beginEditingLayout];
++  });
++}
++
++void* ExportTouchLayout() {
++  // Composed from NSUserDefaults directly rather than the overlay's mirror,
++  // so it works even if the overlay never attached this session.
++  NSUserDefaults* d = NSUserDefaults.standardUserDefaults;
++  NSMutableString* text = [NSMutableString
++      stringWithFormat:@"GoldenEye touch layout (%@)\nscale %.3f\n",
++                       NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"],
++                       std::clamp(REXCVAR_GET(touch_button_scale), 0.5, 2.0)];
++  for (const auto& spec : kButtons) {
++    NSNumber* x = [d objectForKey:GePosKey(spec.label, "x")];
++    NSNumber* y = [d objectForKey:GePosKey(spec.label, "y")];
++    if (x && y) {
++      [text appendFormat:@"%s %.4f %.4f\n", spec.label, x.doubleValue, y.doubleValue];
++    } else {
++      [text appendFormat:@"%s (table default)\n", spec.label];
++    }
++  }
++  // Side effects: the bridge's log window and the Files app both get a copy.
++  for (NSString* line in [text componentsSeparatedByString:@"\n"]) {
++    if (line.length) REXLOG_INFO("layout export: {}", line.UTF8String);
++  }
++  auto path = rex::filesystem::GetDocumentsFolder() / "touch-layout.txt";
++  NSError* err = nil;
++  if (![text writeToFile:@(path.string().c_str())
++              atomically:YES
++                encoding:NSUTF8StringEncoding
++                   error:&err]) {
++    REXLOG_ERROR("layout export: write failed: {}", err.description.UTF8String ?: "?");
++  }
++  return (__bridge_retained void*)text;
++}
++
+ void AttachTouchOverlay(void* parent_view) {
+   UIView* parent = (__bridge UIView*)parent_view;
+   if (!parent) {
+@@ -709,6 +1150,7 @@
+   auto* overlay = [[RexTouchOverlayView alloc] initWithFrame:parent.bounds];
+   overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+   [parent addSubview:overlay];
++  g_overlay_view = overlay;
+ 
+   g_settings_target = [RexSettingsButtonTarget new];
+   UIButton* gear = [UIButton buttonWithType:UIButtonTypeSystem];
+@@ -721,20 +1163,25 @@
+                 action:@selector(tapped)
+       forControlEvents:UIControlEventTouchUpInside];
+   [parent addSubview:gear];
+-  // Top-right, inside the safe area: the game's own HUD lives along the bottom
+-  // and in the lower corners, so this is the one region nothing else claims.
++  // Top-LEFT, inside the safe area (the user, 2026-08-08: top-right sat on the
++  // pause/START corner). Only present in menus and the pause screen -- the
++  // overlay's tick drives that via g_settings_gear + GeInGameplay.
+   UILayoutGuide* safe = parent.safeAreaLayoutGuide;
+   [NSLayoutConstraint activateConstraints:@[
+-    [gear.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
++    [gear.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+     [gear.topAnchor constraintEqualToAnchor:safe.topAnchor constant:12],
+     [gear.widthAnchor constraintEqualToConstant:34],
+     [gear.heightAnchor constraintEqualToConstant:34],
+   ]];
++  g_settings_gear = gear;
+   // Lay out now rather than waiting for the next run-loop turn. Boot occupies
+   // the main thread from here until the guest is up, so the first natural
+   // layout pass is a long way off -- and if boot fails there is never one at
+   // all, which is exactly when the frame log and the selftest are wanted.
+   [overlay layoutIfNeeded];
++  // The other-app audio policy wants its category in place before SDL's first
++  // session activation -- this is the earliest point after config load.
++  ApplyAudioSessionMode();
+   REXLOG_INFO("touch overlay: attached");
+ }
+ 
+--- a/src/ui/settings_uikit.mm
++++ b/src/ui/settings_uikit.mm
+@@ -125,6 +125,9 @@
+ /// Action rows.
+ @property(nonatomic, copy) void (^action)(void);
+ @property(nonatomic) BOOL destructive;
++/// Switch rows: called after the cvar write, for rows whose flip has a side
++/// effect beyond the cvar (the graphics toggle presses the game's RB).
++@property(nonatomic, copy) void (^onChanged)(void);
+ @end
+ 
+ @implementation RexSettingsRow
+@@ -137,6 +140,64 @@
+ @end
+ 
+ @implementation RexSettingsSection
++@end
++
++// ---------------------------------------------------------------------------
++// Other-app audio picker
++// ---------------------------------------------------------------------------
++
++// One-of-five picker for the "Other App Audio" row, the family's standard
++// (quake ports): each choice carries a sentence saying what it actually does,
++// because "duck" and "mix" mean nothing to a player. Checkmark on the current
++// mode; picking applies immediately and backs out after the checkmark lands.
++@interface RexAudioModeController : UITableViewController
++@property(nonatomic, copy) void (^onPick)(void);
++@end
++
++@implementation RexAudioModeController
++- (void)viewDidLoad {
++  [super viewDidLoad];
++  self.title = @"Other App Audio";
++  self.tableView.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
++  self.navigationItem.rightBarButtonItem =
++      [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
++                                                    target:self
++                                                    action:@selector(dismissSelf)];
++}
++- (void)dismissSelf {
++  [self dismissViewControllerAnimated:YES completion:nil];
++}
++- (NSInteger)tableView:(UITableView*)t numberOfRowsInSection:(NSInteger)s {
++  (void)t; (void)s;
++  return (NSInteger)((__bridge NSArray*)rex::ui::AudioModeTitles()).count;
++}
++- (UITableViewCell*)tableView:(UITableView*)t cellForRowAtIndexPath:(NSIndexPath*)ip {
++  (void)t;
++  UITableViewCell* c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
++                                              reuseIdentifier:nil];
++  c.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
++  c.textLabel.text = ((__bridge NSArray*)rex::ui::AudioModeTitles())[(NSUInteger)ip.row];
++  c.textLabel.textColor = UIColor.whiteColor;
++  c.detailTextLabel.text = ((__bridge NSArray*)rex::ui::AudioModeDetails())[(NSUInteger)ip.row];
++  c.detailTextLabel.textColor = [UIColor colorWithWhite:0.68 alpha:1.0];
++  c.detailTextLabel.numberOfLines = 0;  // let the explanation wrap rather than truncate
++  c.accessoryType = (ip.row == (NSInteger)CvarDouble(@"audio_session_mode"))
++                        ? UITableViewCellAccessoryCheckmark
++                        : UITableViewCellAccessoryNone;
++  c.tintColor = UIColor.systemYellowColor;
++  return c;
++}
++- (void)tableView:(UITableView*)t didSelectRowAtIndexPath:(NSIndexPath*)ip {
++  [t deselectRowAtIndexPath:ip animated:YES];
++  CvarSetDouble(@"audio_session_mode", (double)ip.row);
++  rex::ui::ApplyAudioSessionMode();
++  rex::ui::PersistSettings();
++  [t reloadData];
++  if (self.onPick) self.onPick();
++  // Let the checkmark land before backing out, so the choice is visibly taken.
++  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
++                 dispatch_get_main_queue(), ^{ [self dismissSelf]; });
++}
+ @end
+ 
+ // ---------------------------------------------------------------------------
+@@ -254,51 +315,70 @@
+   // --- Graphics ---
+   RexSettingsRow* mip = [self switchRow:@"Distance texture filtering" cvar:@"texture_flat_lod"];
+   mip.inverted = YES;  // the cvar names the workaround; the row names the feature
+-  // "Standard" writes the cvar's default (empty string = fbo), so a fresh
+-  // install shows a selected segment and SaveConfig keeps the file clean.
+-  RexSettingsRow* rtpath = [self segmentedRow:@"Renderer path"
+-                                         cvar:@"render_target_path_vulkan"
+-                                       labels:@[ @"Standard", @"Tile (FSI)" ]
+-                                       values:@[ @"", @"fsi" ]];
++  // The remaster's signature feature as a stateful toggle (the user: "so the
++  // user knows what they are changing it to"). The switch holds the INTENT in
++  // ge_n64_graphics (persisted); flipping it presses the game's own RB
++  // shortcut, and the overlay re-applies the choice once per launch after the
++  // guest is up, so the preference survives relaunch even though the game
++  // always boots into remastered graphics.
++  RexSettingsRow* vtoggle = [self switchRow:@"Original N64 graphics" cvar:@"ge_n64_graphics"];
++  vtoggle.onChanged = ^{
++    using PulseFn = void (*)(uint16_t, uint32_t);
++    static PulseFn pulse =
++        reinterpret_cast<PulseFn>(dlsym(RTLD_DEFAULT, "GeInjectButtonPulse"));
++    if (!pulse) {
++      REXLOG_ERROR("settings: GeInjectButtonPulse not found");
++      return;
++    }
++    pulse((uint16_t)CvarDouble(@"ge_graphics_toggle_mask"), 250);
++  };
++
+   [self addSection:@"Graphics"
+-            footer:@"Distance filtering is off by default: it sharpens distant surfaces but "
+-                   @"draws dark seams on character faces (a known bug, M-056).\n"
+-                   @"Tile (FSI) is an energy experiment (M-066): it keeps the frame in "
+-                   @"tile-local memory, cutting render passes from 7 to 2. Takes effect after "
+-                   @"fully closing and relaunching the app; the row below shows what this "
+-                   @"launch is actually running (it falls back to Standard where unsupported)."
++            footer:@"The graphics switch is instant and works mid-game -- the same flip the "
++                   @"controller's RB shortcut does. (Flipping with RB directly can leave "
++                   @"this switch out of step until it is toggled again.)\n"
++                   @"Distance filtering is off by default: it sharpens distant surfaces but "
++                   @"draws dark seams on character faces (a known bug, M-056)."
+               rows:@[
++                vtoggle,
+                 mip,
+-                rtpath,
+-                [self infoRow:@"Path this launch"
+-                         text:^NSString* {
+-                           // The cvar records what was asked for; the graphics
+-                           // library records what Setup actually chose.
+-                           using ActivePathFn = const char* (*)();
+-                           static ActivePathFn fn = reinterpret_cast<ActivePathFn>(
+-                               dlsym(RTLD_DEFAULT, "RexActiveRenderTargetPath"));
+-                           if (!fn) return @"unavailable";
+-                           const char* active = fn();
+-                           NSString* shown =
+-                               strcmp(active, "fsi") == 0
+-                                   ? @"Tile (FSI)"
+-                                   : (strcmp(active, "fbo") == 0 ? @"Standard" : @(active));
+-                           bool fsi_requested =
+-                               [CvarString(@"render_target_path_vulkan") isEqualToString:@"fsi"];
+-                           bool fsi_active = strcmp(active, "fsi") == 0;
+-                           if (fsi_requested != fsi_active) {
+-                             // Either the change has not been relaunched into
+-                             // effect yet, or this device cannot run FSI --
+-                             // indistinguishable from here, so say both.
+-                             return [shown
+-                                 stringByAppendingString:@" · change needs relaunch (or is "
+-                                                         @"unsupported here)"];
+-                           }
+-                           return shown;
+-                         }],
+               ]];
+ 
+   // --- Controls ---
++  // The layout editor: drag any button where the thumb wants it, scale slider,
++  // reset, done -- the family's editor, chrome and all. The page dismisses
++  // first because the editor lives on the game screen underneath.
++  RexSettingsRow* customize = [RexSettingsRow new];
++  customize.kind = RexRowAction;
++  customize.title = @"Customize Touch Layout…";
++  customize.action = ^{
++    rex::ui::DismissSettings();
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{ rex::ui::BeginTouchLayoutEdit(); });
++  };
++
++  // One tap turns the saved layout into text: share sheet + clipboard +
++  // Documents/touch-layout.txt + the console bridge's log, all at once --
++  // no re-nudging, no racing the log window (the user, 2026-08-08).
++  __weak __typeof(self) weakExportSelf = self;
++  RexSettingsRow* exportLayout = [RexSettingsRow new];
++  exportLayout.kind = RexRowAction;
++  exportLayout.title = @"Export Touch Layout…";
++  exportLayout.action = ^{
++    __typeof(self) strong = weakExportSelf;
++    if (!strong) return;
++    NSString* text = (__bridge_transfer NSString*)rex::ui::ExportTouchLayout();
++    UIPasteboard.generalPasteboard.string = text;
++    UIActivityViewController* share =
++        [[UIActivityViewController alloc] initWithActivityItems:@[ text ]
++                                          applicationActivities:nil];
++    // iPad/visionOS present popovers from a rect; anchor to the view centre.
++    share.popoverPresentationController.sourceView = strong.view;
++    share.popoverPresentationController.sourceRect =
++        CGRectMake(CGRectGetMidX(strong.view.bounds), CGRectGetMidY(strong.view.bounds), 1, 1);
++    [strong presentViewController:share animated:YES completion:nil];
++  };
++
+   [self addSection:@"Controls"
+             footer:@"A long swipe turns exactly as far as several short ones."
+               rows:@[
+@@ -315,13 +395,6 @@
+                               cvar:@"touch_controls"
+                             labels:@[ @"Auto", @"On", @"Off" ]
+                             values:@[ @"auto", @"on", @"off" ]],
+-                [self sliderRow:@"Button size"
+-                           cvar:@"touch_button_scale"
+-                            min:0.6
+-                            max:1.8
+-                         format:^NSString*(double v) {
+-                           return [NSString stringWithFormat:@"%.0f%%", v * 100.0];
+-                         }],
+                 [self sliderRow:@"Button opacity"
+                            cvar:@"touch_button_opacity"
+                             min:0.05
+@@ -330,9 +403,41 @@
+                            return [NSString stringWithFormat:@"%.0f%%", v * 100.0];
+                          }],
+                 [self switchRow:@"Haptics" cvar:@"touch_haptics"],
++                [self segmentedRow:@"Crosshair"
++                              cvar:@"touch_crosshair"
++                            labels:@[ @"Off", @"Cross", @"Circle" ]
++                            values:@[ @"off", @"cross", @"circle" ]],
++                customize,
++                exportLayout,
+               ]];
+ 
+   // --- Audio ---
++  // "Other App Audio": what happens to Music/podcasts while the game runs.
++  // Opens the family-standard picker (five modes, each explained in a
++  // sentence); the row shows the current choice.
++  RexSettingsRow* audioMode = [RexSettingsRow new];
++  audioMode.kind = RexRowAction;
++  audioMode.title = @"Other App Audio";
++  audioMode.cvar = @"audio_session_mode";  // row drops cleanly if the cvar goes
++  audioMode.info = ^NSString* {
++    NSArray* titles = (__bridge NSArray*)rex::ui::AudioModeTitles();
++    NSInteger m = (NSInteger)CvarDouble(@"audio_session_mode");
++    if (m < 0 || m >= (NSInteger)titles.count) m = 2;
++    return titles[(NSUInteger)m];
++  };
++  __weak __typeof(self) weakAudioSelf = self;
++  audioMode.action = ^{
++    __typeof(self) strong = weakAudioSelf;
++    if (!strong) return;
++    RexAudioModeController* picker =
++        [[RexAudioModeController alloc] initWithStyle:UITableViewStyleInsetGrouped];
++    picker.onPick = ^{ [strong->_table reloadData]; };
++    UINavigationController* nav =
++        [[UINavigationController alloc] initWithRootViewController:picker];
++    nav.modalPresentationStyle = UIModalPresentationFormSheet;
++    [strong presentViewController:nav animated:YES completion:nil];
++  };
++
+   [self addSection:@"Audio"
+             footer:nil
+               rows:@[
+@@ -344,6 +449,7 @@
+                            return [NSString stringWithFormat:@"%.0f%%", v * 100.0];
+                          }],
+                 [self switchRow:@"Mute" cvar:@"audio_mute"],
++                audioMode,
+               ]];
+ 
+   // --- Diagnostics ---
+@@ -691,8 +797,17 @@
+     }
+     case RexRowAction: {
+       cell.textLabel.textColor = row.destructive ? UIColor.systemRedColor : UIColor.systemBlueColor;
+-      cell.textLabel.textAlignment = NSTextAlignmentCenter;
+       cell.selectionStyle = UITableViewCellSelectionStyleDefault;
++      if (row.info) {
++        // An action that carries state (the audio mode): title left, current
++        // value under it, disclosure chevron -- the standard "opens a picker"
++        // shape, so it must not be centred like the plain actions.
++        cell.detailTextLabel.text = row.info();
++        cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
++        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
++      } else {
++        cell.textLabel.textAlignment = NSTextAlignmentCenter;
++      }
+       break;
+     }
+   }
+@@ -715,6 +830,7 @@
+ - (void)switchChanged:(UISwitch*)sender {
+   RexSettingsRow* row = [self rowForTag:sender.tag];
+   CvarSetBool(row.cvar, row.inverted ? !sender.isOn : sender.isOn);
++  if (row.onChanged) row.onChanged();
+   rex::ui::PersistSettings();
+ }
+ 
+--- a/include/rex/ui/touch_controls.h
++++ b/include/rex/ui/touch_controls.h
+@@ -68,6 +68,19 @@
+ /// Defined in touch_overlay_uikit.mm; void* so callers need not be ObjC++.
+ void AttachTouchOverlay(void* parent_view);
+ 
++/// Enter the touch-layout editor (drag buttons, scale slider, reset/done).
++/// Called by the settings page after dismissing itself; no-op when the overlay
++/// does not exist. Defined in touch_overlay_uikit.mm.
++void BeginTouchLayoutEdit();
++
++/// The current touch layout as human-readable text (an NSString*, bridged as
++/// void* to keep this header C++-clean): one line per button, unit coords of
++/// the screen, plus the scale. Also logs every line and writes
++/// Documents/touch-layout.txt as side effects, so the same tap serves the
++/// share sheet, the Files app, and the console bridge. Defined in
++/// touch_overlay_uikit.mm.
++void* ExportTouchLayout();
++
+ /// The deadzone and curve constants, exposed for tests and for the settings UI.
+ inline constexpr float kStickDeadzone = 0.15f;
+ inline constexpr float kStickLinearWeight = 0.4f;
+--- a/include/rex/ui/settings_uikit.h
++++ b/include/rex/ui/settings_uikit.h
+@@ -48,5 +48,17 @@
+ /// where a deferred write would be lost to the process being suspended.
+ void PersistSettingsNow();
+ 
++/// Apply the audio_session_mode cvar to AVAudioSession (category options, and
++/// the game-side duck gain the SDL mixer multiplies in). Called at overlay
++/// attach, on foreground, and whenever the picker changes the mode. iOS /
++/// visionOS only; defined in audio_session_uikit.mm.
++void ApplyAudioSessionMode();
++
++/// Player-facing names and one-sentence explanations for the five audio modes,
++/// index == cvar value. NSArray<NSString*>* returned as void* so this header
++/// stays C++-clean; the settings page bridges them back.
++void* AudioModeTitles();
++void* AudioModeDetails();
++
+ }  // namespace ui
+ }  // namespace rex

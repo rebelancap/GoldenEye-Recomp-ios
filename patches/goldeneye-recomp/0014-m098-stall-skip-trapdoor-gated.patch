@@ -1,0 +1,90 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -61,6 +61,18 @@
+                      "the watchdog recovery can be proven against a real locked state.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_INT32(ge_stall_skip, 1, "GPU",
++                     "What the frame-wait hook does when one GPU wait exceeds ~80 ms (M-098). "
++                     "0 = nothing (honest wait). 1 = release this one wait (drawn=true) and "
++                     "log GEWDSKIP. 2 = upstream's behaviour: also set render-skip bit 0x02 in "
++                     "dev+10941 -- which NO game store ever clears, so it parks D3D in 'GPU "
++                     "untrusted, never render' until our heal releases it. That bit-set was the "
++                     "2026-09-04 device freeze (hsio flag 0 every tick, so the M-097 path is "
++                     "innocent): a Dam load at 40 Hz stalled one wait past 80 ms and upstream's "
++                     "own watchdog hack latched the one-way trapdoor.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++static std::atomic<uint32_t> g_wdskip_fires{0};
++
+ REXCVAR_DEFINE_BOOL(ge_hsio_guard, true, "GPU",
+                     "THE FREEZE CAUSE, defused (bean fable 04). The D3D 'HSIO training "
+                     "failed' flag @0x8308855C is computed ONCE at device init from "
+@@ -1250,8 +1262,21 @@
+       }
+     }
+     else if ((uint32_t)(t - s_wait_start) > 4000000u) {  // ~80ms @49.875MHz
+-      drawn = true;
+-      if (dev) base[dev + 10941u] |= 0x02u;   // stalled: skip this GPU wait
++      // Upstream released the wait AND set dev+10941 |= 0x02 here ("skip this
++      // GPU wait", believing the game re-clears it next frame). It does not:
++      // no game store clears bit 0x02 (static enumeration, M-098), so that line
++      // was a permanent park into D3D's never-render mode -- the organic freeze
++      // whose flight recordings showed hsio == 0. Default: release only.
++      const int32_t mode = REXCVAR_GET(ge_stall_skip);
++      if (mode != 0) {
++        drawn = true;
++        const uint32_t n = g_wdskip_fires.fetch_add(1, std::memory_order_relaxed) + 1;
++        const uint8_t marker = dev ? WD8(base, dev + 10941u) : 0;
++        REXKRNL_INFO("GEWDSKIP #{}: GPU wait stalled {} ticks (~{} ms) marker={:#x} mode={}", n,
++                     (uint32_t)(t - s_wait_start), (uint32_t)(t - s_wait_start) / 49875u, marker,
++                     mode);
++        if (mode == 2 && dev) base[dev + 10941u] |= 0x02u;
++      }
+     }
+     // The six GPU-completion waits poll this routine in a TIGHT busy spin. With
+     // dozens of guest threads that oversubscribes the cores and starves the
+@@ -1441,7 +1466,7 @@
+   {
+     struct FlightSample {
+       uint32_t tick, submit, credited, progress, target;
+-      uint32_t skipbits, hsio;
++      uint32_t skipbits, hsio, wdskip;
+       uint64_t guest_frames, host_presents;
+     };
+     static FlightSample s_flight[1024];
+@@ -1456,6 +1481,7 @@
+     fs.target = a1 ? LD32(base, a1 + 10908) : 0;
+     fs.skipbits = a1 ? WD8(base, a1 + 10941) : 0;
+     fs.hsio = hsio_flag;
++    fs.wdskip = g_wdskip_fires.load(std::memory_order_relaxed);
+     fs.guest_frames = RexGetGuestFrameCount();
+     fs.host_presents = host_presents;
+     if ((guest_nearly_dead || presents_nearly_dead) && s_heal_armed && !s_flight_dumped) {
+@@ -1465,11 +1491,12 @@
+       char name[64];
+       std::snprintf(name, sizeof(name), "freeze-flight-%u.txt", s_heal_tick);
+       std::ofstream f(dir / name);
+-      f << "tick submit credited progress target skipbits hsio guest_frames host_presents\n";
++      f << "tick submit credited progress target skipbits hsio wdskip guest_frames host_presents\n";
+       for (uint32_t i = 0; i < n; ++i) {
+         const FlightSample& s = s_flight[(s_flight_n - n + i) % 1024u];
+         f << s.tick << ' ' << s.submit << ' ' << s.credited << ' ' << s.progress << ' '
+-          << s.target << ' ' << s.skipbits << ' ' << s.hsio << ' ' << s.guest_frames << ' '
++          << s.target << ' ' << s.skipbits << ' ' << s.hsio << ' ' << s.wdskip << ' '
++          << s.guest_frames << ' '
+           << s.host_presents << '\n';
+       }
+       f.close();
+@@ -1477,9 +1504,9 @@
+       // The last two seconds inline, so a bridge read alone shows the onset.
+       for (uint32_t i = (n > 120u ? n - 120u : 0u); i < n; i += 8) {
+         const FlightSample& s = s_flight[(s_flight_n - n + i) % 1024u];
+-        REXKRNL_INFO("GEFLIGHT t{} sub={} cred={} prog={} tgt={} skip={:#x} gf={} hp={}", s.tick,
+-                     s.submit, s.credited, s.progress, s.target, s.skipbits, s.guest_frames,
+-                     s.host_presents);
++        REXKRNL_INFO("GEFLIGHT t{} sub={} cred={} prog={} tgt={} skip={:#x} wd={} gf={} hp={}",
++                     s.tick, s.submit, s.credited, s.progress, s.target, s.skipbits, s.wdskip,
++                     s.guest_frames, s.host_presents);
+       }
+     }
+     if (!guest_nearly_dead && !presents_nearly_dead && s_flight_dumped && s_heal_armed) {

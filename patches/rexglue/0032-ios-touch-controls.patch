@@ -1,0 +1,105 @@
+--- a/src/kernel/xam/xam_input.cpp
++++ b/src/kernel/xam/xam_input.cpp
+@@ -16,6 +16,10 @@
+ #include <vector>
+ 
+ #include <rex/cvar.h>
++#include <rex/platform.h>
++#if REX_PLATFORM_IOS
++#include <rex/ui/touch_controls.h>  // on-screen controls feed the guest pad
++#endif
+ #include <rex/input/input.h>
+ #include <rex/input/input_system.h>
+ #include <rex/kernel/xam/private.h>
+@@ -140,8 +144,48 @@
+     const uint16_t scripted = rex::kernel::xam::ScriptedButtonsNow();
+     if (scripted) {
+       input_state->gamepad.buttons = uint16_t(input_state->gamepad.buttons) | scripted;
++    }
++  }
++
++#if REX_PLATFORM_IOS
++  // On-screen controls (GoldenEye-Recomp-ios overlay). Merged rather than
++  // substituted: a device can have both a paired controller and a thumb on the
++  // glass, and whichever is further from rest should win per axis. The overlay
++  // parks itself at neutral when a controller connects, so in practice this
++  // costs nothing once a pad is in play.
++  //
++  // Note the input system reports failure when no controller is connected at
++  // all -- which is the common case on a phone -- so this runs regardless of
++  // `result` and reports success once touch is driving.
++  if (input_state && actual_user_index == 0 && rex::ui::TouchControlsActive()) {
++    const auto touch = rex::ui::GetTouchPadState();
++    auto stronger = [](int16_t a, int16_t b) {
++      return (std::abs(int(a)) >= std::abs(int(b))) ? a : b;
++    };
++    if (result != X_ERROR_SUCCESS) {
++      // No physical pad: start from neutral rather than from uninitialised
++      // guest memory.
++      input_state->gamepad.buttons = 0;
++      input_state->gamepad.left_trigger = 0;
++      input_state->gamepad.right_trigger = 0;
++      input_state->gamepad.thumb_lx = 0;
++      input_state->gamepad.thumb_ly = 0;
++      input_state->gamepad.thumb_rx = 0;
++      input_state->gamepad.thumb_ry = 0;
+     }
++    input_state->gamepad.buttons = uint16_t(input_state->gamepad.buttons) | touch.buttons;
++    input_state->gamepad.left_trigger =
++        std::max<uint8_t>(input_state->gamepad.left_trigger, touch.left_trigger);
++    input_state->gamepad.right_trigger =
++        std::max<uint8_t>(input_state->gamepad.right_trigger, touch.right_trigger);
++    input_state->gamepad.thumb_lx = stronger(input_state->gamepad.thumb_lx, touch.thumb_lx);
++    input_state->gamepad.thumb_ly = stronger(input_state->gamepad.thumb_ly, touch.thumb_ly);
++    input_state->gamepad.thumb_rx = stronger(input_state->gamepad.thumb_rx, touch.thumb_rx);
++    input_state->gamepad.thumb_ry = stronger(input_state->gamepad.thumb_ry, touch.thumb_ry);
++    return X_ERROR_SUCCESS;
+   }
++#endif  // REX_PLATFORM_IOS
++
+   return result;
+ }
+ 
+--- a/src/ui/window_uikit.mm
++++ b/src/ui/window_uikit.mm
+@@ -25,6 +25,8 @@
+ #include <rex/ui/windowed_app_context.h>
+ 
+ #import <QuartzCore/CAMetalLayer.h>
++#include <rex/ui/touch_controls.h>  // on-screen controls layered over the Metal view
++
+ #import <UIKit/UIKit.h>
+ 
+ namespace {
+@@ -60,6 +62,9 @@
+   self.view = [[RexMetalView alloc] initWithFrame:UIScreen.mainScreen.bounds];
+   self.view.contentScaleFactor = UIScreen.mainScreen.nativeScale;
+   self.view.multipleTouchEnabled = YES;
++  // The on-screen controls sit above the Metal layer as ordinary UIKit views.
++  // They hide themselves whenever a real controller is connected.
++  rex::ui::AttachTouchOverlay((__bridge void*)self.view);
+ }
+ 
+ - (void)viewDidLayoutSubviews {
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -72,6 +72,8 @@
+             windowed_app_context_uikit.mm
+             sdl_ios_device_idiom.mm
+             onboarding_uikit.mm
++            touch_controls.cpp
++            touch_overlay_uikit.mm
+         )
+     else()
+         set(REXUI_PLATFORM_SOURCES
+@@ -165,6 +167,10 @@
+             "-framework QuartzCore"
+             "-framework Metal"
+             "-framework Foundation"
++            # The on-screen controls are drawn with Core Graphics, and
++            # GameController is what tells them a real pad has appeared.
++            "-framework CoreGraphics"
++            "-framework GameController"
+         )
+     else()
+         target_link_libraries(rexui PUBLIC

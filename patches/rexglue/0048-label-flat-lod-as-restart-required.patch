@@ -1,0 +1,16 @@
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -31,7 +31,12 @@
+                     "points at corrupted smaller mips from the texture loader, not at LOD "
+                     "math; flat-LOD sampling avoids the damaged levels. Costs distance mip "
+                     "filtering. Remove once the mip chain is verified/fixed. Requires an app "
+-                    "restart; the shader/pipeline cache is keyed on this flag.");
++                    "restart; the shader/pipeline cache is keyed on this flag.")
++    // Labelled honestly so the console says so and device-ab.sh refuses to
++    // A/B it live: the flag acts at TRANSLATION time, so flipping it in a warm
++    // scene changes nothing already translated and a live measurement of its
++    // cost is meaningless (Fable, round 7).
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ namespace rex::graphics {
+ 

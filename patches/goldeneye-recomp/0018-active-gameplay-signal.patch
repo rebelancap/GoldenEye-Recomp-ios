@@ -1,0 +1,126 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -1371,32 +1371,105 @@
+ // (ge_dbg_now) then treats the frame as GPU-complete only once the CP's
+ // counter has moved past this -- i.e. the just-submitted frame was really
+ // drawn -- so the game blocks for the real render (visible) but no longer.
+-// Guest base for UI-thread queries. Stashed by the present hook (which runs
+-// every guest frame with the base in hand); read by GeInGameplay below on the
+-// UIKit main thread through the fault-proof accessors.
++// Guest base stashed by the present hook (which runs every guest frame with the
++// base in hand), for anything off the guest thread that needs it through the
++// fault-proof WD* accessors.
+ static std::atomic<uint8_t*> g_ui_guest_base{nullptr};
+ 
+-// REFUTED as an in-mission signal (2026-08-08, .53 device report + bench
+-// peeks): 0x8272B424 is 3 in the FRONT-END too (it means "not split-screen"),
+-// so this returned 1 everywhere and hid the settings gear for good. Nothing
+-// cheap discriminates the dossier menus from live play -- the player structs
+-// are statically allocated (players[0] = 0x447f07a0 even pre-mission), and
+-// pause @0x82F1E70C / watch player+0x2E8 / control-disabled player+0x80 /
+-// viewport player+0x904 all read 0 in both states. What IS verified: pause
+-// @0x82F1E70C == 1 exactly while the Q-watch pause screen is up (capture-
+-// proven). Kept as an export for when static analysis finds the real menu
+-// state; nothing calls it for UI decisions today.
++// Active-gameplay signal for the UI (the settings gear hides while the player
++// is actually playing, and is shown everywhere else).
++//
++// HISTORY -- the .53 attempt used 0x8272B424 == 3 && !paused. REFUTED
++// (2026-08-08, device report + bench peeks): 0x8272B424 is 3 in the FRONT-END
++// too (it means "not split-screen"), so that predicate was true everywhere and
++// hid the gear for good. Neither the pause flag, the watch flag,
++// control-disabled, nor the viewport field discriminates the dossier menus
++// from live play on its own.
++//
++// What DOES discriminate is the boss stage pair the missing-music work already
++// leans on: g_StageNum @0x82423E00 / g_MainStageNum @0x82423DFC, where stage 90
++// is the title/front-end stage (GE_TITLE_STAGE). ge_missing_music_tick uses
++// exactly that pair to tell Mission Select from a live level, and its cue
++// transitions are capture-proven -- so it is a signal with standing, not a new
++// guess. On top of it the three known "not playing right now" flags force the
++// gear back: pause (Q-watch/pause screen, capture-proven == 1 there), the
++// watch flag, and control-disabled (cutscene). Every one of them fails SAFE:
++// anything unreadable, unbooted, or unrecognised reports "not gameplay", which
++// SHOWS the gear -- the only route to Settings must never be lost to a bug.
++//
++// Sampled on the guest present thread (cheap LD32s, no mach syscalls) into an
++// atomic with a freshness stamp; the UIKit tick just reads the atomic.
++namespace {
++constexpr uint32_t GEUI_PENDING_STAGE = 0x82423DFCu;  // boss g_MainStageNum
++constexpr uint32_t GEUI_CURRENT_STAGE = 0x82423E00u;  // boss g_StageNum
++constexpr uint32_t GEUI_TITLE_STAGE   = 90u;          // front-end / Mission Select
++constexpr uint32_t GEUI_PAUSE_FLAG    = 0x82F1E70Cu;
++constexpr uint32_t GEUI_PLAYER_PTR    = 0x82F1FA98u;  // -> players[0..3]
++constexpr uint32_t GEUI_OFF_VIEWPORT  = 0x904u;       // 0 == locally rendered view
++constexpr uint32_t GEUI_OFF_WATCH     = 0x2E8u;       // watch up
++constexpr uint32_t GEUI_OFF_DISABLED  = 0x80u;        // cutscene / control disabled
++
++std::atomic<int> g_ui_in_gameplay{0};
++std::atomic<int64_t> g_ui_in_gameplay_ns{0};
++
++// Runs on the guest thread from the present hook, with a live base in hand.
++void ge_gameplay_state_tick(uint8_t* base) {
++  const uint32_t current_stage = LD32(base, GEUI_CURRENT_STAGE);
++  const uint32_t pending_stage = LD32(base, GEUI_PENDING_STAGE);
++  const uint32_t paused        = LD32(base, GEUI_PAUSE_FLAG);
++
++  uint32_t player = 0;
++  for (int i = 0; i < 4; ++i) {
++    const uint32_t candidate = LD32(base, GEUI_PLAYER_PTR + i * 4u);
++    if (candidate && LD32(base, candidate + GEUI_OFF_VIEWPORT) == 0u) {
++      player = candidate;
++      break;
++    }
++  }
++  const uint32_t watch = player ? LD32(base, player + GEUI_OFF_WATCH) : 0u;
++  const uint32_t ctl   = player ? LD32(base, player + GEUI_OFF_DISABLED) : 0u;
++
++  const bool in_level = current_stage != 0u &&
++                        current_stage != GEUI_TITLE_STAGE &&
++                        pending_stage != GEUI_TITLE_STAGE;
++  const int active = (in_level && player != 0u && paused == 0u && watch == 0u &&
++                      ctl == 0u) ? 1 : 0;
++
++  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                             std::chrono::steady_clock::now().time_since_epoch())
++                             .count();
++  g_ui_in_gameplay_ns.store(now_ns, std::memory_order_relaxed);
++  // Log the first sample as well as every change, so a run's transcript opens
++  // with the front-end reading rather than leaving it to be inferred.
++  static bool logged_once = false;
++  const bool first = !logged_once;
++  logged_once = true;
++  if (g_ui_in_gameplay.exchange(active, std::memory_order_relaxed) != active || first) {
++    REXKRNL_INFO("GEGAMEPLAY active={} stage={} pending={} pause={} watch={} ctl={}",
++                 active, current_stage, pending_stage, paused, watch, ctl);
++  }
++}
++}  // namespace
++
++// The UI-thread query (dlsym'd by the touch overlay, exactly as
++// GeInjectButtonPulse is). Reads only the atomic -- no guest memory, no mach
++// syscalls on the main thread. A stale sample (the guest wedged, suspended, or
++// never booted) reports 0, which SHOWS the gear.
+ extern "C" int GeInGameplay(void) {
+-  uint8_t* base = g_ui_guest_base.load(std::memory_order_relaxed);
+-  if (!base) return 0;
+-  const uint32_t screen = WD32(base, 0x8272B424u);
+-  const uint32_t paused = WD32(base, 0x82F1E70Cu);
+-  return (screen == 3u && paused == 0u) ? 1 : 0;
++  if (g_ui_in_gameplay.load(std::memory_order_relaxed) == 0) return 0;
++  const int64_t stamped = g_ui_in_gameplay_ns.load(std::memory_order_relaxed);
++  if (stamped == 0) return 0;
++  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                             std::chrono::steady_clock::now().time_since_epoch())
++                             .count();
++  if (now_ns - stamped > 1000000000LL) return 0;  // >1 s without a present
++  return 1;
+ }
+ 
+ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
+   PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx; (void)base;
+   g_ui_guest_base.store(base, std::memory_order_relaxed);
++  ge_gameplay_state_tick(base);
+   (void)r30;
+   uint32_t a1 = r31.u32;
+   auto* cpp = ge_cp();

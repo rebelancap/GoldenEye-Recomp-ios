@@ -1,0 +1,213 @@
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -431,6 +431,9 @@
+   bool CanEndSubmissionImmediately() const;
+ 
+   void ClearTransientDescriptorPools();
++  // Diagnostic (GoldenEye-Recomp-ios overlay): dump raw pre-resolve EDRAM plus
++  // a register sidecar; called from IssueCopy while an edramdump is armed.
++  void DumpEdramBeforeResolve();
+   bool IssueCopy_ReadbackResolvePath();
+   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstring>
+ #include <iterator>
+ #include <mutex>
+@@ -77,6 +78,25 @@
+                       "cost amplification on thermally clamped mobile GPUs, at the price of "
+                       "CPU/GPU overlap.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(log_surface_info, false, "GPU",
++                    "DIAGNOSTIC (round 8): log RB_SURFACE_INFO / RB_COLOR_INFO / blend register "
++                    "state whenever the combination changes, one line per unique combination. "
++                    "Names the MSAA sample count and render-target formats a scene actually "
++                    "uses -- the FSI darkening hunt needs the menu's. Cheap when off.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++namespace {
++// EDRAM dump probe (round 8, M-065): armed over the console via
++// RexRequestEdramDump. While armed, each PM4 copy (resolve) first downloads
++// the raw pre-resolve EDRAM contents -- the instant the drawn frame is still
++// present, before the resolve's own clear wipes it -- and writes them next to
++// a register sidecar. Splits the FSI darkening between the write side (EDRAM
++// already dark) and the resolve side (EDRAM bright, output dark) in one step.
++std::atomic<int> g_edram_dump_remaining{0};
++std::atomic<uint32_t> g_edram_dump_serial{0};
++char g_edram_dump_dir[512] = {0};
++}  // namespace
+ 
+ namespace {
+ // Render-pass and submission accounting. On a tile-based GPU every render pass
+@@ -4452,6 +4472,61 @@
+   return true;
+ }
+ 
++void VulkanCommandProcessor::DumpEdramBeforeResolve() {
++  // Same sequence as InitializeTrace: record the EDRAM download into the open
++  // submission, submit-and-await, then read the mapping back on the CPU.
++  if (!render_target_cache_->InitializeTraceSubmitDownloads()) {
++    REXGPU_ERROR("edramdump: InitializeTraceSubmitDownloads failed");
++    return;
++  }
++  AwaitAllQueueOperationsCompletion();
++
++  bool fsi = render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
++  uint32_t serial = g_edram_dump_serial.fetch_add(1, std::memory_order_relaxed);
++  std::string base = std::string(g_edram_dump_dir) + "/edram-" + (fsi ? "fsi" : "fbo") + "-" +
++                     std::to_string(serial);
++  std::string bin_path = base + ".bin";
++  if (!render_target_cache_->WriteEdramSnapshotToFile(bin_path.c_str())) {
++    return;
++  }
++
++  // Register sidecar: everything the analysis needs to locate and interpret
++  // the render targets inside the raw EDRAM bytes.
++  const RegisterFile& regs = *register_file_;
++  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
++  auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
++  auto rb_copy_control = regs.Get<reg::RB_COPY_CONTROL>();
++  auto rb_copy_dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
++  auto rb_copy_dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
++  if (FILE* file = std::fopen((base + ".txt").c_str(), "w")) {
++    std::fprintf(file, "path=%s\n", fsi ? "fsi" : "fbo");
++    std::fprintf(file, "surface_pitch=%u\n", uint32_t(rb_surface_info.surface_pitch));
++    std::fprintf(file, "msaa_samples=%u\n", uint32_t(rb_surface_info.msaa_samples));
++    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
++      auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
++      std::fprintf(file, "rt%u_base_tiles=%u rt%u_format=%u rt%u_blendcontrol=%08X\n", i,
++                   uint32_t(color_info.color_base), i, uint32_t(color_info.color_format), i,
++                   uint32_t(regs[reg::RB_BLENDCONTROL::rt_register_indices[i]]));
++    }
++    std::fprintf(file, "depth_base_tiles=%u depth_format=%u\n", uint32_t(rb_depth_info.depth_base),
++                 uint32_t(rb_depth_info.depth_format));
++    std::fprintf(file, "colorcontrol=%08X\n", uint32_t(regs[XE_GPU_REG_RB_COLORCONTROL]));
++    std::fprintf(file, "color_mask=%08X\n", uint32_t(regs[XE_GPU_REG_RB_COLOR_MASK]));
++    std::fprintf(file,
++                 "copy: src_select=%u sample_select=%u color_clear=%u depth_clear=%u "
++                 "dest_format=%u dest_pitch=%u dest_height=%u\n",
++                 uint32_t(rb_copy_control.copy_src_select),
++                 uint32_t(rb_copy_control.copy_sample_select),
++                 uint32_t(rb_copy_control.color_clear_enable),
++                 uint32_t(rb_copy_control.depth_clear_enable),
++                 uint32_t(rb_copy_dest_info.copy_dest_format),
++                 uint32_t(rb_copy_dest_pitch.copy_dest_pitch),
++                 uint32_t(rb_copy_dest_pitch.copy_dest_height));
++    std::fclose(file);
++  }
++  REXGPU_INFO("edramdump: wrote {}", bin_path);
++}
++
+ bool VulkanCommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+@@ -4461,6 +4536,15 @@
+     return false;
+   }
+ 
++  if (g_edram_dump_remaining.load(std::memory_order_relaxed) > 0) {
++    g_edram_dump_remaining.fetch_sub(1, std::memory_order_relaxed);
++    DumpEdramBeforeResolve();
++    // The dump awaited the queue; the resolve below needs an open submission.
++    if (!BeginSubmission(true)) {
++      return false;
++    }
++  }
++
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+     uint32_t written_address, written_length;
+@@ -6016,6 +6100,29 @@
+     }
+   }
+ 
++  if (REXCVAR_GET(log_surface_info)) {
++    // One line per unique register combination; keyed on everything printed.
++    uint64_t key = uint64_t(regs[XE_GPU_REG_RB_SURFACE_INFO]) ^
++                   (uint64_t(regs[XE_GPU_REG_RB_COLORCONTROL]) << 32);
++    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
++      key = key * UINT64_C(0x100000001B3) ^ color_infos[i].value;
++      key = key * UINT64_C(0x100000001B3) ^ regs[reg::RB_BLENDCONTROL::rt_register_indices[i]];
++    }
++    static std::atomic<uint64_t> last_key{~UINT64_C(0)};
++    if (last_key.exchange(key, std::memory_order_relaxed) != key) {
++      REXGPU_INFO(
++          "surface_info: msaa={}x pitch={} rt0(base={} fmt={} blend={:08X}) "
++          "rt1(base={} fmt={} blend={:08X}) colorcontrol={:08X} path={}",
++          1u << uint32_t(rb_surface_info.msaa_samples), uint32_t(rb_surface_info.surface_pitch),
++          uint32_t(color_infos[0].color_base), uint32_t(color_infos[0].color_format),
++          uint32_t(regs[reg::RB_BLENDCONTROL::rt_register_indices[0]]),
++          uint32_t(color_infos[1].color_base), uint32_t(color_infos[1].color_format),
++          uint32_t(regs[reg::RB_BLENDCONTROL::rt_register_indices[1]]),
++          uint32_t(regs[XE_GPU_REG_RB_COLORCONTROL]),
++          edram_fragment_shader_interlock ? "fsi" : "fbo");
++    }
++  }
++
+   // Disable depth and stencil if it aliases a color render target (for
+   // instance, during the XBLA logo in 58410954, though depth writing is already
+   // disabled there).
+@@ -6941,3 +7048,11 @@
+ extern "C" void RexGetGpuDispatchStats(uint64_t* out, uint32_t count) {
+   rex::graphics::GetGpuDispatchStats(out, size_t(count));
+ }
++
++// Arms the EDRAM dump probe: each of the next `count` resolves writes the raw
++// pre-resolve EDRAM plus a register sidecar into `dir` (which must exist).
++// Reached by dlsym from the console bridge, like the stats above.
++extern "C" void RexRequestEdramDump(const char* dir, uint32_t count) {
++  std::snprintf(g_edram_dump_dir, sizeof(g_edram_dump_dir), "%s", dir);
++  g_edram_dump_remaining.store(int(count), std::memory_order_relaxed);
++}
+--- a/src/system/console_bridge.cpp
++++ b/src/system/console_bridge.cpp
+@@ -26,6 +26,7 @@
+ #include <errno.h>
+ #include <netinet/in.h>
+ #include <sys/socket.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
+ #include <rex/cvar.h>
+@@ -110,6 +111,7 @@
+       "  modified          list cvars that differ from their default\n"
+       "  info <name>       type, category, default and description\n"
+       "  reset <name>      restore a cvar's default\n"
++      "  edramdump <dir> [n]  dump raw pre-resolve EDRAM (+ register sidecar) at the next n resolves\n"
+ #if REX_PLATFORM_IOS
+       "  settings [close]  open (or close) the native settings page\n"
+ #endif
+@@ -366,6 +368,26 @@
+     }
+     std::string s = out.str();
+     return s.empty() ? "nothing differs from default\n" : s;
++  }
++
++  if (cmd == "edramdump") {
++    // Round-8 probe (M-065): raw pre-resolve EDRAM + register sidecar, one
++    // pair per resolve, written by the GPU worker at the next `count` PM4
++    // copies. Splits the FSI darkening between write side and resolve side.
++    std::string dir;
++    in >> dir;
++    if (dir.empty() || dir[0] != '/') {
++      return "usage: edramdump <abs-dir> [count]   (default count 4)\n";
++    }
++    uint32_t count = 4;
++    if (!(in >> count) || count == 0) count = 4;  // failed extraction zeroes it
++    using EdramDumpFn = void (*)(const char*, uint32_t);
++    static auto fn =
++        reinterpret_cast<EdramDumpFn>(dlsym(RTLD_DEFAULT, "RexRequestEdramDump"));
++    if (!fn) return "error: RexRequestEdramDump not present in this build\n";
++    ::mkdir(dir.c_str(), 0755);
++    fn(dir.c_str(), count);
++    return "armed: next " + std::to_string(count) + " resolves dump EDRAM into " + dir + "\n";
+   }
+ 
+   return "error: unknown command '" + cmd + "' (try help)\n";

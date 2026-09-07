@@ -1,0 +1,157 @@
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -15,6 +15,14 @@
+ #include <cstddef>
+ 
+ #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC && !defined(_XOPEN_SOURCE)
++// Darwin's <ucontext.h> hard-errors unless _XOPEN_SOURCE is defined: the
++// get/make/swapcontext routines are deprecated there but still functional
++// (verified on macOS arm64). Defined here rather than globally -- a global
++// _XOPEN_SOURCE hides Darwin extensions the rest of the runtime uses.
++#define _XOPEN_SOURCE 700
++#define REX_DEFINED_XOPEN_SOURCE_FOR_UCONTEXT 1
++#endif
+ #include <ucontext.h>
+ #include <cstdint>
+ #include <vector>
+@@ -51,7 +59,7 @@
+ #if REX_PLATFORM_WIN32
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
+-#elif REX_PLATFORM_LINUX
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+   ucontext_t context_{};
+   std::vector<uint8_t> stack_;
+   void (*entry_)(void*) = nullptr;
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -24,7 +24,10 @@
+ 
+ #include <pthread.h>
+ #include <semaphore.h>
++#if REX_PLATFORM_LINUX
++// Linux-only, and nothing in this file actually calls eventfd().
+ #include <sys/eventfd.h>
++#endif
+ #include <sys/syscall.h>
+ #include <sys/time.h>
+ #include <sys/types.h>
+@@ -109,14 +112,28 @@
+   k_Count
+ };
+ 
++#if REX_PLATFORM_MAC
++// Darwin has no POSIX real-time signal range (no SIGRTMIN/SIGRTMAX). The two
++// signal types the runtime uses map onto the two user-defined signals, which
++// are consecutive (SIGUSR1 == 30, SIGUSR2 == 31). Nothing else in the process
++// may claim them.
++#define REX_SIGNAL_BASE SIGUSR1
++#define REX_SIGNAL_LAST SIGUSR2
++static_assert(static_cast<int>(SignalType::k_Count) <= (SIGUSR2 - SIGUSR1 + 1),
++              "More signal types than Darwin has user signals to spare.");
++#else
++#define REX_SIGNAL_BASE SIGRTMIN
++#define REX_SIGNAL_LAST (SIGRTMAX - 1)
++#endif
++
+ int GetSystemSignal(SignalType num) {
+-  auto result = SIGRTMIN + static_cast<int>(num);
+-  assert_true(result < SIGRTMAX);
++  auto result = REX_SIGNAL_BASE + static_cast<int>(num);
++  assert_true(result <= REX_SIGNAL_LAST);
+   return result;
+ }
+ 
+ SignalType GetSystemSignalType(int num) {
+-  return static_cast<SignalType>(num - SIGRTMIN);
++  return static_cast<SignalType>(num - REX_SIGNAL_BASE);
+ }
+ 
+ std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_handler_installed =
+@@ -669,7 +686,16 @@
+     WaitStarted();
+     std::unique_lock<std::mutex> lock(state_mutex_);
+     if (state_ != State::kUninitialized && state_ != State::kFinished) {
++#if REX_PLATFORM_MAC
++      // Darwin's pthread_setname_np names the CALLING thread only -- there is
++      // no way to name another thread. Naming is cosmetic (debugger/Instruments
++      // display), so set it when we happen to be that thread and skip otherwise.
++      if (pthread_equal(thread_, pthread_self())) {
++        pthread_setname_np(std::string(name).c_str());
++      }
++#else
+       pthread_setname_np(thread_, std::string(name).c_str());
++#endif
+ #if REX_PLATFORM_ANDROID
+       SetAndroidPreApi26Name(name);
+ #endif
+@@ -687,8 +713,32 @@
+   }
+ #endif
+ 
++#if REX_PLATFORM_MAC
++  // pthread_t is an opaque pointer on Darwin. The Mach port name is the natural
++  // 32-bit per-thread identifier and is what Instruments/lldb display.
++  uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
++#else
+   uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
++#endif
+ 
++#if REX_PLATFORM_MAC
++  // Darwin exposes no CPU-affinity API: thread_policy_set(THREAD_AFFINITY_POLICY)
++  // is only a scheduling *hint* and is a no-op on Apple Silicon, where the
++  // kernel owns P/E-core placement outright. Report "may run anywhere" and drop
++  // requests on the floor rather than pretending to honour them.
++  // NOTE (perf): if a Phase 3 measurement ever wants core pinning, the lever on
++  // Apple Silicon is QoS class (pthread_set_qos_class_self_np), not affinity.
++  uint64_t affinity_mask() {
++    WaitStarted();
++    const uint32_t cpu_count = std::min<uint32_t>(std::thread::hardware_concurrency(), 64u);
++    return cpu_count >= 64 ? ~UINT64_C(0) : ((UINT64_C(1) << cpu_count) - 1);
++  }
++
++  void set_affinity_mask(uint64_t mask) {
++    WaitStarted();
++    (void)mask;
++  }
++#else
+   uint64_t affinity_mask() {
+     WaitStarted();
+     cpu_set_t cpu_set;
+@@ -729,6 +779,7 @@
+     }
+ #endif
+   }
++#endif  // REX_PLATFORM_MAC affinity
+ 
+   int priority() {
+     WaitStarted();
+@@ -784,6 +835,13 @@
+ #if REX_PLATFORM_ANDROID
+     int result = sigqueue(pthread_gettid_np(thread_),
+                           GetSystemSignal(SignalType::kThreadUserCallback), value);
++#elif REX_PLATFORM_MAC
++    // Darwin has neither pthread_sigqueue nor a per-thread sigqueue, so the
++    // sigval payload cannot be delivered. That is fine here: signal_handler()
++    // ignores siginfo entirely and recovers the thread from thread-local state,
++    // so a plain directed signal carries everything that is actually read.
++    (void)value;
++    int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
+ #else
+     int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
+ #endif
+@@ -1394,7 +1452,13 @@
+ }
+ 
+ void set_current_thread_name(const std::string_view name) {
++#if REX_PLATFORM_MAC
++  // Darwin's one-argument form -- it can only ever name the calling thread,
++  // which is exactly what this function does.
++  pthread_setname_np(std::string(name).c_str());
++#else
+   pthread_setname_np(pthread_self(), std::string(name).c_str());
++#endif
+ #if REX_PLATFORM_ANDROID
+   if (!android_pthread_getname_np_ && current_thread_) {
+     current_thread_->condition().SetAndroidPreApi26Name(name);

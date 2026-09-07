@@ -1,0 +1,101 @@
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -500,6 +500,13 @@
+         rex::path_to_utf8(pipeline_storage_file_path));
+     return;
+   }
++  // Apple libc positions an "a+" stream at END of file on open (POSIX leaves
++  // the initial read position unspecified; glibc gives the start, Apple gives
++  // the end), so the header fread below returns 0 bytes and the storage is
++  // truncated and rebuilt on every single launch -- nothing is ever pre-warmed.
++  // Writes in "a+" mode always append regardless of the read position, so
++  // rewinding here is safe on every platform.
++  rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_SET);
+   pipeline_storage_file_flush_needed_ = false;
+   // 'XEPS'.
+   const uint32_t pipeline_storage_magic = 0x53504558;
+@@ -517,11 +524,13 @@
+     uint32_t magic_api;
+     uint32_t version_swapped;
+   } pipeline_storage_file_header;
++  bool pipeline_storage_header_ok = false;
+   if (fread(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
+             pipeline_storage_file_) &&
+       pipeline_storage_file_header.magic == pipeline_storage_magic &&
+       pipeline_storage_file_header.magic_api == pipeline_storage_magic_api &&
+       pipeline_storage_file_header.version_swapped == pipeline_storage_version_swapped) {
++    pipeline_storage_header_ok = true;
+     rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END);
+     int64_t pipeline_storage_told_end = rex::filesystem::Tell(pipeline_storage_file_);
+     size_t pipeline_storage_told_count =
+@@ -568,16 +577,20 @@
+         }
+       }
+       pipeline_stored_descriptions.resize(pipeline_storage_kept_count);
+-      if (pipeline_storage_skipped_unsupported_count || pipeline_storage_skipped_corrupted_count) {
+-        REXGPU_INFO(
+-            "VulkanPipelineCache: Pipeline storage filtering kept {} descriptions (skipped {} "
+-            "unsupported, {} corrupted)",
+-            pipeline_storage_kept_count, pipeline_storage_skipped_unsupported_count,
+-            pipeline_storage_skipped_corrupted_count);
+-      }
++      REXGPU_INFO(
++          "VulkanPipelineCache: pipeline storage read {} descriptions, kept {} (skipped {} "
++          "unsupported, {} corrupted)",
++          pipeline_storage_read_count, pipeline_storage_kept_count,
++          pipeline_storage_skipped_unsupported_count, pipeline_storage_skipped_corrupted_count);
+     }
+   }
+ 
++  if (!pipeline_storage_header_ok) {
++    REXGPU_INFO(
++        "VulkanPipelineCache: pipeline storage header absent or invalidated -- starting a fresh "
++        "store, no pipelines pre-warmed this launch");
++  }
++
+   // Initialize the Xenos shader storage stream.
+   auto shader_storage_file_path =
+       shader_storage_shareable_root / fmt::format("{:08X}.xsh", title_id);
+@@ -591,6 +604,13 @@
+     pipeline_storage_file_ = nullptr;
+     return;
+   }
++  // Apple libc positions an "a+" stream at END of file on open (POSIX leaves
++  // the initial read position unspecified; glibc gives the start, Apple gives
++  // the end), so the header fread below returns 0 bytes and the storage is
++  // truncated and rebuilt on every single launch -- nothing is ever pre-warmed.
++  // Writes in "a+" mode always append regardless of the read position, so
++  // rewinding here is safe on every platform.
++  rex::filesystem::Seek(shader_storage_file_, 0, SEEK_SET);
+   ++shader_storage_index_;
+   shader_storage_file_flush_needed_ = false;
+   struct {
+@@ -612,6 +632,7 @@
+     // Load shaders written by previous runs until the end of the file or until
+     // a corrupted one is detected.
+     ShaderStoredHeader shader_header;
++    size_t shader_storage_loaded_count = 0;
+     std::vector<uint32_t> ucode_dwords;
+     ucode_dwords.reserve(0xFFFF);
+     while (true) {
+@@ -638,14 +659,20 @@
+       }
+       // Loaded from the current storage - don't write again.
+       shader->set_ucode_storage_index(shader_storage_index_);
++      ++shader_storage_loaded_count;
+     }
+     rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
++    REXGPU_INFO("VulkanPipelineCache: guest shader storage loaded {} shaders ({} bytes valid)",
++                shader_storage_loaded_count, shader_storage_valid_bytes);
+   } else {
+     rex::filesystem::TruncateStdioFile(shader_storage_file_, 0);
+     shader_storage_file_header.magic = shader_storage_magic;
+     shader_storage_file_header.version_swapped = rex::byte_swap(shader_storage_version);
+     fwrite(&shader_storage_file_header, sizeof(shader_storage_file_header), 1,
+            shader_storage_file_);
++    REXGPU_INFO(
++        "VulkanPipelineCache: guest shader storage header absent or invalidated -- 0 shaders "
++        "loaded, starting a fresh store");
+   }
+ 
+   // Translate shader modifications needed for stored pipelines.

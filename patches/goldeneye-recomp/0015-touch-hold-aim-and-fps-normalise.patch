@@ -1,0 +1,152 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -26,7 +26,15 @@
+ #include <rex/system/xmemory.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/thread.h>  // rex::thread::Sleep -- frame-wait backoff
++#include <rex/platform.h>
++#if REX_PLATFORM_IOS
++#include <rex/ui/touch_controls.h>  // hold-to-aim reads the overlay's pad state
++#endif
+ 
++// Injected pad pulse (rexglue overlay, patches/rexglue/0063): hold-to-aim uses
++// it to press the left trigger a second time on release.
++extern "C" void GeInjectPadPulse(uint16_t mask, uint8_t rt, uint8_t lt, uint32_t hold_ms);
++
+ // Backing off this spin is the single change M-049 identified as highest
+ // leverage; exposed as a cvar so its effect is measured rather than asserted.
+ REXCVAR_DEFINE_INT32(
+@@ -1775,6 +1783,24 @@
+ REXCVAR_DEFINE_BOOL(ge_mouselook_enable, true, "Input",
+                     "Mouse look (works alongside the controller; captures the cursor in-game)");
+ 
++// the user: "the AIM touch control button should stop aiming when you release or
++// let go." The game treats the left trigger as a TOGGLE of aim mode, which is
++// right for a real controller (you tap once and keep both thumbs free) and
++// wrong for a touch button you press-and-drag: lifting the finger left the red
++// crosshair up until you tapped the button a second time. With this on, the
++// release of the on-screen AIM button injects a second left-trigger press, so
++// the game's own toggle handler exits aim mode and runs its own exit path --
++// nothing here writes the aim-mode field behind the game's back.
++// Touch only: a physical controller keeps the toggle it has always had.
++REXCVAR_DEFINE_BOOL(ge_touch_hold_aim, true, "Input",
++                    "On-screen AIM button is hold-to-aim: releasing it leaves aim mode "
++                    "(touch controls only; a real controller keeps the toggle)");
++REXCVAR_DEFINE_INT32(
++    ge_hold_aim_test_lt, -1, "Input",
++    "TEST: stand in for the on-screen AIM button's deflection (0-255) on a build with no "
++    "touch overlay, so hold-to-aim can be exercised from the macOS bench. -1 = off.")
++    .range(-1, 255);
++
+ namespace {
+ std::atomic<int> g_mouse_dx{0};
+ std::atomic<int> g_mouse_dy{0};
+@@ -2163,7 +2189,75 @@
+   if (game_control_disabled) return;
+ 
+   const uint32_t aim_mode = LD32(base, player + GE_OFF_AIM_MODE);
++
++  // Hold-to-aim for the on-screen AIM button (see ge_touch_hold_aim above).
++  //
++  // Bench finding (M-102): with this profile's settings bean's left trigger is
++  // already HOLD-to-aim -- a 150 ms injected LT gave aim_mode 0->1->0 150 ms
++  // apart, a 2500 ms one gave 0->1 ... 1->0 2500 ms apart. the user's device
++  // shows toggle behaviour instead, so the semantics are not fixed (a game
++  // option, or a stuck trigger). This handles both without ever re-entering
++  // aim: on the AIM button's release edge, watch for a few frames; if the game
++  // exited by itself (hold semantics) do nothing at all, and only if aim mode
++  // is STILL on -- with the button still up -- press the trigger once, which is
++  // what exits under toggle semantics. The game runs its own exit path either
++  // way; nothing here writes the aim-mode field behind its back.
++  //
++  // The LT reading comes from the touch overlay's own published pad state, not
++  // from the merged guest pad: the exit press we inject flows through the merge
++  // point, and reading it back there would re-trigger this on the next frame.
++  if (REXCVAR_GET(ge_touch_hold_aim)) {
++    static uint8_t prev_touch_lt = 0;
++    static int exit_watch_frames = 0;   // >0 while waiting to see if it self-exits
++    static int exit_cooldown_frames = 0;
++    bool eligible = false;
++    uint8_t touch_lt = 0;
++#if REX_PLATFORM_IOS
++    if (rex::ui::TouchControlsActive()) {
++      eligible = true;
++      touch_lt = rex::ui::GetTouchPadState().left_trigger;
++    }
++#endif
++    const int32_t test_lt = REXCVAR_GET(ge_hold_aim_test_lt);
++    if (!eligible && test_lt >= 0) {
++      eligible = true;
++      touch_lt = uint8_t(test_lt);
++    }
++    if (eligible) {
++      if (exit_cooldown_frames > 0) --exit_cooldown_frames;
++      // Same threshold the overlay presses with (0 or 255); half-scale is a
++      // safe edge for anything in between.
++      const bool was_down = prev_touch_lt >= 128, is_down = touch_lt >= 128;
++      if (was_down && !is_down) {
++        exit_watch_frames = (aim_mode == 1 && exit_cooldown_frames == 0) ? 4 : 0;
++      } else if (!was_down && is_down) {
++        exit_watch_frames = 0;  // pressed again; nothing to clean up
++      }
++      if (exit_watch_frames > 0) {
++        if (aim_mode == 0 || is_down) {
++          exit_watch_frames = 0;  // exited on its own (hold semantics) -- done
++        } else if (--exit_watch_frames == 0) {
++          // Still aiming several frames after the finger came up: toggle
++          // semantics. One trigger press is the game's own way out.
++          GeInjectPadPulse(0, 0, 255, 100);
++          exit_cooldown_frames = 60;  // never chase our own injected press
++          REXLOG_INFO(
++              "GEAIM hold-to-aim: AIM released but aim_mode still 1 -> pressing LT to exit");
++        }
++      }
++      prev_touch_lt = touch_lt;
++    } else {
++      prev_touch_lt = 0;
++      exit_watch_frames = 0;
++    }
++  }
++
+   if (aim_mode != prev_aim_mode) {
++    if (REXCVAR_GET(ge_touch_hold_aim)) {
++      // One line per transition -- naturally rate-limited (aim mode changes at
++      // human speed), and the only way to see hold-to-aim working from a log.
++      REXLOG_INFO("GEAIM aim_mode {} -> {}", prev_aim_mode, aim_mode);
++    }
+     if (aim_mode != 0) {  // entering aim mode -> reset gun position
+       STF32(base, player + GE_OFF_GUN_X, 0.f);
+       STF32(base, player + GE_OFF_GUN_Y, 0.f);
+--- a/src/ge_app.h
++++ b/src/ge_app.h
+@@ -37,6 +37,7 @@
+ // "Save & Restart" so username/server/enable changes take effect on a clean
+ // boot -- they are read at startup (UserProfile ctor, online client start).
+ REXCVAR_DECLARE(bool, postfx_enabled);
++REXCVAR_DECLARE(int32_t, max_fps);  // defined in the SDK's graphics_system.cpp
+ 
+ namespace ge {
+ void LaunchSelfDetached();
+@@ -139,6 +140,22 @@
+ #if REX_PLATFORM_IOS
+     // Feed the on-screen frame-rate readout (show_fps) the guest's own counters.
+     rex::ui::SetGuestFrameCounters(&ge::GetGpuSwapHudCounters);
++
++    // Frame-rate cap normalisation. This runs AFTER ge.toml is applied (the
++    // OnConfigurePaths default above runs before it), which is the only place
++    // it can work. bean is a 60 Hz title and the display-linked pacer divides
++    // the 120 Hz panel down to 60, so "120" and "Off" are just 60 with a
++    // misleading label -- and the settings page now offers only 60 and 30, so
++    // a stored 0/120 would leave that row with no segment selected. Fold them
++    // into 60 once, at boot.
++    {
++      const int32_t cap = REXCVAR_GET(max_fps);
++      if (cap == 0 || cap > 60) {
++        REXLOG_INFO("max_fps {} normalised to 60 (bean is a 60 Hz title; the pacer divides "
++                    "the panel down to 60 either way)", cap);
++        rex::cvar::SetFlagByName("max_fps", "60");
++      }
++    }
+ #endif
+ 
+ #if REX_CONSOLE_BRIDGE

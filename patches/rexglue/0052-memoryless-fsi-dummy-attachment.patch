@@ -1,0 +1,72 @@
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -915,6 +915,57 @@
+     fsi_extent.height = std::min(2048u * draw_resolution_scale_y(),
+                                  std::min(device_properties.maxFramebufferHeight,
+                                           device_properties.maxImageDimension2D));
++    // Prefer lazily-allocated backing for the dummy attachments: they are
++    // transient and never loaded or stored, so with a lazy memory type they
++    // occupy no DRAM at all (MoltenVK makes them MTLStorageModeMemoryless) --
++    // which is also what the device energy A/B must be measuring (D-015).
++    // Falls back to a plain device-local dedicated allocation elsewhere.
++    auto create_fsi_dummy_image = [&](const VkImageCreateInfo& image_create_info,
++                                      VkImage& image_out, VkDeviceMemory& memory_out) -> bool {
++      VkImage image;
++      if (dfn.vkCreateImage(device, &image_create_info, nullptr, &image) != VK_SUCCESS) {
++        return false;
++      }
++      VkMemoryRequirements memory_requirements;
++      dfn.vkGetImageMemoryRequirements(device, image, &memory_requirements);
++      VkPhysicalDeviceMemoryProperties memory_properties;
++      ifn.vkGetPhysicalDeviceMemoryProperties(physical_device, &memory_properties);
++      uint32_t lazy_memory_type = UINT32_MAX;
++      for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
++        if ((memory_requirements.memoryTypeBits & (uint32_t(1) << i)) &&
++            (memory_properties.memoryTypes[i].propertyFlags &
++             VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT)) {
++          lazy_memory_type = i;
++          break;
++        }
++      }
++      if (lazy_memory_type != UINT32_MAX) {
++        VkMemoryAllocateInfo memory_allocate_info;
++        memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++        memory_allocate_info.pNext = nullptr;
++        memory_allocate_info.allocationSize = memory_requirements.size;
++        memory_allocate_info.memoryTypeIndex = lazy_memory_type;
++        VkDeviceMemory memory = VK_NULL_HANDLE;
++        if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory) == VK_SUCCESS) {
++          if (dfn.vkBindImageMemory(device, image, memory, 0) == VK_SUCCESS) {
++            REXGPU_INFO("VulkanRenderTargetCache: {}x FSI dummy attachment is memoryless",
++                        uint32_t(image_create_info.samples));
++            image_out = image;
++            memory_out = memory;
++            return true;
++          }
++          dfn.vkFreeMemory(device, memory, nullptr);
++        }
++      }
++      dfn.vkDestroyImage(device, image, nullptr);
++      REXGPU_INFO(
++          "VulkanRenderTargetCache: {}x FSI dummy attachment is device-local "
++          "(no lazily-allocated memory type)",
++          uint32_t(image_create_info.samples));
++      return ui::vulkan::util::CreateDedicatedAllocationImage(
++          vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
++          image_out, memory_out);
++    };
+     for (uint32_t slot = 0; slot < 3; ++slot) {
+       if (slot == 1 && !msaa_2x_no_attachments_supported_) {
+         // Guest 2x uses the 4x slot, matching the pipeline sample fallback.
+@@ -939,9 +990,8 @@
+           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+       dummy_image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+       dummy_image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+-      if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+-              vulkan_device, dummy_image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+-              pass_slot.dummy_image, pass_slot.dummy_image_memory)) {
++      if (!create_fsi_dummy_image(dummy_image_create_info, pass_slot.dummy_image,
++                                  pass_slot.dummy_image_memory)) {
+         REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the {}x FSI dummy attachment",
+                      uint32_t(slot_samples));
+         Shutdown();

@@ -1,0 +1,63 @@
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -29,9 +29,21 @@
+                     "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
+                     "required for Vulkan GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, true, "UI/Vulkan",
++// No Metal GPU implements geometry shaders, so MoltenVK never reports
++// geometryShader on any Apple platform. Leaving the requirement on would reject
++// every physical device before the backend is even built -- the Vulkan path
++// would be unusable on macOS, iOS and visionOS alike. The fallback primitive
++// emulation this cvar guards is exactly what those platforms need, so default
++// it off there and leave desktop drivers, which do have the feature, unchanged.
++#if REX_PLATFORM_MAC
++inline constexpr bool kRequireGeometryShaderDefault = false;
++#else
++inline constexpr bool kRequireGeometryShaderDefault = true;
++#endif
++REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, kRequireGeometryShaderDefault, "UI/Vulkan",
+                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
+-                    "fallback primitive emulation paths)")
++                    "fallback primitive emulation paths). Defaults off on Apple platforms, where "
++                    "Metal has no geometry shader stage.")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DEFINE_BOOL(vulkan_claim_geometry_shader, false, "Vulkan",
+                     "Report geometryShader as supported to the GPU emulation even when the driver "
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <cstring>
+ #include <utility>
+ #include <vector>
+@@ -152,7 +153,25 @@
+     }
+     buffer_memory_.push_back(buffer_memory);
+     if (dfn.vkBindBufferMemory(device, buffer_, buffer_memory, 0) != VK_SUCCESS) {
+-      REXGPU_ERROR("Shared memory: Failed to bind memory to the Vulkan buffer");
++      // The guest's whole 512 MB of physical memory is emulated as one GPU
++      // buffer, so a driver whose maximum buffer size is smaller than that can
++      // never satisfy this bind. On Metal that ceiling is MTLDevice's
++      // maxBufferLength, which MoltenVK reports through maxStorageBufferRange.
++      // Say so plainly rather than leaving a bare "bind failed": it is the
++      // difference between a one-line diagnosis and a bring-up hunt.
++      const uint32_t max_range = vulkan_device->properties().maxStorageBufferRange;
++      REXGPU_ERROR(
++          "Shared memory: Failed to bind memory to the Vulkan buffer "
++          "(need {} MB; this device's maximum storage buffer range is {} MB)",
++          kBufferSize >> 20, max_range >> 20);
++      // Duplicated to stderr on purpose: this failure aborts the process from
++      // the GPU worker a moment later, and the log sink does not reliably flush
++      // in between -- the first time this was hit the explanation was lost and
++      // only the driver's own validation message survived.
++      std::fprintf(stderr,
++                   "[gpu] shared memory needs a %u MB buffer; this device's maximum is %u MB\n",
++                   kBufferSize >> 20, max_range >> 20);
++      std::fflush(stderr);
+       Shutdown();
+       return false;
+     }

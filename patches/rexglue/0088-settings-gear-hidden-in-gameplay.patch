@@ -1,0 +1,62 @@
+--- a/src/ui/touch_overlay_uikit.mm
++++ b/src/ui/touch_overlay_uikit.mm
+@@ -25,6 +25,7 @@
+ 
+ #import <GameController/GameController.h>
+ #import <UIKit/UIKit.h>
++#import <QuartzCore/QuartzCore.h>  // CACurrentMediaTime (gear hide hysteresis)
+ 
+ #include <cmath>
+ #include <string>
+@@ -244,6 +245,9 @@
+   // the editor; centreForButton consults this before the defaults table.
+   NSMutableDictionary<NSString*, NSValue*>* _savedUnit;
+   BOOL _editing;
++  // Host time the guest last became "in gameplay" (0 = not playing). Drives
++  // the settings gear's hide delay; see the tick.
++  CFTimeInterval _gameplaySince;
+   NSString* _dragLabel;
+   CGSize _dragOffset;
+   UIView* _editBar;
+@@ -777,18 +781,30 @@
+     return;
+   }
+ 
+-  // The gear is ALWAYS visible (except while the layout editor owns the
+-  // screen). The menu-only rule shipped in .53 hid it EVERYWHERE: its
+-  // predicate (solo-fullscreen flag 3 + unpaused) turned out to be true in
+-  // the front-end too -- 0x8272B424 means "not split-screen", the player
+-  // structs are statically allocated, and neither pause flag, the watch
+-  // flag, control-disabled, nor the viewport field differs between the
+-  // dossier menus and live play (all bench-peeked, 2026-08-08). Until the
+-  // real front-end/mission state is found by static analysis, reachability
+-  // wins: at top-LEFT the gear overlaps nothing (buttons right, stick
+-  // lower-left), so the mis-tap hazard that motivated hiding is gone.
++  // The gear hides while the player is actually playing and is shown
++  // everywhere else -- intro/attract, the menus, briefing, the watch/pause
++  // screen, level complete. GeInGameplay is the guest-side predicate (see
++  // ge_hooks.cpp: boss stage != title, plus pause/watch/control-disabled);
++  // the .53 rule failed because its predicate was true in the front-end too,
++  // and the gear vanished for good. Every failure mode here reports "not
++  // gameplay" and SHOWS the gear: symbol missing, guest not booted, guest
++  // wedged, onboarding still up. The gear is the only route to Settings.
++  //
++  // Hysteresis one way only: showing is immediate, hiding waits for 400 ms of
++  // continuous gameplay so a quick pause/unpause cannot flicker it.
+   if (g_settings_gear) {
+-    const BOOL hide = _editing;
++    using InGameplayFn = int (*)(void);
++    static InGameplayFn in_gameplay =
++        reinterpret_cast<InGameplayFn>(dlsym(RTLD_DEFAULT, "GeInGameplay"));
++    const BOOL playing = (in_gameplay && in_gameplay() != 0) ? YES : NO;
++    if (!playing) {
++      _gameplaySince = 0.0;
++    } else if (_gameplaySince == 0.0) {
++      _gameplaySince = CACurrentMediaTime();
++    }
++    const BOOL settled =
++        playing && (CACurrentMediaTime() - _gameplaySince) >= 0.4;
++    const BOOL hide = _editing || settled;
+     if (g_settings_gear.hidden != hide) g_settings_gear.hidden = hide;
+   }
+ 

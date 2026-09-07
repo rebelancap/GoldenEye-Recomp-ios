@@ -1,0 +1,92 @@
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -1290,6 +1290,15 @@
+ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
+                                                     uint32_t count) {
+   uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
++  // DIAGNOSTIC (GoldenEye-Recomp-ios overlay): is the CP writing completion
++  // values back to guest memory at all? M-023.
++  {
++    static std::atomic<uint64_t> n{0};
++    const uint64_t i = n.fetch_add(1) + 1;
++    if (i <= 8 || (i % 500) == 0) {
++      REXGPU_INFO("CPDIAG MEM_WRITE #{} addr={:08X} count={}", i, write_addr, count);
++    }
++  }
+   for (uint32_t i = 0; i < count - 1; i++) {
+     uint32_t write_data = reader->ReadAndSwap<uint32_t>();
+ 
+@@ -1369,8 +1378,17 @@
+   return true;
+ }
+ 
++// DIAGNOSTIC (GoldenEye-Recomp-ios overlay): EVENT_WRITE family counters, M-023.
++static std::atomic<uint64_t> g_cpdiag_event_write{0};
++static std::atomic<uint64_t> g_cpdiag_event_write_shd{0};
++static std::atomic<uint64_t> g_cpdiag_event_write_ext{0};
++
+ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader, uint32_t packet,
+                                                       uint32_t count) {
++  {
++    const uint64_t i = g_cpdiag_event_write.fetch_add(1) + 1;
++    if (i <= 8 || (i % 500) == 0) REXGPU_INFO("CPDIAG EVENT_WRITE #{}", i);
++  }
+   // generate an event that creates a write to memory when completed
+   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+   // Writeback initiator.
+@@ -1387,6 +1405,10 @@
+ 
+ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* reader,
+                                                           uint32_t packet, uint32_t count) {
++  {
++    const uint64_t i = g_cpdiag_event_write_shd.fetch_add(1) + 1;
++    if (i <= 8 || (i % 500) == 0) REXGPU_INFO("CPDIAG EVENT_WRITE_SHD #{}", i);
++  }
+   // generate a VS|PS_done event
+   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+   uint32_t address = reader->ReadAndSwap<uint32_t>();
+@@ -1406,12 +1428,19 @@
+   address &= ~0x3;
+   data_value = GpuSwap(data_value, endianness);
+   memory::store(memory_->TranslatePhysical(address), data_value);
++  REXGPU_INFO("CPDIAG EVENT_WRITE_SHD addr={:08X} host={} value={:08X} (initiator={:08X})", address,
++              static_cast<void*>(memory_->TranslatePhysical<uint8_t*>(address)), data_value,
++              initiator);
+   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
+   return true;
+ }
+ 
+ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* reader,
+                                                           uint32_t packet, uint32_t count) {
++  {
++    const uint64_t i = g_cpdiag_event_write_ext.fetch_add(1) + 1;
++    if (i <= 8 || (i % 500) == 0) REXGPU_INFO("CPDIAG EVENT_WRITE_EXT #{}", i);
++  }
+   // generate a screen extent event
+   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+   uint32_t address = reader->ReadAndSwap<uint32_t>();
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -179,6 +179,22 @@
+             "vsync_interval_ticks={} host_tick_frequency={}",
+             refresh_rate_hz, guest_tick_frequency, vsync_interval_ticks,
+             chrono::Clock::host_tick_frequency_platform());
++        // DIAGNOSTIC: measure the guest timebase the recompiled code actually
++        // sees (mftb -> REX_QUERY_TIMEBASE -> QueryGuestTickCount). It should
++        // advance at guest_tick_frequency; anything else and every guest
++        // deadline is wrong.
++        {
++          const uint64_t t0 = chrono::Clock::QueryGuestTickCount();
++          const auto h0 = std::chrono::steady_clock::now();
++          std::this_thread::sleep_for(std::chrono::milliseconds(200));
++          const uint64_t t1 = chrono::Clock::QueryGuestTickCount();
++          const auto h1 = std::chrono::steady_clock::now();
++          const double host_s =
++              std::chrono::duration<double>(h1 - h0).count();
++          REXGPU_INFO("guest timebase measured: {:.3f} MHz over {:.3f} s (expected {:.3f} MHz)",
++                      (double(t1 - t0) / host_s) / 1e6, host_s,
++                      double(guest_tick_frequency) / 1e6);
++        }
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+         while (vsync_worker_running_) {
+           // Live anti-aliasing: re-apply swap_post_effect each tick so the menu

@@ -1,0 +1,29 @@
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -10,6 +10,7 @@
+     keybinds.cpp
+     menu_item.cpp
+     presenter.cpp
++    screen_capture.cpp
+     renderdoc_api.cpp
+     window.cpp
+     windowed_app.cpp
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/filesystem.h>
+ #include <rex/logging/sink.h>
+ #include <rex/logging.h>
++#include <rex/ui/screen_capture.h>
+ #include <rex/ui/overlay/console_overlay.h>
+ #include <rex/ui/overlay/debug_overlay.h>
+ #include <rex/ui/overlay/settings_overlay.h>
+@@ -427,6 +428,8 @@
+   auto* graphics_system = static_cast<rex::graphics::GraphicsSystem*>(config_.graphics.get());
+   if (graphics_system && graphics_system->presenter()) {
+     auto* presenter = graphics_system->presenter();
++    // In-engine PNG capture (cvar-driven; no-op unless capture_dir is set).
++    rex::ui::StartCaptureService(presenter);
+     auto* provider = graphics_system->provider();
+     if (provider) {
+       immediate_drawer_ = provider->CreateImmediateDrawer();

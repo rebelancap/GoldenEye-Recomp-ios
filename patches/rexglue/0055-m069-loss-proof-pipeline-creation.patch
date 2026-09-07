@@ -1,0 +1,135 @@
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <memory>
+@@ -21,6 +22,11 @@
+ #include <utility>
+ #include <vector>
+ 
++#if defined(__APPLE__)
++#include <pthread.h>
++#include <pthread/qos.h>
++#endif
++
+ #include <fmt/format.h>
+ 
+ #include <rex/assert.h>
+@@ -63,6 +69,18 @@
+ // Real (non-placeholder) Vulkan graphics pipelines compiled this session; see
+ // the comment at the increment site and docs/pacing.md.
+ static std::atomic<uint64_t> g_pipelines_created{0};
++
++// M-069: pipeline creation threads must not be starveable. They are spawned
++// with no explicit priority, which on iOS means an unspecified QoS the
++// scheduler may park on E-cores behind everything else -- during exactly the
++// compile storms they exist to absorb, while EndSubmission (and through it
++// presentation) waits on their completions. Profiled on device as the
++// hard-freeze face of M-069.
++static void ElevateCreationThreadQoS() {
++#if defined(__APPLE__)
++  pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
++#endif
++}
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+@@ -684,8 +702,13 @@
+       std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads;
+       creation_threads.reserve(creation_thread_count);
+       for (size_t i = 0; i < creation_thread_count; ++i) {
++        // Elevate QoS only on the spawned threads, never on the caller (which
++        // may be the GPU worker in the blocking-init path).
+         std::unique_ptr<rex::thread::Thread> creation_thread =
+-            rex::thread::Thread::Create({}, creation_worker);
++            rex::thread::Thread::Create({}, [&creation_worker]() {
++              ElevateCreationThreadQoS();
++              creation_worker();
++            });
+         assert_not_null(creation_thread);
+         creation_thread->set_name("Vulkan Pipelines");
+         creation_threads.push_back(std::move(creation_thread));
+@@ -799,7 +822,46 @@
+       }
+       if (await_creation_completion_event) {
+         creation_request_cond_.notify_one();
+-        rex::thread::Wait(creation_completion_event_.get(), false);
++        // M-069: this wait must be bounded. It used to be infinite, and a
++        // starved or wedged creation thread parked the GPU worker here forever
++        // -- presentation lives on this thread, so that is the device
++        // hard-freeze. Proceeding without the completion is safe for the
++        // Vulkan backend: placeholder draws are skipped at record time (never
++        // bound), completed real pipelines are never destroyed mid-flight, and
++        // the IssueSwap guard bounds the visuals. So: wait in slices, name the
++        // stall loudly, and give up after 3 s rather than dying quietly.
++        uint64_t waited_ms = 0;
++        while (rex::thread::Wait(creation_completion_event_.get(), false,
++                                 std::chrono::milliseconds(250)) ==
++               rex::thread::WaitResult::kTimeout) {
++          waited_ms += 250;
++          size_t stalled_busy, stalled_queued;
++          {
++            std::lock_guard<std::mutex> lock(creation_request_lock_);
++            stalled_busy = creation_threads_busy_;
++            stalled_queued = creation_queue_.size();
++          }
++          if (stalled_busy == 0 && stalled_queued == 0) {
++            // Work is done but the completion event never arrived -- the lost
++            // completion itself, caught in the act.
++            REXGPU_WARN(
++                "M-069: pipeline creation completion event lost; recovered after {} ms",
++                waited_ms);
++            break;
++          }
++          if (waited_ms == 1000) {
++            REXGPU_WARN(
++                "M-069: async pipeline creation still running after {} ms ({} busy, {} queued)",
++                waited_ms, stalled_busy, stalled_queued);
++          }
++          if (waited_ms >= 3000) {
++            REXGPU_WARN(
++                "M-069: abandoning pipeline creation wait after {} ms ({} busy, {} queued) -- "
++                "continuing without it (expect the IssueSwap placeholder guard to cover visuals)",
++                waited_ms, stalled_busy, stalled_queued);
++            break;
++          }
++        }
+       }
+     }
+   }
+@@ -3510,8 +3572,22 @@
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   VkPipeline pipeline;
++  // M-069: time every creation. A wedged MoltenVK/MTLCompiler call shows as a
++  // "Creating graphics pipeline state" line with no completion after it; a
++  // merely slow one gets its duration named here instead of being argued about.
++  std::chrono::steady_clock::time_point creation_start = std::chrono::steady_clock::now();
+   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                          &pipeline_create_info, nullptr, &pipeline);
++  uint64_t creation_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                      std::chrono::steady_clock::now() - creation_start)
++                                      .count());
++  if (creation_ms >= 250) {
++    REXGPU_WARN("M-069: vkCreateGraphicsPipelines took {} ms (VS {:016X}, PS {:016X})", creation_ms,
++                creation_arguments.vertex_shader->shader().ucode_data_hash(),
++                creation_arguments.pixel_shader
++                    ? creation_arguments.pixel_shader->shader().ucode_data_hash()
++                    : 0);
++  }
+   if (create_result != VK_SUCCESS) {
+     uint64_t ps_hash = creation_arguments.pixel_shader
+                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+@@ -3556,6 +3632,7 @@
+ }
+ 
+ void VulkanPipelineCache::CreationThread(size_t thread_index) {
++  ElevateCreationThreadQoS();
+   while (true) {
+     PipelineCreationArguments creation_arguments;
+     {

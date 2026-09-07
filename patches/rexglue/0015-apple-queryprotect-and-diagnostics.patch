@@ -1,0 +1,126 @@
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -27,6 +27,7 @@
+ #include <rex/string.h>
+ 
+ #if defined(__APPLE__)
++#include <mach/mach.h>  // vm_region_64, mach_task_self -- see QueryProtect
+ // Darwin is large-file-native: off_t is already 64-bit and the glibc *64
+ // aliases do not exist.
+ #define off64_t off_t
+@@ -369,9 +370,53 @@
+ }
+ 
+ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+-#if !REX_PLATFORM_LINUX
++#if defined(__APPLE__)
++  // Darwin has no /proc/self/maps; ask the Mach VM directly.
++  //
++  // This is not cosmetic. MMIOHandler::ExceptionCallback uses QueryProtect to
++  // decide whether another thread has already cleared the write-watch it just
++  // faulted on. Returning "false, kNoAccess" unconditionally (the old non-Linux
++  // path) makes that check always say "still protected", so every racing fault
++  // re-enters the access-violation callback instead of aborting early.
+   access_out = PageAccess::kNoAccess;
+   length = 0;
++
++  vm_address_t region_address = vm_address_t(base_address);
++  vm_size_t region_size = 0;
++  vm_region_basic_info_data_64_t info{};
++  mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
++  mach_port_t object_name = MACH_PORT_NULL;
++  const kern_return_t kr =
++      vm_region_64(mach_task_self(), &region_address, &region_size, VM_REGION_BASIC_INFO_64,
++                   reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
++  if (object_name != MACH_PORT_NULL) {
++    mach_port_deallocate(mach_task_self(), object_name);
++  }
++  if (kr != KERN_SUCCESS) {
++    return false;
++  }
++  // vm_region_64 returns the first region at or AFTER the address; if it starts
++  // past us, base_address is unmapped.
++  const uintptr_t addr = reinterpret_cast<uintptr_t>(base_address);
++  if (uintptr_t(region_address) > addr) {
++    return false;
++  }
++  length = size_t(uintptr_t(region_address) + size_t(region_size) - addr);
++
++  const bool r = (info.protection & VM_PROT_READ) != 0;
++  const bool w = (info.protection & VM_PROT_WRITE) != 0;
++  const bool x = (info.protection & VM_PROT_EXECUTE) != 0;
++  if (!r && !w && !x) {
++    access_out = PageAccess::kNoAccess;
++  } else if (x) {
++    access_out = w ? PageAccess::kExecuteReadWrite : PageAccess::kExecuteReadOnly;
++  } else {
++    access_out = w ? PageAccess::kReadWrite : PageAccess::kReadOnly;
++  }
++  return true;
++#elif !REX_PLATFORM_LINUX
++  access_out = PageAccess::kNoAccess;
++  length = 0;
+   return false;
+ #else
+   access_out = PageAccess::kNoAccess;
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -170,6 +170,15 @@
+         uint64_t vsync_interval_ticks =
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
++        // DIAGNOSTIC (GoldenEye-Recomp-ios overlay): the vblank rate is the
++        // game's clock, and over-driving it is documented below as freezing the
++        // guest. Report the inputs once so a wrong tick frequency or refresh
++        // rate is visible immediately.
++        REXGPU_INFO(
++            "vsync worker: refresh_rate={} Hz guest_tick_frequency={} "
++            "vsync_interval_ticks={} host_tick_frequency={}",
++            refresh_rate_hz, guest_tick_frequency, vsync_interval_ticks,
++            chrono::Clock::host_tick_frequency_platform());
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+         while (vsync_worker_running_) {
+           // Live anti-aliasing: re-apply swap_post_effect each tick so the menu
+@@ -340,6 +349,17 @@
+ }
+ 
+ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
++  // DIAGNOSTIC (GoldenEye-Recomp-ios overlay): first-frame bring-up. Report the
++  // first few interrupt dispatches and then every 600th, so we can see whether
++  // the GPU->guest notification path is alive at all without flooding the log.
++  {
++    static std::atomic<uint64_t> dispatch_count{0};
++    const uint64_t n = dispatch_count.fetch_add(1) + 1;
++    if (n <= 3 || (n % 600) == 0) {
++      REXGPU_INFO("DispatchInterruptCallback #{} source={} cpu={} callback={:08X}", n, source, cpu,
++                  interrupt_callback_);
++    }
++  }
+   if (!interrupt_callback_) {
+     return;
+   }
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -425,6 +425,9 @@
+ u32 VdRetrainEDRAM_entry(u32 unk0, u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 unk5) {
+   return 0;
+ }
++
++// DIAGNOSTIC (GoldenEye-Recomp-ios overlay): does the guest ever ask to present?
++static std::atomic<uint64_t> g_vdswap_count{0};
+ 
+ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+                   mapped_void fetch_ptr,       // frontbuffer Direct3D 9 texture header fetch
+@@ -434,6 +437,12 @@
+                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
+                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
+                   mapped_u32 height) {
++  {
++    const uint64_t n = g_vdswap_count.fetch_add(1) + 1;
++    if (n <= 3 || (n % 600) == 0) {
++      REXLOG_INFO("VdSwap #{}", n);
++    }
++  }
+   // All of these parameters are REQUIRED.
+   assert(buffer_ptr);
+   assert(fetch_ptr);

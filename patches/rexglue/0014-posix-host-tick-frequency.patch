@@ -1,0 +1,32 @@
+--- a/src/core/clock_posix.cpp
++++ b/src/core/clock_posix.cpp
+@@ -17,13 +17,22 @@
+ namespace rex::chrono {
+ 
+ uint64_t Clock::host_tick_frequency_platform() {
+-  timespec res;
+-  int error = clock_getres(CLOCK_MONOTONIC_RAW, &res);
+-  assert_zero(error);
+-  assert_zero(res.tv_sec);  // Sub second resolution is required.
+-
+-  // Convert nano seconds to hertz. Resolution is 1ns on most systems.
+-  return 1000000000ull / res.tv_nsec;
++  // host_tick_count_platform() below returns NANOSECONDS by construction
++  // (tv_nsec + tv_sec * 1e9), so the matching frequency is always 1 GHz.
++  //
++  // The previous implementation derived this from clock_getres(), which reports
++  // the timer's RESOLUTION, not the units of the counter. On Linux the two
++  // coincide -- CLOCK_MONOTONIC_RAW resolves to 1 ns, giving exactly 1e9 -- so
++  // the bug was invisible there. On Apple Silicon clock_getres() reports 42 ns
++  // (the 24 MHz mach timebase), yielding 23,809,523 Hz while the counter kept
++  // ticking in nanoseconds: the guest clock ran ~42x fast.
++  //
++  // Symptom that found it: the GPU vsync worker computed a correct 833,333-tick
++  // (16.67 ms) vblank interval from a correct 50 MHz guest timebase, then
++  // satisfied it on almost every 1 ms iteration -- flooding the guest vblank ISR
++  // at ~690 Hz instead of 60 Hz, which graphics_system.cpp itself warns "freezes
++  // the guest".
++  return 1000000000ull;
+ }
+ 
+ uint64_t Clock::host_tick_count_platform() {

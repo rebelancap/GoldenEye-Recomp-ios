@@ -1,0 +1,55 @@
+--- a/src/ui/settings_uikit.mm
++++ b/src/ui/settings_uikit.mm
+@@ -296,25 +296,27 @@
+   _owned = [NSMutableArray array];
+ 
+   // --- Display ---
++  // the user: "i don't want too many settings to confuse the user." Frame queue
++  // depth is gone from the page (the cvar stays, for the console); and the cap
++  // row keeps only the two values that differ in practice -- bean is a 60 Hz
++  // title and the display-linked pacer divides the 120 Hz panel down to 60, so
++  // 120 and Off are just 60 with a misleading label. ge_app normalises any
++  // stored 0/120 to 60 at boot so the row always has a segment selected.
+   [self addSection:@"Display"
+-            footer:@"Queue depth 1 gives the lowest input lag and resists the frame-rate "
+-                   @"collapses; 2 gives more CPU/GPU overlap."
++            footer:@"The game runs at 60. 30 halves the GPU work and heat for long sessions."
+               rows:@[
+                 [self switchRow:@"Show frame rate" cvar:@"show_fps"],
+                 [self switchRow:@"Detailed readout" cvar:@"show_perf_hud"],
+-                [self segmentedRow:@"Frame rate cap"
++                [self segmentedRow:@"Frame rate"
+                               cvar:@"max_fps"
+-                            labels:@[ @"30", @"60", @"120", @"Off" ]
+-                            values:@[ @"30", @"60", @"120", @"0" ]],
+-                [self segmentedRow:@"Frame queue depth"
+-                              cvar:@"vulkan_max_queued_frames"
+-                            labels:@[ @"1 (low latency)", @"2 (smooth)" ]
+-                            values:@[ @"1", @"2" ]],
++                            labels:@[ @"60", @"30 (saves battery)" ]
++                            values:@[ @"60", @"30" ]],
+               ]];
+ 
+   // --- Graphics ---
+-  RexSettingsRow* mip = [self switchRow:@"Distance texture filtering" cvar:@"texture_flat_lod"];
+-  mip.inverted = YES;  // the cvar names the workaround; the row names the feature
++  // The distance-filtering row is gone too (texture_flat_lod keeps its default
++  // and is still reachable from the console): it is a workaround switch, not a
++  // preference, and M-099 exonerated it as a performance lever.
+   // The remaster's signature feature as a stateful toggle (the user: "so the
+   // user knows what they are changing it to"). The switch holds the INTENT in
+   // ge_n64_graphics (persisted); flipping it presses the game's own RB
+@@ -347,13 +349,10 @@
+             footer:@"The graphics switch is instant and works mid-game -- the same flip the "
+                    @"controller's RB shortcut does. (Flipping with RB directly can leave "
+                    @"this switch out of step until it is toggled again.)\n"
+-                   @"Distance filtering is off by default: it sharpens distant surfaces but "
+-                   @"draws dark seams on character faces (a known bug, M-056).\n"
+                    @"Antialiasing off trades smooth edges for frame rate; it takes effect "
+                    @"the next time the app is launched."
+               rows:@[
+                 vtoggle,
+-                mip,
+                 aa,
+               ]];
+ 

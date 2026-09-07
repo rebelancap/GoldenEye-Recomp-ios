@@ -1,0 +1,41 @@
+--- a/src/ge_app.h
++++ b/src/ge_app.h
+@@ -52,6 +52,7 @@
+ // The guest's own submit/present counters, for the remote console. Implemented
+ // in ge_hooks.cpp, which owns the device-struct offsets.
+ void GetGpuSubmitPresentCounts(uint64_t* out_submitted, uint64_t* out_presented);
++void GetGpuSwapHudCounters(uint64_t* out_submitted, uint64_t* out_swaps);
+ // Per-frame phase accounting for the console (M-049 item 1).
+ void GetFramePhases(uint32_t* out_cycles, uint64_t* out_wait_us, uint64_t* out_between_us);
+ void GetDbgNowCalls(uint64_t* out_total, uint64_t* out_slept);
+@@ -137,7 +138,7 @@
+ 
+ #if REX_PLATFORM_IOS
+     // Feed the on-screen frame-rate readout (show_fps) the guest's own counters.
+-    rex::ui::SetGuestFrameCounters(&ge::GetGpuSubmitPresentCounts);
++    rex::ui::SetGuestFrameCounters(&ge::GetGpuSwapHudCounters);
+ #endif
+ 
+ #if REX_CONSOLE_BRIDGE
+@@ -147,6 +148,8 @@
+     rex::console::Start(8773, [this]() {
+       rex::console::BridgeStats out;
+       ge::GetGpuSubmitPresentCounts(&out.submitted, &out.presented);
++      uint64_t hud_submit = 0, hud_swaps = 0;
++      ge::GetGpuSwapHudCounters(&hud_submit, &hud_swaps);
+       ge::GetFramePhases(&out.wait_cycles, &out.wait_us, &out.between_us);
+       ge::GetDbgNowCalls(&out.dbgnow_calls, &out.dbgnow_sleeps);
+       // Frame rate is derived here from the guest's present counter rather than
+@@ -156,10 +159,10 @@
+       const auto now = std::chrono::steady_clock::now();
+       const double dt = std::chrono::duration<double>(now - console_stats_last_).count();
+       if (dt >= 0.25) {
+-        const uint64_t delta = out.presented - console_stats_last_presented_;
++        const uint64_t delta = hud_swaps - console_stats_last_presented_;
+         console_stats_fps_ = double(delta) / dt;
+         console_stats_last_ = now;
+-        console_stats_last_presented_ = out.presented;
++        console_stats_last_presented_ = hud_swaps;
+       }
+       out.fps = console_stats_fps_;
+       out.frame_time_ms = console_stats_fps_ > 0.0 ? 1000.0 / console_stats_fps_ : 0.0;

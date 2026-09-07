@@ -1,0 +1,41 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -1391,32 +1391,12 @@
+     // by repaints; it is the same source the honest fps reads.
+     guest_nearly_dead = s_heal_tick > 30u && (guest_frames - gf_30_ago) <= 2u;
+   }
+-  // The PROPHYLACTIC (M-094 endgame). The onset recording shows the freeze
+-  // begins as ONE lost +2 progress credit: the healthy menu runs progress at
+-  // target-4, rock-steady across a thousand ticks; the tick before the latch
+-  // it slips to target-6, and the next tick the marker sets and the cascade
+-  // of stale cursors begins. Every repair attempted after the latch -- pokes,
+-  // heals, the full coherent write-set -- buys at most two frames, because
+-  // parked-state surgery cannot match what the live pipeline would have
+-  // written. So catch the slip at the ONLY moment the state is still simple
+-  // and pay back the missing credit before anything latches. Fires only on
+-  // the exact 4 -> 6 transition, logs every occurrence.
+-  if (a1) {
+-    static uint32_t s_prev_offset = 0;
+-    uint32_t ph_pp = LD32(base, a1 + 10896);
+-    if (ph_pp && ph_pp < 0xFFFFFFFEu) {
+-      uint32_t ph_pr = LD32(base, ph_pp);
+-      uint32_t ph_tg = LD32(base, a1 + 10908);
+-      uint32_t off = ph_tg - ph_pr;
+-      if (off == 6u && s_prev_offset == 4u) {
+-        ST32(base, ph_pp, ph_pr + 2u);
+-        REXKRNL_INFO("GEHEAL onset-catch: progress {} -> {} (offset slipped 4 -> 6; +2 repaid)",
+-                     ph_pr, ph_pr + 2u);
+-        off = 4u;
+-      }
+-      s_prev_offset = off;
+-    }
+-  }
++  // The .58 "prophylactic" (onset-catch: repay a +2 credit on a 4 -> 6 offset
++  // slip) lived here and is REMOVED (M-096): the healthy offset is
++  // refresh-dependent -- 4 on the ~30 fps bench but 6 on the 60 fps device --
++  // so on device the guard fired 43 times in 5 seconds INTO A HEALTHY ledger
++  // and may have hastened the latch. No heuristic writer goes here again; the
++  // fix is at the source of the crediting race.
+   ++s_heal_tick;
+   // Freeze flight recorder (M-092). Every dissection so far has read the
+   // PARKED steady state; nobody has ever seen the moment of ENTRY -- which

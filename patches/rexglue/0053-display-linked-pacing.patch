@@ -1,0 +1,556 @@
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -28,10 +28,14 @@
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xthread.h>
++#include <rex/ui/display_pacer.h>
+ #include <rex/ui/graphics_provider.h>
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++#include <cmath>
++#include <dlfcn.h>
++
+ REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
+ 
+ REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
+@@ -59,6 +63,26 @@
+                      "Frame rate cap in Hz when vsync is off (0 = uncapped)")
+     .range(0, 1000);
+ 
++// Pacing (docs/pacing.md, GoldenEye-Recomp-ios overlay). "displaylink" makes
++// the emulated guest vblank a divided-down copy of the panel's real refresh
++// (even cadence, no beat frequency, no 1 ms poll jitter); "timer" is the
++// upstream wall-clock behaviour and the automatic fallback wherever no
++// display link exists. Hot-reload on purpose: the judder A/B flips this live
++// in one device session.
++REXCVAR_DEFINE_STRING(pace, "displaylink", "GPU",
++                      "Guest vblank clock source: displaylink (divided from the panel's real "
++                      "refresh; falls back to timer if none) or timer (wall clock)")
++    .allowed({"displaylink", "timer"})
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(pace_fps, 0, "GPU",
++                     "Display-linked vblank rate: 0 = auto governor (steps down the even "
++                     "ladder, e.g. 60/40/30 on a 120 Hz panel, when frames persistently miss; "
++                     "steps back up on sustained clean delivery), else pin a rate and the "
++                     "nearest whole panel division at or below it is used")
++    .range(0, 120)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace {
+ 
+ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+@@ -211,6 +235,19 @@
+                       double(guest_tick_frequency) / 1e6);
+         }
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        // Display-linked pacing state (docs/pacing.md). The auto governor's
++        // delivery signal is the Vulkan backend's monotonic swap counter,
++        // resolved by name so this generic file needs no backend dependency.
++        using SwapCadenceFn = void (*)(uint64_t*, uint32_t*, uint32_t*, uint32_t*);
++        SwapCadenceFn swap_cadence_fn =
++            reinterpret_cast<SwapCadenceFn>(dlsym(RTLD_DEFAULT, "RexGetSwapCadence"));
++        uint32_t governor_extra_division = 0;  // rungs below the base target
++        uint64_t governor_window_start_us = 0;
++        uint64_t governor_window_swaps = 0;
++        uint64_t governor_window_vblanks = 0;
++        uint64_t governor_clean_since_us = 0;
++        uint64_t link_vblanks_fired = 0;
++        uint32_t last_logged_divisor = 0;
+         while (vsync_worker_running_) {
+           // Live anti-aliasing: re-apply swap_post_effect each tick so the menu
+           // toggle takes effect without a restart. SetDesiredSwapPostEffect
+@@ -218,7 +255,118 @@
+           if (command_processor_) {
+             command_processor_->SetDesiredSwapPostEffect(
+                 ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
++          }
++
++          // Display-linked path: the guest vblank becomes a divided-down copy
++          // of the panel's real refresh. Same thread, same MarkVblank, same
++          // interrupt plumbing as the timer path -- only the alarm clock
++          // differs (the M-060 lesson stands).
++          bool link_fired = false;
++          bool link_available = false;
++          if (REXCVAR_GET(pace) == "displaylink") {
++            ui::DisplayPacer& pacer = ui::DisplayPacer::Instance();
++            double panel_hz = pacer.refresh_hz();
++            if (pacer.active() && panel_hz >= 20.0) {
++              link_available = true;
++              // Base target: the guest video mode rate, bounded by max_fps
++              // (the user's cap) and pace_fps (a pinned rung).
++              double target_hz = refresh_rate_hz;
++              int32_t fps_cap = REXCVAR_GET(max_fps);
++              if (!REXCVAR_GET(vsync) && fps_cap > 0) {
++                target_hz = std::min(target_hz, double(fps_cap));
++              }
++              int32_t pinned = REXCVAR_GET(pace_fps);
++              if (pinned > 0) {
++                target_hz = std::min(target_hz, double(pinned));
++              }
++              // Whole division of the panel at or below the target (the 0.05
++              // absorbs 59.94-style rates), plus the governor's rungs in auto.
++              uint32_t divisor =
++                  std::max(1u, uint32_t(std::ceil(panel_hz / target_hz - 0.05)));
++              if (pinned == 0) {
++                divisor += governor_extra_division;
++              }
++              // Never below ~20 Hz -- the guest gets unusable beneath that.
++              while (divisor > 1 && panel_hz / double(divisor) < 19.0) {
++                --divisor;
++              }
++              if (divisor != last_logged_divisor) {
++                REXGPU_INFO("pace: displaylink {}/{} -> {:.1f} Hz vblank", uint32_t(panel_hz),
++                            divisor, panel_hz / double(divisor));
++                last_logged_divisor = divisor;
++              }
++              if (pacer.WaitForSlots(divisor, std::chrono::milliseconds(250))) {
++                MarkVblank();
++                ++link_vblanks_fired;
++                link_fired = true;
++                // Auto governor: compare delivered swaps against fired
++                // vblanks over ~1 s windows. Persistent misses step down a
++                // rung quickly (judder now); sustained clean delivery steps
++                // back up lazily (a bounce is a visible cadence change).
++                if (pinned == 0 && swap_cadence_fn) {
++                  uint64_t now_us =
++                      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                                   std::chrono::steady_clock::now().time_since_epoch())
++                                   .count());
++                  uint64_t swaps_now = 0;
++                  uint32_t unused_p50, unused_p95, unused_max;
++                  swap_cadence_fn(&swaps_now, &unused_p50, &unused_p95, &unused_max);
++                  if (!governor_window_start_us) {
++                    governor_window_start_us = now_us;
++                    governor_window_swaps = swaps_now;
++                    governor_window_vblanks = link_vblanks_fired;
++                  } else if (now_us - governor_window_start_us >= 1000000) {
++                    uint64_t delivered = swaps_now - governor_window_swaps;
++                    uint64_t expected = link_vblanks_fired - governor_window_vblanks;
++                    if (expected >= 20) {
++                      if (delivered * 10 < expected * 9) {
++                        // Floor at the second rung (30 Hz on a 120 Hz panel):
++                        // the first device session (M-069) showed pipeline
++                        // compile storms spiralling the governor to 20 Hz and
++                        // pinning there, which reads as "broken", not "paced".
++                        if (governor_extra_division < 2) {
++                          ++governor_extra_division;
++                          REXGPU_INFO("pace governor: down a rung (now +{}; {} of {} delivered)",
++                                      governor_extra_division, delivered, expected);
++                        }
++                        governor_clean_since_us = 0;
++                      } else if (delivered * 100 >= expected * 98) {
++                        if (!governor_clean_since_us) {
++                          governor_clean_since_us = now_us;
++                        } else if (governor_extra_division &&
++                                   now_us - governor_clean_since_us >= 5000000) {
++                          --governor_extra_division;
++                          governor_clean_since_us = now_us;
++                          REXGPU_INFO("pace governor: up a rung ({})", governor_extra_division);
++                        }
++                      } else {
++                        governor_clean_since_us = 0;
++                      }
++                    }
++                    governor_window_start_us = now_us;
++                    governor_window_swaps = swaps_now;
++                    governor_window_vblanks = link_vblanks_fired;
++                  }
++                }
++              }
++              // On timeout (link paused: occlusion, backgrounding) fall
++              // through to the timer path below for this iteration so the
++              // guest heartbeat never stops.
++            }
+           }
++          if (link_fired) {
++            // Keep the timer's bookkeeping fresh so a displaylink -> timer
++            // transition does not immediately double-fire.
++            last_frame_time = chrono::Clock::QueryGuestTickCount();
++            continue;
++          }
++          if (link_available) {
++            // Wait timed out with a live link: reset the governor's window
++            // (its rates are meaningless across a pause) and take one timer
++            // step so a paused panel cannot silence the guest's heartbeat.
++            governor_window_start_us = 0;
++            governor_clean_since_us = 0;
++          }
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           // vsync on  -> lock to the guest video mode refresh rate.
+           // vsync off -> honor max_fps (Hz), or run uncapped (~1kHz tick) at 0.
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+@@ -85,6 +86,18 @@
+                     "Names the MSAA sample count and render-target formats a scene actually "
+                     "uses -- the FSI darkening hunt needs the menu's. Cheap when off.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++namespace {
++// Swap cadence (docs/pacing.md): inter-swap intervals at IssueSwap, the
++// number judder is. Single writer (the GPU worker); readers copy the ring.
++// p95 >> p50 is ragged pacing; p95 ~= p50 is an even cadence. total is
++// monotonic and never cleared -- the pacing governor and the console can both
++// read it without stealing from each other (unlike the self-clearing rates).
++constexpr uint32_t kSwapIntervalRingSize = 256;  // power of two
++uint32_t g_swap_interval_ring_us[kSwapIntervalRingSize] = {};
++std::atomic<uint64_t> g_swap_total{0};
++std::atomic<uint64_t> g_swap_last_us{0};
++}  // namespace
+ 
+ namespace {
+ // EDRAM dump probe (round 8, M-065): armed over the console via
+@@ -3013,6 +3026,22 @@
+         return true;
+       });
+ 
++  // Swap cadence sample (docs/pacing.md): this point is reached only for
++  // frames actually handed to the presenter (the async-placeholder skip
++  // returned above), so the intervals recorded here are what the eye sees.
++  {
++    uint64_t now_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                                   std::chrono::steady_clock::now().time_since_epoch())
++                                   .count());
++    uint64_t last_us = g_swap_last_us.exchange(now_us, std::memory_order_relaxed);
++    if (last_us) {
++      uint64_t total = g_swap_total.load(std::memory_order_relaxed);
++      g_swap_interval_ring_us[total % kSwapIntervalRingSize] =
++          uint32_t(std::min<uint64_t>(now_us - last_us, UINT32_MAX));
++      g_swap_total.store(total + 1, std::memory_order_release);
++    }
++  }
++
+   // End the frame even if did not present for any reason (the image refresher
+   // was not called), to prevent leaking per-frame resources.
+   EndSubmission(true);
+@@ -7055,4 +7084,24 @@
+ extern "C" void RexRequestEdramDump(const char* dir, uint32_t count) {
+   std::snprintf(g_edram_dump_dir, sizeof(g_edram_dump_dir), "%s", dir);
+   g_edram_dump_remaining.store(int(count), std::memory_order_relaxed);
++}
++
++// Swap cadence over the last kSwapIntervalRingSize visible frames
++// (docs/pacing.md). `total` is monotonic and never cleared, so the pacing
++// governor and the console can both consume this without racing each other.
++extern "C" void RexGetSwapCadence(uint64_t* total_out, uint32_t* p50_us_out, uint32_t* p95_us_out,
++                                  uint32_t* max_us_out) {
++  uint64_t total = g_swap_total.load(std::memory_order_acquire);
++  *total_out = total;
++  uint32_t n = uint32_t(std::min<uint64_t>(total, kSwapIntervalRingSize));
++  if (!n) {
++    *p50_us_out = *p95_us_out = *max_us_out = 0;
++    return;
++  }
++  uint32_t copy[kSwapIntervalRingSize];
++  std::memcpy(copy, g_swap_interval_ring_us, sizeof(uint32_t) * kSwapIntervalRingSize);
++  std::sort(copy, copy + n);
++  *p50_us_out = copy[n / 2];
++  *p95_us_out = copy[(uint64_t(n) * 95) / 100];
++  *max_us_out = copy[n - 1];
+ }
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -59,6 +59,10 @@
+     "Number of pipeline creation threads for Vulkan async pipeline creation (-1 for auto)")
+     .range(-1, 32)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++// Real (non-placeholder) Vulkan graphics pipelines compiled this session; see
++// the comment at the increment site and docs/pacing.md.
++static std::atomic<uint64_t> g_pipelines_created{0};
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+@@ -3522,6 +3526,14 @@
+         creation_arguments.tessellation_patch_control_points, description.render_pass_key.key,
+         uint32_t(use_dynamic_rendering));
+     return false;
++  }
++  // Hitch accounting (docs/pacing.md): every real (non-placeholder) pipeline
++  // compiled this session, exported below as RexGetPipelinesCreated. Metal
++  // recompiles every pipeline after any app-binary change, so the first
++  // session after an OTA climbs this fast while hitching -- the console's
++  // `pso=` field makes that visible instead of arguable.
++  if (!creating_placeholder) {
++    g_pipelines_created.fetch_add(1, std::memory_order_relaxed);
+   }
+   bool was_placeholder =
+       creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
+@@ -3726,3 +3738,9 @@
+ }
+ 
+ }  // namespace rex::graphics::vulkan
++
++// Monotonic count of real pipelines compiled this session (docs/pacing.md).
++// Reached by dlsym from the console bridge like the other diagnostics.
++extern "C" uint64_t RexGetPipelinesCreated() {
++  return g_pipelines_created.load(std::memory_order_relaxed);
++}
+--- a/src/system/console_bridge.cpp
++++ b/src/system/console_bridge.cpp
+@@ -75,6 +75,19 @@
+   static auto fn = reinterpret_cast<GpuPassStatsFn>(dlsym(RTLD_DEFAULT, "RexGetGpuPassStats"));
+   return fn;
+ }
++// Swap cadence percentiles and the session pipeline-compile count -- the
++// judder and hitch numbers (docs/pacing.md).
++using SwapCadenceFn = void (*)(uint64_t*, uint32_t*, uint32_t*, uint32_t*);
++static SwapCadenceFn SwapCadence() {
++  static auto fn = reinterpret_cast<SwapCadenceFn>(dlsym(RTLD_DEFAULT, "RexGetSwapCadence"));
++  return fn;
++}
++using PipelinesCreatedFn = uint64_t (*)();
++static PipelinesCreatedFn PipelinesCreated() {
++  static auto fn =
++      reinterpret_cast<PipelinesCreatedFn>(dlsym(RTLD_DEFAULT, "RexGetPipelinesCreated"));
++  return fn;
++}
+ static WrmVblankFn WrmVblank() {
+   static auto fn =
+       reinterpret_cast<WrmVblankFn>(dlsym(RTLD_DEFAULT, "RexGetWaitRegMemVblankPhase"));
+@@ -178,6 +191,23 @@
+     }
+     if (auto* thermal_name = ThermalStateNameFn()) {
+       out << " thermal=" << thermal_name();
++    }
++    // Judder is p95 >> p50 here; even pacing is p95 ~= p50 (docs/pacing.md).
++    if (auto* cadence_fn = SwapCadence()) {
++      uint64_t swaps_total = 0;
++      uint32_t p50_us = 0, p95_us = 0, max_us = 0;
++      cadence_fn(&swaps_total, &p50_us, &p95_us, &max_us);
++      if (swaps_total) {
++        out << " | swap_ms p50=" << (p50_us / 1000.0) << " p95=" << (p95_us / 1000.0)
++            << " max=" << (max_us / 1000.0) << " pace=" << cvar::GetFlagByName("pace") << "/"
++            << cvar::GetFlagByName("pace_fps");
++      }
++    }
++    // Pipelines compiled this session: the hitch suspect. Climbing while the
++    // game hitches = compile-bound (expected on the first session after any
++    // binary update); flat while hitching = look elsewhere.
++    if (auto* pso_fn = PipelinesCreated()) {
++      out << " pso=" << pso_fn();
+     }
+     if (auto* timings = PresenterTimings()) {
+       uint64_t aq = 0, pr = 0, aqmax = 0, prmax = 0;
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -2,6 +2,7 @@
+ 
+ # Core UI sources
+ set(REXUI_CORE_SOURCES
++    display_pacer.cpp
+     graphics_upload_buffer_pool.cpp
+     graphics_util.cpp
+     imgui_dialog.cpp
+--- a/src/ui/window_uikit.mm
++++ b/src/ui/window_uikit.mm
+@@ -28,7 +28,81 @@
+ #include <rex/ui/touch_controls.h>  // on-screen controls layered over the Metal view
+ 
+ #import <UIKit/UIKit.h>
++
++#include <rex/ui/display_pacer.h>
++
++// ---------------------------------------------------------------------------
++// Display link -> DisplayPacer feed (docs/pacing.md)
++//
++// The pacer turns the emulated guest vblank into a divided-down copy of the
++// panel's refresh. The link runs on its OWN thread with its own run loop: the
++// main thread also carries every paint and all of UIKit, and a pacing clock
++// that jitters whenever the UI is busy would re-create exactly the phase noise
++// this exists to remove.
++// ---------------------------------------------------------------------------
++
++@interface RexPacerLink : NSObject
++- (void)start;
++- (void)stop;
++@end
++
++@implementation RexPacerLink {
++  CADisplayLink* _link;
++  NSThread* _thread;
++  BOOL _running;
++}
++
++- (void)start {
++  if (_running) return;
++  _running = YES;
++  _thread = [[NSThread alloc] initWithTarget:self selector:@selector(threadMain) object:nil];
++  _thread.name = @"DisplayPacer";
++  // Above default priority: this thread is a clock. It does almost no work
++  // (an atomic increment and a condvar notify per refresh), but it must run
++  // promptly when the panel ticks.
++  _thread.qualityOfService = NSQualityOfServiceUserInteractive;
++  [_thread start];
++}
++
++- (void)threadMain {
++  @autoreleasepool {
++    _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
++    // Ask for the panel's fastest rate; pacing divides it down deliberately.
++    // Without this, UIKit idles the link at 60 even on a 120 Hz panel (and
++    // Info.plist carries CADisableMinimumFrameDurationOnPhone for the same
++    // reason on the present side).
++    if (@available(iOS 15.0, tvOS 15.0, *)) {
++      const float max_fps = float(UIScreen.mainScreen.maximumFramesPerSecond);
++      _link.preferredFrameRateRange = CAFrameRateRangeMake(max_fps, max_fps, max_fps);
++    }
++    [_link addToRunLoop:NSRunLoop.currentRunLoop forMode:NSRunLoopCommonModes];
++    rex::ui::DisplayPacer::Instance().SetLinkActive(true);
++    while (_running &&
++           [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode
++                                  beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.25]]) {
++    }
++    rex::ui::DisplayPacer::Instance().SetLinkActive(false);
++    [_link invalidate];
++    _link = nil;
++  }
++}
+ 
++- (void)tick:(CADisplayLink*)link {
++  // targetTimestamp - timestamp is the period actually in effect this tick.
++  const double period_s = link.targetTimestamp - link.timestamp;
++  rex::ui::DisplayPacer::Instance().OnDisplayLinkTick(
++      period_s > 0 ? uint64_t(period_s * 1e9) : 0);
++}
++
++- (void)stop {
++  if (!_running) return;
++  _running = NO;
++  // The run loop wakes within 0.25 s and exits; SetLinkActive(false) there
++  // releases any pacer waiters.
++}
++
++@end
++
+ namespace {
+ 
+ // The startup-size cvars are meaningless on a device -- the screen decides. The
+@@ -107,6 +181,11 @@
+ UIKitWindow::~UIKitWindow() {
+   EnterDestructor();
+   @autoreleasepool {
++    if (pacer_link_) {
++      RexPacerLink* link = (__bridge_transfer RexPacerLink*)pacer_link_;
++      [link stop];
++      pacer_link_ = nullptr;
++    }
+     if (ui_window_) {
+       UIWindow* window = (__bridge_transfer UIWindow*)ui_window_;
+       window.hidden = YES;
+@@ -136,6 +215,11 @@
+     view_controller_ = (__bridge_retained void*)controller;
+     metal_layer_ = (__bridge void*)controller.view.layer;
+ 
++    // The pacing clock lives with the window: one panel, one link, one pacer.
++    RexPacerLink* pacer_link = [[RexPacerLink alloc] init];
++    [pacer_link start];
++    pacer_link_ = (__bridge_retained void*)pacer_link;
++
+     HandleResize();
+ 
+     // iOS windows are always "focused" -- there is no other window to lose it
+--- a/src/ui/window_apple.mm
++++ b/src/ui/window_apple.mm
+@@ -19,11 +19,13 @@
+ #include <rex/cvar.h>
+ #include <rex/graphics/video_mode_util.h>
+ #include <rex/logging.h>
++#include <rex/ui/display_pacer.h>
+ #include <rex/ui/menu_item.h>
+ #include <rex/ui/surface_apple.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
+ #import <AppKit/AppKit.h>
++#import <QuartzCore/CADisplayLink.h>
+ #import <QuartzCore/CAMetalLayer.h>
+ 
+ namespace {
+@@ -120,6 +122,25 @@
+ 
+ // A layer-hosting view: we supply the CAMetalLayer rather than letting AppKit
+ // make one, so the same layer pointer can be handed to VK_EXT_metal_surface.
++// Display link -> DisplayPacer feed (docs/pacing.md). The macOS build is the
++// verification vehicle for the pacing design, so it feeds the same pacer the
++// phone does. CADisplayLink arrived on macOS in 14.0 (via NSView); on older
++// systems the pacer simply stays inactive and the vsync worker keeps its
++// wall-clock fallback. Runs on the main run loop here -- the dev Mac's main
++// thread is not the phone's, and the simplicity is worth more than the last
++// millisecond of isolation on the verification platform.
++@interface RexPacerFeed : NSObject
++- (void)tick:(CADisplayLink*)link API_AVAILABLE(macos(14.0));
++@end
++
++@implementation RexPacerFeed
++- (void)tick:(CADisplayLink*)link API_AVAILABLE(macos(14.0)) {
++  const double period_s = link.targetTimestamp - link.timestamp;
++  rex::ui::DisplayPacer::Instance().OnDisplayLinkTick(
++      period_s > 0 ? uint64_t(period_s * 1e9) : 0);
++}
++@end
++
+ @interface RexMetalView : NSView
+ @end
+ 
+@@ -158,6 +179,14 @@
+ AppleWindow::~AppleWindow() {
+   EnterDestructor();
+   @autoreleasepool {
++    if (pacer_link_) {
++      DisplayPacer::Instance().SetLinkActive(false);
++      if (@available(macOS 14.0, *)) {
++        CADisplayLink* pacer_link = (__bridge_transfer CADisplayLink*)pacer_link_;
++        [pacer_link invalidate];
++      }
++      pacer_link_ = nullptr;
++    }
+     if (ns_window_) {
+       NSWindow* window = (__bridge_transfer NSWindow*)ns_window_;
+       window.delegate = nil;
+@@ -219,6 +248,16 @@
+     // Match the layer's pixel size to the display before anyone asks for it.
+     HandleResize();
+ 
++    // Pacing clock (docs/pacing.md); macOS 14+ only, fallback is the timer.
++    if (@available(macOS 14.0, *)) {
++      RexPacerFeed* feed = [[RexPacerFeed alloc] init];
++      CADisplayLink* pacer_link = [view displayLinkWithTarget:feed selector:@selector(tick:)];
++      [pacer_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
++      pacer_link_ = (__bridge_retained void*)pacer_link;
++      // The link retains its target; feed lives as long as the link does.
++      DisplayPacer::Instance().SetLinkActive(true);
++    }
++
+     [window center];
+     [window makeKeyAndOrderFront:nil];
+ 
+--- a/include/rex/ui/window_uikit.h
++++ b/include/rex/ui/window_uikit.h
+@@ -54,6 +54,7 @@
+   void* ui_window_ = nullptr;      // UIWindow*
+   void* view_controller_ = nullptr;  // RexViewController*
+   void* metal_layer_ = nullptr;    // CAMetalLayer*
++  void* pacer_link_ = nullptr;     // RexPacerLink* (docs/pacing.md)
+   bool paint_pending_ = false;
+ };
+ 
+--- a/include/rex/ui/window_apple.h
++++ b/include/rex/ui/window_apple.h
+@@ -57,6 +57,7 @@
+   void* content_view_ = nullptr; // NSView* (layer-hosting)
+   void* metal_layer_ = nullptr;  // CAMetalLayer*
+   void* delegate_ = nullptr;     // RexWindowDelegate*
++  void* pacer_link_ = nullptr;   // CADisplayLink* (macOS 14+, docs/pacing.md)
+   bool paint_pending_ = false;
+ };
+ 

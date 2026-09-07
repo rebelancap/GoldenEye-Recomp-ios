@@ -1,0 +1,110 @@
+--- a/include/rex/platform/dynlib.h
++++ b/include/rex/platform/dynlib.h
+@@ -56,7 +56,22 @@
+ inline constexpr const char* kRenderDoc = "librenderdoc.so";
+ inline constexpr const char* kSpirvToolsSdkPath = "bin/libSPIRV-Tools-shared.so";
+ 
++#elif REX_PLATFORM_MAC
++
++#if TARGET_OS_IPHONE || TARGET_OS_VISION
++// iOS/visionOS have no Vulkan loader: MoltenVK is embedded in the app bundle
++// and dlopened from Frameworks/ (there is no ICD mechanism to go through).
++inline constexpr const char* kVulkanLoader = "@rpath/libMoltenVK.dylib";
+ #else
++// macOS: the Khronos loader (brew vulkan-loader / VulkanSDK) fronts MoltenVK.
++inline constexpr const char* kVulkanLoader = "libvulkan.1.dylib";
++#endif
++// RenderDoc has no Apple build. The name is only ever passed to dlopen, which
++// fails harmlessly and leaves the capture API disabled.
++inline constexpr const char* kRenderDoc = "librenderdoc.dylib";
++inline constexpr const char* kSpirvToolsSdkPath = "lib/libSPIRV-Tools-shared.dylib";
++
++#else
+ #error No library names provided for the target platform.
+ #endif
+ 
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -30,6 +30,15 @@
+ #include <libgen.h>
+ #include <pwd.h>
+ 
++#if defined(__APPLE__)
++// Darwin is large-file-native: off_t is already 64-bit and the glibc *64
++// aliases do not exist. Map them onto the plain entry points.
++#define off64_t off_t
++#define fseeko64 fseeko
++#define ftello64 ftello
++#define ftruncate64 ftruncate
++#endif
++
+ namespace rex {
+ 
+ std::string path_to_utf8(const std::filesystem::path& path) {
+--- a/src/core/mapped_memory_posix.cpp
++++ b/src/core/mapped_memory_posix.cpp
+@@ -20,6 +20,16 @@
+ #include <rex/memory/mapped_memory.h>
+ #include <rex/platform.h>
+ 
++#if defined(__APPLE__)
++// Darwin is large-file-native: off_t/struct stat are already 64-bit and the
++// glibc *64 aliases do not exist. `stat64` is a macro (not a typedef) so the
++// elaborated `struct stat64` below still resolves.
++#define off64_t off_t
++#define stat64 stat
++#define fstat64 fstat
++#define ftruncate64 ftruncate
++#endif
++
+ namespace rex::memory {
+ 
+ class PosixMappedMemory : public MappedMemory {
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -25,6 +25,14 @@
+ #include <rex/memory/utils.h>
+ #include <rex/platform.h>
+ #include <rex/string.h>
++
++#if defined(__APPLE__)
++// Darwin is large-file-native: off_t is already 64-bit and the glibc *64
++// aliases do not exist.
++#define off64_t off_t
++#define ftruncate64 ftruncate
++#define mmap64 mmap
++#endif
+ 
+ #if REX_PLATFORM_ANDROID
+ #include <string.h>
+--- a/src/kernel/crt/heap.cpp
++++ b/src/kernel/crt/heap.cpp
+@@ -318,7 +318,12 @@
+     diagnostics.capacity += d.capacity;
+     diagnostics.allocated += d.allocated;
+     diagnostics.peak_allocated += d.peak_allocated;
+-    diagnostics.peak_request_size = std::max(diagnostics.peak_request_size, d.peak_request_size);
++    // o1heap reports size_t; HeapDiagnostics stores uint64_t. Those are the
++    // same type under glibc/LP64 but distinct on Darwin (unsigned long vs
++    // unsigned long long), where std::max's single template parameter fails to
++    // deduce. Cast explicitly rather than relying on the platform's typedefs.
++    diagnostics.peak_request_size =
++        std::max<uint64_t>(diagnostics.peak_request_size, uint64_t(d.peak_request_size));
+     diagnostics.oom_count += d.oom_count;
+   }
+   return diagnostics;
+--- a/thirdparty/crypto/sha256.cpp
++++ b/thirdparty/crypto/sha256.cpp
+@@ -8,7 +8,11 @@
+ #include "sha256.h"
+ 
+ // big endian architectures need #define __BYTE_ORDER __BIG_ENDIAN
+-#ifndef _MSC_VER
++#if defined(__APPLE__)
++// Darwin has no <endian.h>; the __BYTE_ORDER/__LITTLE_ENDIAN macros this file
++// relies on come from <machine/endian.h>.
++#include <machine/endian.h>
++#elif !defined(_MSC_VER)
+ #include <endian.h>
+ #endif
+ 

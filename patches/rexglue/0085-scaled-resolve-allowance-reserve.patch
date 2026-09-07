@@ -1,0 +1,29 @@
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -1390,10 +1390,23 @@
+       budget_bytes = proc_available_bytes;
+       budget_source = "os_proc_available_memory";
+     }
+-    // Half the budget is the ceiling for this one buffer: the guest's own
+-    // 512 MB shared-memory buffer, every render target, every host texture
+-    // and the swapchain all come out of the same budget.
++    // The ceiling for this one buffer is what is left after everything else
++    // the process still has to allocate: the guest's 512 MB shared-memory
++    // buffer, every render target (they scale too), every host texture, the
++    // pipeline caches and the swapchain. Measured on the bench (M-105 §3 and
++    // M-106) that remainder is ~2.4 GB at 3x3 (7.0 GB total - 4.6 GB buffer)
++    // and ~2.0 GB at 2x2, of which only a few hundred MB exist by the time
++    // this runs -- so reserve 3 GB out of an HONEST remaining-headroom number
++    // (os_proc_available_memory). The Vision Pro with the increased-memory-
++    // limit entitlement reports 7992 MB here: 7992 - 3072 = 4920 >= 4608 admits
++    // true 3x3, while the un-entitled 4920 MB admits 2x2 (2048) and not 3x3.
++    // The VK budget fallback (macOS, where no jetsam limit exists) is not a
++    // headroom number at all, so it keeps the older half-of-budget rule.
++    constexpr uint64_t kOtherAllocationsReserve = uint64_t(3072) << 20;
+     uint64_t allowance = budget_bytes / 2;
++    if (proc_available_bytes && budget_bytes == proc_available_bytes) {
++      allowance = budget_bytes > kOtherAllocationsReserve ? budget_bytes - kOtherAllocationsReserve : 0;
++    }
+     if (max_buffer_size && (!allowance || max_buffer_size < allowance)) {
+       allowance = max_buffer_size;
+       budget_source = "vk maxBufferSize";

@@ -1,0 +1,124 @@
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -23,7 +23,14 @@
+ #include <rex/math.h>
+ #include <rex/platform.h>
+ 
++#if REX_PLATFORM_MAC
++// Darwin's <ucontext.h> is the deprecated get/make/swapcontext API and
++// hard-errors without _XOPEN_SOURCE. Only the ucontext_t/mcontext_t types are
++// needed here, and <signal.h> above already provides them.
++#include <sys/ucontext.h>
++#else
+ #include <ucontext.h>
++#endif
+ 
+ namespace rex::arch {
+ 
+@@ -42,11 +49,40 @@
+ 
+ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+                                      void* signal_context) {
++#if REX_PLATFORM_MAC
++  // Darwin's mcontext_t is a POINTER to _STRUCT_MCONTEXT64, not the struct, and
++  // its register file is split into __ss (thread state), __es (exception state)
++  // and __ns (NEON state) rather than glibc's flat gregs/regs arrays.
++  auto* const mc = reinterpret_cast<ucontext_t*>(signal_context)->uc_mcontext;
++#else
+   mcontext_t& mcontext = reinterpret_cast<ucontext_t*>(signal_context)->uc_mcontext;
++#endif
+ 
+   HostThreadContext thread_context;
+ 
+-#if REX_ARCH_AMD64
++#if REX_PLATFORM_MAC
++#if !REX_ARCH_ARM64
++#error Apple support in this handler is arm64-only (the port targets Apple Silicon, iOS and visionOS).
++#endif
++  static_assert(!__DARWIN_OPAQUE_ARM_THREAD_STATE64,
++                "arm64e opaque thread state: fp/lr/sp/pc must go through the "
++                "arm_thread_state64_get_* accessors, which this code does not use.");
++  // x0-x28 come from __ss.__x; x29 (frame pointer) and x30 (link register) are
++  // named fields on Darwin.
++  std::memcpy(thread_context.x, mc->__ss.__x, sizeof(uint64_t) * 29);
++  thread_context.x[29] = mc->__ss.__fp;
++  thread_context.x[30] = mc->__ss.__lr;
++  thread_context.sp = mc->__ss.__sp;
++  thread_context.pc = mc->__ss.__pc;
++  thread_context.pstate = mc->__ss.__cpsr;
++  thread_context.fpsr = mc->__ns.__fpsr;
++  thread_context.fpcr = mc->__ns.__fpcr;
++  std::memcpy(thread_context.v, mc->__ns.__v, sizeof(thread_context.v));
++  // Darwin hands us the exception syndrome register directly, so none of
++  // Linux's __reserved extension-chain walk (FPSIMD_MAGIC / ESR_MAGIC) is
++  // needed -- and it is always present, unlike on Android.
++  const uint64_t darwin_esr = mc->__es.__esr;
++#elif REX_ARCH_AMD64
+   thread_context.rip = uint64_t(mcontext.gregs[REG_RIP]);
+   thread_context.eflags = uint32_t(mcontext.gregs[REG_EFL]);
+   // The REG_ order may be different than the register indices in the
+@@ -107,7 +143,29 @@
+       break;
+     case SIGSEGV: {
+       Exception::AccessViolationOperation access_violation_operation;
+-#if REX_ARCH_AMD64
++#if REX_PLATFORM_MAC
++      // Data Abort (ESR_EL1 EC 0b100100 / 0b100101): bit 6 (WnR) is 1 for a
++      // write, 0 for a read. Same decode as the Linux arm64 path below, but the
++      // ESR always exists here so there is no instruction-decode fallback.
++      if (((darwin_esr >> 26) & 0b111110) == 0b100100) {
++        access_violation_operation = (darwin_esr & (UINT64_C(1) << 6))
++                                         ? Exception::AccessViolationOperation::kWrite
++                                         : Exception::AccessViolationOperation::kRead;
++      } else {
++        bool instruction_is_store;
++        if (IsArm64LoadPrefetchStore(*reinterpret_cast<const uint32_t*>(thread_context.pc),
++                                     instruction_is_store)) {
++          access_violation_operation = instruction_is_store
++                                           ? Exception::AccessViolationOperation::kWrite
++                                           : Exception::AccessViolationOperation::kRead;
++        } else {
++          assert_always(
++              "SIGSEGV was not a Data Abort and the faulting instruction is not "
++              "a known load, prefetch or store instruction");
++          access_violation_operation = Exception::AccessViolationOperation::kUnknown;
++        }
++      }
++#elif REX_ARCH_AMD64
+       // x86_pf_error_code::X86_PF_WRITE
+       constexpr uint64_t kX86PageFaultErrorCodeWrite = UINT64_C(1) << 1;
+       access_violation_operation = (uint64_t(mcontext.gregs[REG_ERR]) & kX86PageFaultErrorCodeWrite)
+@@ -159,7 +217,32 @@
+   for (size_t i = 0; i < rex::countof(handlers_) && handlers_[i].first; ++i) {
+     if (handlers_[i].first(&ex, handlers_[i].second)) {
+       // Exception handled.
+-#if REX_ARCH_AMD64
++#if REX_PLATFORM_MAC
++      uint32_t modified_register_index;
++      uint32_t modified_x_registers_remaining = ex.modified_x_registers();
++      while (rex::bit_scan_forward(modified_x_registers_remaining, &modified_register_index)) {
++        modified_x_registers_remaining &= ~(UINT32_C(1) << modified_register_index);
++        const uint64_t value = thread_context.x[modified_register_index];
++        if (modified_register_index < 29) {
++          mc->__ss.__x[modified_register_index] = value;
++        } else if (modified_register_index == 29) {
++          mc->__ss.__fp = value;
++        } else {
++          mc->__ss.__lr = value;
++        }
++      }
++      mc->__ss.__sp = thread_context.sp;
++      mc->__ss.__pc = thread_context.pc;
++      mc->__ss.__cpsr = uint32_t(thread_context.pstate);
++      mc->__ns.__fpsr = thread_context.fpsr;
++      mc->__ns.__fpcr = thread_context.fpcr;
++      uint32_t modified_v_registers_remaining = ex.modified_v_registers();
++      while (rex::bit_scan_forward(modified_v_registers_remaining, &modified_register_index)) {
++        modified_v_registers_remaining &= ~(UINT32_C(1) << modified_register_index);
++        std::memcpy(&mc->__ns.__v[modified_register_index],
++                    &thread_context.v[modified_register_index], sizeof(vec128_t));
++      }
++#elif REX_ARCH_AMD64
+       mcontext.gregs[REG_RIP] = greg_t(thread_context.rip);
+       mcontext.gregs[REG_EFL] = greg_t(thread_context.eflags);
+       uint32_t modified_register_index;

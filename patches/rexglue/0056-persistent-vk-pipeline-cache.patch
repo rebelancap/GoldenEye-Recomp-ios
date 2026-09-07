@@ -1,0 +1,264 @@
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -432,6 +432,51 @@
+           "shader storage will be disabled: {}",
+           rex::path_to_utf8(shader_storage_shareable_root));
+       return;
++    }
++  }
++
++  // Persistent VkPipelineCache (GoldenEye-Recomp-ios overlay): loaded before
++  // the storage pre-warm below so the boot-time pipeline creation pass runs
++  // against a warm cache. The driver validates the blob's header/UUID itself
++  // and ignores stale data, so feeding a mismatched file is safe.
++  if (vk_pipeline_cache_ == VK_NULL_HANDLE) {
++    vk_pipeline_cache_path_ =
++        shader_storage_shareable_root / fmt::format("{:08X}.vk.psocache", title_id);
++    std::vector<uint8_t> initial_data;
++    if (FILE* blob_file = rex::filesystem::OpenFile(vk_pipeline_cache_path_, "rb")) {
++      fseek(blob_file, 0, SEEK_END);
++      long blob_size = ftell(blob_file);
++      if (blob_size > 0) {
++        initial_data.resize(size_t(blob_size));
++        fseek(blob_file, 0, SEEK_SET);
++        if (fread(initial_data.data(), 1, size_t(blob_size), blob_file) != size_t(blob_size)) {
++          initial_data.clear();
++        }
++      }
++      fclose(blob_file);
++    }
++    const ui::vulkan::VulkanDevice* const vk_device = command_processor_.GetVulkanDevice();
++    VkPipelineCacheCreateInfo pipeline_cache_create_info = {};
++    pipeline_cache_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
++    pipeline_cache_create_info.initialDataSize = initial_data.size();
++    pipeline_cache_create_info.pInitialData = initial_data.empty() ? nullptr : initial_data.data();
++    if (vk_device->functions().vkCreatePipelineCache(vk_device->device(),
++                                                     &pipeline_cache_create_info, nullptr,
++                                                     &vk_pipeline_cache_) != VK_SUCCESS) {
++      // A corrupt blob must not cost the cache entirely -- retry empty.
++      pipeline_cache_create_info.initialDataSize = 0;
++      pipeline_cache_create_info.pInitialData = nullptr;
++      if (vk_device->functions().vkCreatePipelineCache(vk_device->device(),
++                                                       &pipeline_cache_create_info, nullptr,
++                                                       &vk_pipeline_cache_) != VK_SUCCESS) {
++        vk_pipeline_cache_ = VK_NULL_HANDLE;
++        REXGPU_WARN("VulkanPipelineCache: vkCreatePipelineCache failed; "
++                    "running without a persistent pipeline cache");
++      }
++    }
++    if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
++      REXGPU_INFO("VulkanPipelineCache: persistent VkPipelineCache loaded ({} bytes of prior data)",
++                  initial_data.size());
+     }
+   }
+ 
+@@ -747,6 +792,13 @@
+   // Start the storage writing thread.
+   storage_write_flush_shaders_ = false;
+   storage_write_flush_pipelines_ = false;
++  // Persist the VkPipelineCache right after the boot pre-warm: the first
++  // session on a new app binary pays every Metal compile once, here; saving
++  // now means a mid-session kill cannot take that work with it. The writer
++  // thread consumes this flag on its first iteration.
++  storage_write_vk_pipeline_cache_ = vk_pipeline_cache_ != VK_NULL_HANDLE;
++  vk_pipeline_cache_saved_count_ = g_pipelines_created.load(std::memory_order_relaxed);
++  vk_pipeline_cache_next_save_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+   storage_write_thread_shutdown_ = false;
+   storage_write_thread_ = rex::thread::Thread::Create({}, [this]() { StorageWriteThread(); });
+   assert_not_null(storage_write_thread_);
+@@ -765,7 +817,19 @@
+   }
+   storage_write_shader_queue_.clear();
+   storage_write_pipeline_queue_.clear();
++  storage_write_vk_pipeline_cache_ = false;
+ 
++  // Final synchronous save (the writer thread is stopped), then drop the
++  // cache object -- a later InitializeShaderStorage recreates it from disk.
++  if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
++    SaveVkPipelineCacheBlob();
++    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++    vulkan_device->functions().vkDestroyPipelineCache(vulkan_device->device(), vk_pipeline_cache_,
++                                                      nullptr);
++    vk_pipeline_cache_ = VK_NULL_HANDLE;
++    vk_pipeline_cache_path_.clear();
++  }
++
+   if (pipeline_storage_file_) {
+     fclose(pipeline_storage_file_);
+     pipeline_storage_file_ = nullptr;
+@@ -798,6 +862,25 @@
+     pipeline_storage_file_flush_needed_ = false;
+   }
+ 
++  // Persist the VkPipelineCache periodically: iOS sessions end by app kill,
++  // not clean shutdown, so waiting for Shutdown() would lose nearly every
++  // session's compilations. Save after >=16 new pipelines, at most once per
++  // 30 s, off-thread on the storage writer.
++  if (vk_pipeline_cache_ != VK_NULL_HANDLE && storage_write_thread_) {
++    uint64_t created_total = g_pipelines_created.load(std::memory_order_relaxed);
++    std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
++    if (created_total - vk_pipeline_cache_saved_count_ >= 16 &&
++        now >= vk_pipeline_cache_next_save_) {
++      vk_pipeline_cache_saved_count_ = created_total;
++      vk_pipeline_cache_next_save_ = now + std::chrono::seconds(30);
++      {
++        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
++        storage_write_vk_pipeline_cache_ = true;
++      }
++      storage_write_request_cond_.notify_one();
++    }
++  }
++
+   if (!creation_threads_.empty()) {
+     bool startup_loading = false;
+     {
+@@ -3576,7 +3659,7 @@
+   // "Creating graphics pipeline state" line with no completion after it; a
+   // merely slow one gets its duration named here instead of being argued about.
+   std::chrono::steady_clock::time_point creation_start = std::chrono::steady_clock::now();
+-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
+                                                          &pipeline_create_info, nullptr, &pipeline);
+   uint64_t creation_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - creation_start)
+@@ -3734,7 +3817,44 @@
+     if (pipeline != VK_NULL_HANDLE) {
+       dfn.vkDestroyPipeline(device, pipeline, nullptr);
+     }
++  }
++}
++
++void VulkanPipelineCache::SaveVkPipelineCacheBlob() {
++  if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty()) {
++    return;
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  size_t data_size = 0;
++  if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &data_size, nullptr) != VK_SUCCESS ||
++      !data_size) {
++    return;
++  }
++  std::vector<uint8_t> data(data_size);
++  if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &data_size, data.data()) !=
++      VK_SUCCESS) {
++    return;
+   }
++  // Temp file + rename: an app kill mid-write (the normal way an iOS session
++  // ends) must not corrupt the blob.
++  std::filesystem::path tmp_path = vk_pipeline_cache_path_;
++  tmp_path += ".tmp";
++  FILE* blob_file = rex::filesystem::OpenFile(tmp_path, "wb");
++  if (!blob_file) {
++    return;
++  }
++  bool written = fwrite(data.data(), 1, data_size, blob_file) == data_size;
++  fclose(blob_file);
++  if (!written) {
++    return;
++  }
++  std::error_code rename_error;
++  std::filesystem::rename(tmp_path, vk_pipeline_cache_path_, rename_error);
++  if (!rename_error) {
++    REXGPU_INFO("VulkanPipelineCache: persistent VkPipelineCache saved ({} bytes)", data_size);
++  }
+ }
+ 
+ void VulkanPipelineCache::StorageWriteThread() {
+@@ -3747,6 +3867,7 @@
+ 
+   bool flush_shaders = false;
+   bool flush_pipelines = false;
++  bool save_vk_pipeline_cache = false;
+ 
+   while (true) {
+     if (flush_shaders) {
+@@ -3759,6 +3880,10 @@
+       assert_not_null(pipeline_storage_file_);
+       fflush(pipeline_storage_file_);
+     }
++    if (save_vk_pipeline_cache) {
++      save_vk_pipeline_cache = false;
++      SaveVkPipelineCacheBlob();
++    }
+ 
+     const Shader* shader = nullptr;
+     PipelineStoredDescription pipeline_description;
+@@ -3784,7 +3909,11 @@
+         storage_write_flush_pipelines_ = false;
+         flush_pipelines = true;
+       }
+-      if (!shader && !write_pipeline) {
++      if (storage_write_vk_pipeline_cache_) {
++        storage_write_vk_pipeline_cache_ = false;
++        save_vk_pipeline_cache = true;
++      }
++      if (!shader && !write_pipeline && !save_vk_pipeline_cache) {
+         storage_write_request_cond_.wait(lock);
+         continue;
+       }
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -16,6 +16,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <deque>
++#include <chrono>
+ #include <filesystem>
+ #include <functional>
+ #include <memory>
+@@ -444,6 +445,19 @@
+   FILE* pipeline_storage_file_ = nullptr;
+   bool pipeline_storage_file_flush_needed_ = false;
+ 
++  // Persistent VkPipelineCache (GoldenEye-Recomp-ios overlay). On MoltenVK the
++  // cache data carries the SPIR-V -> MSL conversion results, which survive
++  // app-binary changes -- exactly the cost Metal's own shader cache drops on
++  // every app update. Loaded from / saved to the shader storage directory;
++  // fed to every vkCreateGraphicsPipelines call. Saved by StorageWriteThread
++  // (single saver), used concurrently by creation threads (the Vulkan spec
++  // makes VkPipelineCache internally synchronized for creation commands).
++  void SaveVkPipelineCacheBlob();
++  VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
++  std::filesystem::path vk_pipeline_cache_path_;
++  uint64_t vk_pipeline_cache_saved_count_ = 0;
++  std::chrono::steady_clock::time_point vk_pipeline_cache_next_save_{};
++
+   // Thread for asynchronous writing to the storage streams.
+   void StorageWriteThread();
+   std::mutex storage_write_request_lock_;
+@@ -454,6 +468,7 @@
+   std::deque<PipelineStoredDescription> storage_write_pipeline_queue_;
+   bool storage_write_flush_shaders_ = false;
+   bool storage_write_flush_pipelines_ = false;
++  bool storage_write_vk_pipeline_cache_ = false;
+   bool storage_write_thread_shutdown_ = false;
+   std::unique_ptr<rex::thread::Thread> storage_write_thread_;
+ 
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -43,6 +43,7 @@
+ XE_UI_VULKAN_FUNCTION(vkCreateGraphicsPipelines)
+ XE_UI_VULKAN_FUNCTION(vkCreateImage)
+ XE_UI_VULKAN_FUNCTION(vkCreateImageView)
++XE_UI_VULKAN_FUNCTION(vkCreatePipelineCache)
+ XE_UI_VULKAN_FUNCTION(vkCreatePipelineLayout)
+ XE_UI_VULKAN_FUNCTION(vkCreateQueryPool)
+ XE_UI_VULKAN_FUNCTION(vkCreateRenderPass)
+@@ -59,6 +60,7 @@
+ XE_UI_VULKAN_FUNCTION(vkDestroyImage)
+ XE_UI_VULKAN_FUNCTION(vkDestroyImageView)
+ XE_UI_VULKAN_FUNCTION(vkDestroyPipeline)
++XE_UI_VULKAN_FUNCTION(vkDestroyPipelineCache)
+ XE_UI_VULKAN_FUNCTION(vkDestroyPipelineLayout)
+ XE_UI_VULKAN_FUNCTION(vkDestroyQueryPool)
+ XE_UI_VULKAN_FUNCTION(vkDestroyRenderPass)
+@@ -72,6 +74,7 @@
+ XE_UI_VULKAN_FUNCTION(vkGetDeviceQueue)
+ XE_UI_VULKAN_FUNCTION(vkGetFenceStatus)
+ XE_UI_VULKAN_FUNCTION(vkGetImageMemoryRequirements)
++XE_UI_VULKAN_FUNCTION(vkGetPipelineCacheData)
+ XE_UI_VULKAN_FUNCTION(vkInvalidateMappedMemoryRanges)
+ XE_UI_VULKAN_FUNCTION(vkMapMemory)
+ XE_UI_VULKAN_FUNCTION(vkResetCommandPool)

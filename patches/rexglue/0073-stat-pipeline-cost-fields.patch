@@ -1,0 +1,37 @@
+--- a/src/system/console_bridge.cpp
++++ b/src/system/console_bridge.cpp
+@@ -106,6 +106,19 @@
+       reinterpret_cast<PipelinesCreatedFn>(dlsym(RTLD_DEFAULT, "RexGetPipelinesCreated"));
+   return fn;
+ }
++// rx-0072: what the compiling actually cost, and how many draws waited on it.
++using PendingDrawSkipsFn = uint64_t (*)();
++static PendingDrawSkipsFn PendingDrawSkips() {
++  static auto fn =
++      reinterpret_cast<PendingDrawSkipsFn>(dlsym(RTLD_DEFAULT, "RexGetPendingDrawSkips"));
++  return fn;
++}
++using PipelineCreationMsFn = void (*)(uint64_t*, uint64_t*);
++static PipelineCreationMsFn PipelineCreationMs() {
++  static auto fn =
++      reinterpret_cast<PipelineCreationMsFn>(dlsym(RTLD_DEFAULT, "RexGetPipelineCreationMs"));
++  return fn;
++}
+ static WrmVblankFn WrmVblank() {
+   static auto fn =
+       reinterpret_cast<WrmVblankFn>(dlsym(RTLD_DEFAULT, "RexGetWaitRegMemVblankPhase"));
+@@ -240,6 +253,14 @@
+     // binary update); flat while hitching = look elsewhere.
+     if (auto* pso_fn = PipelinesCreated()) {
+       out << " pso=" << pso_fn();
++    }
++    if (auto* pso_ms_fn = PipelineCreationMs()) {
++      uint64_t total_ms = 0, max_ms = 0;
++      pso_ms_fn(&total_ms, &max_ms);
++      out << " pso_ms=" << total_ms << "(max " << max_ms << ")";
++    }
++    if (auto* skips_fn = PendingDrawSkips()) {
++      out << " pending_skips=" << skips_fn();
+     }
+     if (auto* timings = PresenterTimings()) {
+       uint64_t aq = 0, pr = 0, aqmax = 0, prmax = 0;

@@ -1,0 +1,38 @@
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -48,6 +48,13 @@
+                     "Store shaders persistently and load them when loading games to avoid "
+                     "runtime spikes and freezes when playing the game not for the first time.");
+ 
++REXCVAR_DEFINE_INT32(gpu_test_source1, 0, "GPU",
++                     "PROBE (round 7): fire this many one-shot source-1 (flip-complete) GPU "
++                     "interrupts from the vblank worker, one per tick. The guest ISR has a "
++                     "source-1 branch the runtime never exercises; observing what it does "
++                     "decides the de-quantisation design. Raise the value to fire more.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_INT32(max_fps, 0, "GPU",
+                      "Frame rate cap in Hz when vsync is off (0 = uncapped)")
+     .range(0, 1000);
+@@ -443,6 +450,21 @@
+                          std::memory_order_relaxed);
+   // TODO: Enable profiling once ported
+   // SCOPE_profile_cpu_f("gpu");
++
++  // Round-7 probe: fire N one-shot source-1 (flip/DDI-complete) interrupts on
++  // console demand. The runtime has only ever delivered source 0, so the
++  // guest ISR's source-1 branch (round 2: invokes the callback at record+16)
++  // is unexercised; what it DOES - retire swaps early, ignore, or crash -
++  // decides the de-quantisation design. Console: set gpu_test_source1 <N>.
++  {
++    static uint32_t source1_fired = 0;
++    int32_t source1_want = REXCVAR_GET(gpu_test_source1);
++    if (source1_want > 0 && source1_fired < uint32_t(source1_want)) {
++      ++source1_fired;
++      REXGPU_INFO("GESRC1 probe: dispatching source=1 ({}/{})", source1_fired, source1_want);
++      DispatchInterruptCallback(1, 2);
++    }
++  }
+ 
+   // Increment vblank counter (so the game sees us making progress).
+   if (command_processor_) {

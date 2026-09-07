@@ -1,0 +1,27 @@
+--- a/src/ui/settings_uikit.mm
++++ b/src/ui/settings_uikit.mm
+@@ -356,8 +356,8 @@
+   // on the scale.
+   RexSettingsRow* res = [self segmentedRow:@"Resolution"
+                                       cvar:@"resolution_scale"
+-                                    labels:@[ @"720p (native)", @"1440p (2x)" ]
+-                                    values:@[ @"1", @"2" ]];
++                                    labels:@[ @"720p", @"1440p (2x)", @"2160p (3x)" ]
++                                    values:@[ @"1", @"2", @"3" ]];
+ 
+   [self addSection:@"Graphics"
+             footer:@"The graphics switch is instant and works mid-game -- the same flip the "
+@@ -365,9 +365,10 @@
+                    @"this switch out of step until it is toggled again.)\n"
+                    @"Antialiasing off trades smooth edges for frame rate; it takes effect "
+                    @"the next time the app is launched.\n"
+-                   @"Resolution 1440p renders the whole game at four times the pixels -- "
+-                   @"sharper, and four times the fragment work. It also takes effect the "
+-                   @"next time the app is launched."
++                   @"Resolution 1440p renders the whole game at four times the pixels, "
++                   @"2160p (4K) at nine -- sharper, and that many times the fragment work. "
++                   @"2160p holds a 4.5 GB render buffer and is meant for Vision Pro. It "
++                   @"also takes effect the next time the app is launched."
+               rows:@[
+                 vtoggle,
+                 aa,

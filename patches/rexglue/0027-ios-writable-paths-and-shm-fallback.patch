@@ -1,0 +1,309 @@
+--- a/include/rex/platform.h
++++ b/include/rex/platform.h
+@@ -30,6 +30,16 @@
+ 
+ #if defined(TARGET_OS_MAC) && TARGET_OS_MAC
+ #define REX_PLATFORM_MAC 1
++// TARGET_OS_MAC is Apple's umbrella macro: it is 1 on iOS and visionOS too, so
++// REX_PLATFORM_MAC above already covers them and every Darwin-specific code
++// path (contiguous VA reservation, Mach exception state, SIGBUS) applies as-is.
++// REX_PLATFORM_IOS narrows that to the sandboxed, read-only-bundle platforms,
++// where three things differ from desktop macOS: the app directory cannot be
++// written to, POSIX shared memory is not available, and UIKit owns the loop.
++// TARGET_OS_IPHONE covers iOS, iPadOS, tvOS and visionOS.
++#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
++#define REX_PLATFORM_IOS 1
++#endif
+ #elif defined(WIN32) || defined(_WIN32)
+ #define REX_PLATFORM_WIN32 1
+ #elif defined(__ANDROID__)
+@@ -47,6 +57,9 @@
+ #ifndef REX_PLATFORM_MAC
+ #define REX_PLATFORM_MAC 0
+ #endif
++#ifndef REX_PLATFORM_IOS
++#define REX_PLATFORM_IOS 0
++#endif
+ #ifndef REX_PLATFORM_WIN32
+ #define REX_PLATFORM_WIN32 0
+ #endif
+--- a/include/rex/filesystem.h
++++ b/include/rex/filesystem.h
+@@ -39,6 +39,18 @@
+ // Get user folder.
+ std::filesystem::path GetUserFolder();
+ 
++// Get the folder the user can reach from outside the app, and that the app may
++// write to. On iOS this is the container's Documents/ -- the only directory the
++// Files app exposes (with UIFileSharingEnabled), so it is where the game data
++// is dropped and where the logs are written. Empty on platforms with no such
++// concept; callers there use GetExecutableFolder() instead.
++std::filesystem::path GetDocumentsFolder();
++
++// Get the folder for regenerable data the system may reclaim under storage
++// pressure, and that is excluded from backups (iOS Library/Caches). Falls back
++// to GetUserFolder()/"cache" where the platform has no equivalent.
++std::filesystem::path GetCachesFolder();
++
+ // Creates the parent folder of the specified path if needed.
+ // This can be used to ensure the destination path for a new file exists before
+ // attempting to create it.
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -23,6 +23,7 @@
+ #include <rex/assert.h>
+ #include <rex/filesystem.h>
+ #include <rex/logging.h>
++#include <rex/platform.h>  // REX_PLATFORM_IOS -- Documents/ and Caches/ folders
+ #include <rex/string.h>
+ 
+ #include <dirent.h>
+@@ -124,6 +125,34 @@
+   return std::filesystem::path(home) / ".local" / "share";
+ }
+ 
++std::filesystem::path GetDocumentsFolder() {
++#if REX_PLATFORM_IOS
++  // The sandbox rewrites HOME to the app container, so this is the container's
++  // own Documents/ -- the directory UIFileSharingEnabled publishes to the Files
++  // app. Created eagerly: the user has to be able to see it and drop the game
++  // data in before the app has ever written anything.
++  if (const char* home = std::getenv("HOME")) {
++    auto documents = std::filesystem::path(home) / "Documents";
++    std::error_code ec;
++    std::filesystem::create_directories(documents, ec);
++    return documents;
++  }
++#endif
++  return {};
++}
++
++std::filesystem::path GetCachesFolder() {
++#if REX_PLATFORM_IOS
++  if (const char* home = std::getenv("HOME")) {
++    auto caches = std::filesystem::path(home) / "Library" / "Caches";
++    std::error_code ec;
++    std::filesystem::create_directories(caches, ec);
++    return caches;
++  }
++#endif
++  return GetUserFolder() / "cache";
++}
++
+ FILE* OpenFile(const std::filesystem::path& path, const std::string_view mode) {
+   return fopen(path.c_str(), std::string(mode).c_str());
+ }
+--- a/src/core/filesystem_win.cpp
++++ b/src/core/filesystem_win.cpp
+@@ -62,6 +62,17 @@
+   return result;
+ }
+ 
++std::filesystem::path GetDocumentsFolder() {
++  // Windows has no sandboxed, externally-visible app directory: the executable
++  // folder is writable and is where the config and logs already live. Returning
++  // empty keeps callers on the GetExecutableFolder() path.
++  return {};
++}
++
++std::filesystem::path GetCachesFolder() {
++  return GetUserFolder() / "cache";
++}
++
+ bool CreateEmptyFile(const std::filesystem::path& path) {
+   auto handle =
+       CreateFileW(path.c_str(), 0, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -12,6 +12,7 @@
+ #include <cerrno>
+ #include <cstddef>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+ #include <string>
+@@ -61,7 +62,40 @@
+     name.insert(name.begin(), '/');
+   }
+   return name;
++}
++
++#if REX_PLATFORM_IOS
++// Anonymous, process-private backing file for the guest address space -- the
++// stand-in for POSIX shared memory, which the iOS sandbox does not grant.
++// See the call site in CreateFileMappingHandle for why a file works here.
++static FileMappingHandle CreateContainerFileMapping(const std::filesystem::path& path,
++                                                    size_t length) {
++  const char* home = std::getenv("HOME");
++  if (!home) {
++    return kFileMappingHandleInvalid;
++  }
++  // Caches/ is the correct home for a file the system may reclaim and that
++  // must never be backed up to iCloud (a 4.5 GB backup entry would be
++  // rejected outright).
++  std::filesystem::path dir = std::filesystem::path(home) / "Library" / "Caches";
++  std::error_code ec;
++  std::filesystem::create_directories(dir, ec);
++  std::filesystem::path file = dir / path.filename();
++
++  int fd = open(file.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
++  if (fd < 0) {
++    return kFileMappingHandleInvalid;
++  }
++  // Unlink immediately: the mapping keeps the inode alive for as long as we
++  // need it, and nothing is left behind if the process dies unexpectedly.
++  unlink(file.c_str());
++  if (ftruncate64(fd, static_cast<off_t>(length)) != 0) {
++    close(fd);
++    return kFileMappingHandleInvalid;
++  }
++  return static_cast<FileMappingHandle>(fd);
+ }
++#endif  // REX_PLATFORM_IOS
+ 
+ #if REX_PLATFORM_ANDROID
+ // May be null if no dynamically loaded functions are required.
+@@ -509,12 +543,30 @@
+   auto full_path = MakeShmName(path);
+   int ret = shm_open(full_path.c_str(), oflag, 0777);
+   if (ret < 0) {
++#if REX_PLATFORM_IOS
++    // The iOS sandbox denies shm_open(O_CREAT): POSIX shared memory is only
++    // reachable through an app-group container, which a sideloaded build does
++    // not have. Fall back to a regular file inside our own Caches directory.
++    //
++    // It backs the mapping just as well -- what MapViews needs is one object
++    // that several MAP_SHARED views can alias, and a file provides exactly
++    // that. The file is unlinked the instant it is open, so it never survives
++    // the process and never shows up in the Files app; and APFS keeps it
++    // sparse, so the 4.5 GB length costs only the pages the guest actually
++    // touches (the 360 has 512 MB of physical memory to touch).
++    return CreateContainerFileMapping(path, length);
++#else
+     return kFileMappingHandleInvalid;
++#endif
+   }
+   if (ftruncate64(ret, static_cast<off_t>(length)) != 0) {
+     close(ret);
+     shm_unlink(full_path.c_str());
++#if REX_PLATFORM_IOS
++    return CreateContainerFileMapping(path, length);
++#else
+     return kFileMappingHandleInvalid;
++#endif
+   }
+   return static_cast<FileMappingHandle>(ret);
+ #endif
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -17,6 +17,11 @@
+ #include <rex/filesystem.h>
+ #include <rex/logging/sink.h>
+ #include <rex/logging.h>
++#include <rex/filesystem/vfs.h>  // entrypoint pre-check resolves through the VFS
++// Explicit, not transitive: an undefined REX_PLATFORM_IOS makes every #if below
++// silently take the desktop branch, and the iOS build would then try to write
++// its config and logs into the read-only bundle.
++#include <rex/platform.h>
+ #include <rex/ui/screen_capture.h>
+ #include <rex/ui/overlay/console_overlay.h>
+ #include <rex/ui/overlay/debug_overlay.h>
+@@ -148,6 +153,18 @@
+ bool ReXApp::SetupEnvironment() {
+   auto exe_dir = rex::filesystem::GetExecutableFolder();
+ 
++  // Where the app may write. On desktop that is the folder the executable sits
++  // in -- the config file and the logs directory land next to the binary. On
++  // iOS that folder is inside the signed app bundle and is read-only, so both
++  // would fail silently; and the user needs to reach the game data and the logs
++  // from the Files app, which only ever exposes Documents/. So on iOS every
++  // writable path moves there instead. Nothing else in the SDK changes.
++#if REX_PLATFORM_IOS
++  auto writable_dir = rex::filesystem::GetDocumentsFolder();
++#else
++  auto writable_dir = exe_dir;
++#endif
++
+   std::filesystem::path game_dir;
+   std::string game_data_cvar = REXCVAR_GET(game_data_root);
+   if (!game_data_cvar.empty()) {
+@@ -176,11 +193,19 @@
+   if (!cache_path_cvar.empty()) {
+     cache_dir = cache_path_cvar;
+   } else {
++#if REX_PLATFORM_IOS
++    // Library/Caches, not user_dir/cache: the translated-shader cache is
++    // regenerable and can reach hundreds of MB. Under Application Support it
++    // would be swept into every iCloud backup; under Caches the system may
++    // reclaim it when storage runs low, which is exactly the right behaviour.
++    cache_dir = rex::filesystem::GetCachesFolder() / GetName();
++#else
+     cache_dir = user_dir / "cache";
++#endif
+   }
+ 
+   PathConfig path_config{game_dir, user_dir, update_dir, cache_dir,
+-                         exe_dir / (std::string(GetName()) + ".toml")};
++                         writable_dir / (std::string(GetName()) + ".toml")};
+   OnConfigurePaths(path_config);
+   game_data_root_ = path_config.game_data_root;
+   user_data_root_ = path_config.user_data_root;
+@@ -204,7 +229,7 @@
+                                         log_level_str, category_levels);
+   if (log_file_cvar.empty()) {
+     log_config.app_name = std::string(GetName());
+-    log_config.log_dir = (exe_dir / "logs").string();
++    log_config.log_dir = (writable_dir / "logs").string();
+   }
+ 
+   rex::InitLogging(log_config);
+@@ -237,8 +262,15 @@
+   std::filesystem::path game_data_root = paths.game_data_root;
+   if (game_data_root.empty()) {
+     // No --game_data_root supplied (e.g. launched by double-click): default to
+-    // an "assets" folder staged next to the executable.
++    // an "assets" folder staged next to the executable. On iOS there is no
++    // command line at all and the bundle is read-only, so this is the only
++    // route -- "assets" sits in Documents/, where the user drops the game data
++    // through the Files app.
++#if REX_PLATFORM_IOS
++    auto fallback = rex::filesystem::GetDocumentsFolder() / "assets";
++#else
+     auto fallback = rex::filesystem::GetExecutableFolder() / "assets";
++#endif
+     if (std::filesystem::is_directory(fallback)) {
+       game_data_root = fallback;
+       REXLOG_INFO("--game_data_root not given; defaulting to {}", game_data_root.string());
+@@ -307,22 +339,15 @@
+ 
+   // Mirrors the game:\ / d:\ -> game_data_root mapping in Runtime::SetupVfs.
+   {
+-    constexpr std::string_view kGameDevice = "game:\\";
+-    constexpr std::string_view kDDevice = "d:\\";
+-    std::string_view tail = xex_image;
+-    if (tail.starts_with(kGameDevice)) {
+-      tail.remove_prefix(kGameDevice.size());
+-    } else if (tail.starts_with(kDDevice)) {
+-      tail.remove_prefix(kDDevice.size());
+-    }
+-    std::string host_tail{tail};
+-    std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
+-    // Use the resolved game_data_root (which falls back to <exe-dir>/assets when
+-    // --game_data_root is omitted), not the raw paths value -- otherwise a
+-    // direct launch fails this pre-check with a bare relative "default.xex".
+-    auto xex_host = game_data_root / host_tail;
+-    if (!std::filesystem::is_regular_file(xex_host)) {
+-      auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
++    // Pre-check the entrypoint so a missing or wrong game data drop produces a
++    // plain "the XEX isn't there" message rather than a status code out of the
++    // loader. Resolve it through the VFS rather than against the host
++    // filesystem: LoadXexImage below goes through the VFS too, and when the
++    // game data is an unextracted STFS container there is no host-side
++    // default.xex to stat -- it lives inside the package.
++    if (!runtime_->file_system() || !runtime_->file_system()->ResolvePath(xex_image)) {
++      auto msg = fmt::format("Entrypoint XEX not found: {} (game data: {})", xex_image,
++                             game_data_root.string());
+       REXLOG_ERROR("{}", msg);
+       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+       return false;

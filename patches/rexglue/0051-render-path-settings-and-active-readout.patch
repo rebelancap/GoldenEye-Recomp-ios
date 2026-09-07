@@ -1,0 +1,142 @@
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstdio>
+@@ -43,6 +44,11 @@
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++// Records the path Setup actually selected (0 = fbo, 1 = fsi) for the exported
++// RexActiveRenderTargetPath at the bottom of this file, which the settings page
++// and the console reach by dlsym like the other diagnostics.
++static void RexPublishActiveRenderTargetPath(int path);
++
+ // DEFINE_string(
+ //     render_target_path_vulkan, "",
+ //     "Render target emulation path to use on Vulkan.\n"
+@@ -242,6 +248,11 @@
+       path_ = Path::kHostRenderTargets;
+     }
+   }
++  // Published for the settings page and the console: the cvar records what was
++  // ASKED for, this records what this launch actually runs (the request may
++  // have fallen back right above). Measuring an "FSI" run that silently fell
++  // back to fbo is the archived-cvars trap, and this is the guard.
++  RexPublishActiveRenderTargetPath(path_ == Path::kPixelShaderInterlock ? 1 : 0);
+ 
+   // Format support.
+   constexpr VkFormatFeatureFlags kUsedDepthFormatFeatures =
+@@ -6522,3 +6533,25 @@
+ }
+ 
+ }  // namespace rex::graphics::vulkan
++
++namespace {
++std::atomic<int> g_active_render_target_path{-1};
++}  // namespace
++
++static void RexPublishActiveRenderTargetPath(int path) {
++  g_active_render_target_path.store(path, std::memory_order_relaxed);
++}
++
++// The path this launch actually runs, as distinct from what the init-only cvar
++// asked for (Setup may fall back to fbo when interlock is unsupported).
++// Reached by dlsym from the settings page and the console bridge.
++extern "C" const char* RexActiveRenderTargetPath() {
++  switch (g_active_render_target_path.load(std::memory_order_relaxed)) {
++    case 0:
++      return "fbo";
++    case 1:
++      return "fsi";
++    default:
++      return "not-initialized";
++  }
++}
+--- a/src/ui/settings_uikit.mm
++++ b/src/ui/settings_uikit.mm
+@@ -29,6 +29,8 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cmath>
++#include <cstring>
++#include <dlfcn.h>
+ #include <string>
+ 
+ REXCVAR_DEFINE_BOOL(settings_selftest, false, "Input",
+@@ -252,10 +254,49 @@
+   // --- Graphics ---
+   RexSettingsRow* mip = [self switchRow:@"Distance texture filtering" cvar:@"texture_flat_lod"];
+   mip.inverted = YES;  // the cvar names the workaround; the row names the feature
++  // "Standard" writes the cvar's default (empty string = fbo), so a fresh
++  // install shows a selected segment and SaveConfig keeps the file clean.
++  RexSettingsRow* rtpath = [self segmentedRow:@"Renderer path"
++                                         cvar:@"render_target_path_vulkan"
++                                       labels:@[ @"Standard", @"Tile (FSI)" ]
++                                       values:@[ @"", @"fsi" ]];
+   [self addSection:@"Graphics"
+-            footer:@"Off by default. Turning it on sharpens distant surfaces but draws dark "
+-                   @"seams along the polygon edges of character faces (a known bug, M-056)."
+-              rows:@[ mip ]];
++            footer:@"Distance filtering is off by default: it sharpens distant surfaces but "
++                   @"draws dark seams on character faces (a known bug, M-056).\n"
++                   @"Tile (FSI) is an energy experiment (M-066): it keeps the frame in "
++                   @"tile-local memory, cutting render passes from 7 to 2. Takes effect after "
++                   @"fully closing and relaunching the app; the row below shows what this "
++                   @"launch is actually running (it falls back to Standard where unsupported)."
++              rows:@[
++                mip,
++                rtpath,
++                [self infoRow:@"Path this launch"
++                         text:^NSString* {
++                           // The cvar records what was asked for; the graphics
++                           // library records what Setup actually chose.
++                           using ActivePathFn = const char* (*)();
++                           static ActivePathFn fn = reinterpret_cast<ActivePathFn>(
++                               dlsym(RTLD_DEFAULT, "RexActiveRenderTargetPath"));
++                           if (!fn) return @"unavailable";
++                           const char* active = fn();
++                           NSString* shown =
++                               strcmp(active, "fsi") == 0
++                                   ? @"Tile (FSI)"
++                                   : (strcmp(active, "fbo") == 0 ? @"Standard" : @(active));
++                           bool fsi_requested =
++                               [CvarString(@"render_target_path_vulkan") isEqualToString:@"fsi"];
++                           bool fsi_active = strcmp(active, "fsi") == 0;
++                           if (fsi_requested != fsi_active) {
++                             // Either the change has not been relaunched into
++                             // effect yet, or this device cannot run FSI --
++                             // indistinguishable from here, so say both.
++                             return [shown
++                                 stringByAppendingString:@" · change needs relaunch (or is "
++                                                         @"unsupported here)"];
++                           }
++                           return shown;
++                         }],
++              ]];
+ 
+   // --- Controls ---
+   [self addSection:@"Controls"
+--- a/src/system/console_bridge.cpp
++++ b/src/system/console_bridge.cpp
+@@ -160,6 +160,15 @@
+     std::ostringstream out;
+     out.setf(std::ios::fixed);
+     out.precision(2);
++    // The render-target path this launch actually runs (the init-only cvar
++    // records only what was asked for) -- an FSI-vs-fbo A/B is invalid without
++    // this in the same line as the numbers.
++    using ActivePathFn = const char* (*)();
++    static auto active_path_fn =
++        reinterpret_cast<ActivePathFn>(dlsym(RTLD_DEFAULT, "RexActiveRenderTargetPath"));
++    if (active_path_fn) {
++      out << "rtpath=" << active_path_fn() << " ";
++    }
+     out << "fps=" << s.fps << " frame_ms=" << s.frame_time_ms << " frames=" << s.frame_count
+         << " submitted=" << s.submitted << " presented=" << s.presented;
+     // A growing gap between these two is the signature of a stalled GPU, and it
