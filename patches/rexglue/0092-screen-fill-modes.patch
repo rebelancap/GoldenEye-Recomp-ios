@@ -1,0 +1,109 @@
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -45,6 +45,22 @@
+ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
+                      "Vertical safe area percentage (0-100)")
+     .range(0, 100);
++
++// Uniform zoom of the guest output rectangle about the surface centre, applied
++// AFTER the fit/crop math below. It exists because that math can only ever
++// SHRINK its rectangle: it starts from "stretched across the whole surface on
++// the long axis" and letterboxes back toward the safe area, so no safe-area
++// value can make the output bigger than the surface on that axis. iOS "Screen:
++// fill width" needs exactly that -- scaling the game's own ~2.38:1 WIDE
++// letterbox band up to the height of a 2.17:1 screen requires an output
++// rectangle wider than the surface, with the sides cropped. Overflow on either
++// axis (negative output_x / output_y) is the same state the safe-area cutoff
++// already produces on one axis, and is handled identically downstream.
++REXCVAR_DEFINE_INT32(present_zoom_percent, 100, "UI/Presenter",
++                     "Zoom of the guest output rectangle about the surface centre, percent "
++                     "(100 = the plain fit/crop rectangle)")
++    .range(100, 400)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+ REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+@@ -920,7 +936,11 @@
+     // ratio while stretching throughout the entire surface's width, then limit
+     // the Y cropping via letterboxing or stretching along X.
+     uint32_t present_safe_area;
+-    if (config.GetAllowOverscanCutoff() && REXCVAR_GET(present_safe_area_y) > 0 &&
++    // The overscan flag is read from the cvar rather than from the snapshot in
++    // `config` (which is built once, at presenter init) so that the settings
++    // page's "Screen fill" row can switch fit<->crop live. present_safe_area_*
++    // below was already read live; this just makes the pair consistent.
++    if (REXCVAR_GET(present_allow_overscan_cutoff) && REXCVAR_GET(present_safe_area_y) > 0 &&
+         REXCVAR_GET(present_safe_area_y) < 100) {
+       present_safe_area = uint32_t(REXCVAR_GET(present_safe_area_y));
+     } else {
+@@ -956,7 +976,11 @@
+     // aspect ratio while stretching throughout the entire surface's height,
+     // then limit the X cropping via letterboxing or stretching along Y.
+     uint32_t present_safe_area;
+-    if (config.GetAllowOverscanCutoff() && REXCVAR_GET(present_safe_area_x) > 0 &&
++    // The overscan flag is read from the cvar rather than from the snapshot in
++    // `config` (which is built once, at presenter init) so that the settings
++    // page's "Screen fill" row can switch fit<->crop live. present_safe_area_*
++    // below was already read live; this just makes the pair consistent.
++    if (REXCVAR_GET(present_allow_overscan_cutoff) && REXCVAR_GET(present_safe_area_x) > 0 &&
+         REXCVAR_GET(present_safe_area_x) < 100) {
+       present_safe_area = uint32_t(REXCVAR_GET(present_safe_area_x));
+     } else {
+@@ -986,6 +1010,19 @@
+     // output_width might have been rounded up already by rescale_unsigned, so
+     // rounding down in this division.
+     flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
++  }
++
++  // Uniform zoom about the surface centre (see present_zoom_percent above).
++  // Read live, like the safe areas, so the settings page's "Screen" row can
++  // switch fill modes without a restart.
++  {
++    const int32_t zoom_percent = REXCVAR_GET(present_zoom_percent);
++    if (zoom_percent > 100) {
++      output_width = rescale_unsigned(output_width, uint32_t(zoom_percent), 100);
++      output_height = rescale_unsigned(output_height, uint32_t(zoom_percent), 100);
++      flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
++      flow.output_y = (int32_t(surface_height_in_paint_connection_) - int32_t(output_height)) / 2;
++    }
+   }
+ 
+   // Convert the location from surface pixels (which have 1:1 aspect ratio
+--- a/src/ui/settings_uikit.mm
++++ b/src/ui/settings_uikit.mm
+@@ -358,6 +358,17 @@
+                                       cvar:@"resolution_scale"
+                                     labels:@[ @"720p", @"1440p (2x)", @"2160p (3x)" ]
+                                     values:@[ @"1", @"2", @"3" ]];
++
++  // Screen: which axis of the game's frame fills the screen. Both are
++  // presenter-side and instant (the overlay's tick notices the change and
++  // re-derives the presenter cvars), and both also write the game's OWN screen
++  // settings so the player never has to find that menu. A "wide" mode was tried
++  // and removed: the title squeezes a non-16:9 video mode instead of rendering
++  // it (D-030).
++  RexSettingsRow* fill = [self segmentedRow:@"Screen"
++                                       cvar:@"screen_fill"
++                                     labels:@[ @"Fill width", @"Fill height" ]
++                                     values:@[ @"width", @"height" ]];
+ 
+   [self addSection:@"Graphics"
+             footer:@"The graphics switch is instant and works mid-game -- the same flip the "
+@@ -368,11 +379,16 @@
+                    @"Resolution 1440p renders the whole game at four times the pixels, "
+                    @"2160p (4K) at nine -- sharper, and that many times the fragment work. "
+                    @"2160p holds a 4.5 GB render buffer and is meant for Vision Pro. It "
+-                   @"also takes effect the next time the app is launched."
++                   @"also takes effect the next time the app is launched.\n"
++                   @"Fill width trims a little off the top and bottom and sets the game's "
++                   @"own Screen Letterbox to Wide and Screen Ratio to 16:9 for you. Fill "
++                   @"height shows the whole frame with bars at the sides and sets Letterbox "
++                   @"to Full."
+               rows:@[
+                 vtoggle,
+                 aa,
+                 res,
++                fill,
+               ]];
+ 
+   // --- Controls ---

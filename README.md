@@ -87,10 +87,11 @@ works with the game's own Xbox 360 layout, unchanged.
 **Touch controls** appear automatically when no controller is connected: a
 floating move stick on the left half of the screen, drag anywhere on the right to
 look, and buttons for **FIRE**, **AIM** (press and drag to aim), **USE**,
-**CROUCH**, **RELOAD**, **SWAP** and the menu. Every button can be moved — Settings
-→ Controls → *Customize Touch Layout* — and the layout can be exported and
-re-imported. Look sensitivity, invert axes (separately for each), button opacity,
-haptics and the crosshair style are all in Settings.
+**CROUCH**, **RELOAD**, **SWAP**, **GADGET** and the menu. While AIM is held a
+second FIRE appears under the left thumb, mirroring the right one, so you can
+aim with one hand and shoot with the other. Every button can be moved — Settings
+→ Controls → *Customize Touch Layout*. Look sensitivity, invert axes (separately
+for each), button opacity, haptics and the crosshair style are all in Settings.
 
 **On Apple Vision Pro**, a paired controller is strongly recommended. Without one,
 the touch overlay is driven by pinch: a pinch anywhere in the left half of the

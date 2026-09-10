@@ -1,0 +1,63 @@
+--- a/src/ui/audio_session_uikit.mm
++++ b/src/ui/audio_session_uikit.mm
+@@ -83,6 +83,7 @@
+   g_duck_gain.store(gain, std::memory_order_relaxed);
+ }
+ 
++bool g_session_applied = false;  // PollAudioSessionMode waits for the first apply
+ }  // namespace
+ 
+ // The SDL mixer's hook: multiplied into master_volume every callback. dlsym'd
+@@ -115,6 +116,31 @@
+   ];
+ }
+ 
++// Called about once a second from the overlay's display-link tick. SDL's
++// CoreAudio backend sets its OWN category when it opens the device
++// (SDL_coreaudio.m UpdateAudioSession: Playback + MixWithOthers + DuckOthers,
++// because sdl_audio_driver.cpp asks for the "playback" hint) -- and it opens
++// the device AFTER ApplyAudioSessionMode ran at boot. So at launch the session
++// carried SDL's options, the podcast was ducked and the game played full
++// (seen on device, 2026-09-10, mode 4); only the foreground re-apply put ours back.
++// Re-asserting on drift covers SDL's open, any later re-open, and the system.
++void PollAudioSessionMode() {
++  if (!g_session_applied) return;
++  AVAudioSession* s = AVAudioSession.sharedInstance;
++  const int mode = CurrentMode();
++  const NSUInteger want = OptionsForMode(mode);
++  if (![s.category isEqualToString:AVAudioSessionCategoryPlayback] ||
++      s.categoryOptions != want) {
++    REXLOG_INFO("audio session: drifted to {} opts {:#x}, re-asserting mode {}",
++                s.category.UTF8String, (unsigned long)s.categoryOptions, mode);
++    ApplyAudioSessionMode();
++    return;
++  }
++  // The other app may have started or stopped without the hint notification
++  // firing (it only fires for primary-audio changes we are secondary to).
++  RecomputeDuckGain(s);
++}
++
+ void ApplyAudioSessionMode() {
+   AVAudioSession* s = AVAudioSession.sharedInstance;
+   const int mode = CurrentMode();
+@@ -151,6 +177,7 @@
+   }
+ 
+   RecomputeDuckGain(s);
++  g_session_applied = true;
+ 
+   // Observers, once: the duck-game modes must react when the other app starts
+   // or stops MID-game, and the category is worth re-asserting on foreground
+--- a/include/rex/ui/settings_uikit.h
++++ b/include/rex/ui/settings_uikit.h
+@@ -53,6 +53,10 @@
+ /// attach, on foreground, and whenever the picker changes the mode. iOS /
+ /// visionOS only; defined in audio_session_uikit.mm.
+ void ApplyAudioSessionMode();
++/// Once a second from the overlay tick: re-assert the category if SDL or the
++/// system changed it (SDL sets its own on device open, after boot's apply),
++/// and refresh the game-side duck gain. Defined in audio_session_uikit.mm.
++void PollAudioSessionMode();
+ 
+ /// Player-facing names and one-sentence explanations for the five audio modes,
+ /// index == cvar value. NSArray<NSString*>* returned as void* so this header

@@ -1,0 +1,383 @@
+--- a/src/ui/touch_overlay_uikit.mm
++++ b/src/ui/touch_overlay_uikit.mm
+@@ -27,6 +27,7 @@
+ #import <UIKit/UIKit.h>
+ #import <QuartzCore/QuartzCore.h>  // CACurrentMediaTime (gear hide hysteresis)
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <string>
+ 
+@@ -64,6 +65,21 @@
+                       "game's own crosshair appears in aim mode regardless.")
+     .allowed({"off", "cross", "circle"})
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_STRING(screen_fill, "height", "GPU",
++                      "Which way the game's frame is made to fill the screen. width = fill "
++                      "the screen's width: a little is trimmed off the top and bottom, and "
++                      "the game's own SCREEN LETTERBOX is put into WIDE (which draws into a "
++                      "~2.38:1 band) so that what is trimmed is the band's surround rather "
++                      "than the picture. height = fill the screen's height: the whole 16:9 "
++                      "frame with bars at the sides, game letterbox FULL. A third mode, wide "
++                      "(report the screen's own aspect as the video mode), was tried and "
++                      "removed: bean does not render a non-16:9 mode, it squeezes the frame "
++                      "(D-030). The former fit/crop values are gone -- a ge.toml carrying "
++                      "one fails the allowed-values check in SetFlagByName, is not applied, "
++                      "and the compiled default (width) stands."
++                      )
++    .allowed({"width", "height"})
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(ge_n64_graphics, false, "GPU",
+                     "The player's remembered graphics choice: true = the original N64 look, "
+                     "false = remastered. The settings switch writes it and presses the game's "
+@@ -108,6 +124,173 @@
+ // XInput button bits, named here so the layout table below reads as controls
+ // rather than as magic numbers.
+ constexpr uint16_t kBtnA = 0x1000;
++// --- screen fill ---------------------------------------------------------
++//
++// The game's frame is 16:9. A modern phone is not (an iPhone Air is ~19.5:9,
++// an iPhone 17 Pro Max ~2.17:1), so something has to give. `screen_fill` is the
++// player's choice of WHICH axis fills the screen, and this is the only place
++// that turns it into runtime state:
++//
++//   width   fill the screen's width. The presenter trims the top and bottom of
++//           the frame, and -- because a bare width crop on a 2.17:1 screen
++//           still leaves the game's own black surround visible -- the game's
++//           SCREEN LETTERBOX is put into WIDE, which draws the picture into a
++//           ~2.38:1 band inside the 16:9 frame and moves the HUD in with it.
++//           The presenter then scales that BAND to the screen's height (see
++//           the zoom below), so what gets trimmed is the surround, not the
++//           picture, and no bars are left.
++//   height  fill the screen's height: the whole 16:9 frame, bars at the sides,
++//           game letterbox FULL. Nothing is trimmed.
++//
++// There was a "wide" mode (video_mode_width = 720 * screen aspect, so the game
++// itself would render the wider frame). On the phone it came up as a squeezed,
++// near-square image in the middle of the screen: the title does not honour a
++// non-16:9 video mode (seen on device, 1.0.0.2, 2026-09-10; D-030). Removed. The
++// video-mode cvars are still pinned to 1280x720 at startup so a ge.toml left
++// over from that build boots normally.
++//
++// present_* are set unconditionally for the chosen mode rather than only when
++// non-default: leaving a previous mode's values behind is how a "height" launch
++// would come up cropped.
++
++// The aspect of the band the game draws into with SCREEN LETTERBOX = WIDE, as a
++// constant because the presenter has to know it without being able to see it.
++// Measured off a 1.0.0.2 screenshot: the screen was 921 points tall and, at a
++// 2.1714:1 display aspect, was showing 720 * (16/9) / 2.1714 ~= 590 guest lines
++// of the frame; the picture occupied rows ~40..880, i.e. (840 / 921) * 590
++// ~= 538 guest lines of the 1280-wide frame -> 1280 / 538 ~= 2.38.
++constexpr double kGameWideBandAspect = 2.38;
++
++void ApplyScreenFill(uint32_t surface_w, uint32_t surface_h, bool at_startup) {
++  // Orientation-proof: this runs from -loadView, where UIScreen.bounds can
++  // still be reported portrait even though the app is landscape-only.
++  const uint32_t long_side = std::max<uint32_t>(1, std::max(surface_w, surface_h));
++  const uint32_t short_side = std::max<uint32_t>(1, std::min(surface_w, surface_h));
++  const double display_aspect = double(long_side) / double(short_side);
++  const double guest_aspect = 16.0 / 9.0;
++
++  const std::string mode = REXCVAR_GET(screen_fill);
++  const bool fill_width = (mode != "height");
++
++  bool overscan = false;
++  int32_t safe_x = 90, safe_y = 90;  // the cvars' own defaults
++  int32_t zoom = 100;                // present_zoom_percent, 100 = fit/crop rect
++  bool want_wide = false;            // ask the guest for SCREEN LETTERBOX = WIDE
++  const int32_t video_w = 1280, video_h = 720;
++
++  // Within 1% of 16:9 (a Vision Pro window) there is nothing to fill: both
++  // modes are the same picture, so neither trims a pixel.
++  const bool worth_it = std::abs(display_aspect - guest_aspect) > guest_aspect * 0.01;
++
++  if (display_aspect > guest_aspect) {
++    // The screen is WIDER than the frame. Filling the height is what the
++    // presenter does by default (bars at the sides); filling the width means
++    // cropping Y.
++    if (fill_width && worth_it) {
++      overscan = true;
++      want_wide = true;
++      // How much of the frame's height the presenter is allowed to crop away.
++      // Floor, so the margin can never round the other way and reintroduce a
++      // hairline bar. NOTE this only ever lets the presenter crop DOWN to the
++      // fill-width rectangle -- see the zoom below for the rest.
++      safe_y = int32_t(std::floor(100.0 * guest_aspect / display_aspect));
++      safe_y = std::clamp(safe_y, 1, 99);
++      // No extra zoom to the WIDE band (1.0.0.3 tried zoom = band / display,
++      // ~110% here). The band only exists in GAMEPLAY: the front-end menus
++      // and the watch are drawn across the whole frame, and the zoom took ~19%
++      // off the top and bottom of them (reported on device, 2026-09-10: "crops it quite a
++      // bit"). The thin bars the band leaves in gameplay are the price of
++      // menus that stay whole; kGameWideBandAspect is kept for a possible
++      // gameplay-only zoom keyed on GeInGameplay (D-031).
++      (void)kGameWideBandAspect;
++    }
++  } else {
++    // The screen is TALLER than the frame (a 4:3 iPad). Filling the width is
++    // the presenter's default here; filling the height means cropping X.
++    if (!fill_width && worth_it) {
++      overscan = true;
++      safe_x = int32_t(std::floor(100.0 * display_aspect / guest_aspect));
++      safe_x = std::clamp(safe_x, 1, 99);
++    }
++  }
++
++  auto set = [](const char* name, const std::string& value) {
++    // video_mode_* are kRequiresRestart. SetFlagByName only refuses kInitOnly
++    // cvars after FinalizeInit -- a restart-lifecycle cvar set here, before the
++    // guest has booted, is applied for real. The console bridge's separate
++    // refusal of restart cvars is a bridge-side policy and does not reach here.
++    if (!rex::cvar::SetFlagByName(name, value)) {
++      REXLOG_ERROR("screen fill: could not set {} = {}", name, value);
++    }
++  };
++  set("present_allow_overscan_cutoff", overscan ? "true" : "false");
++  set("present_safe_area_x", std::to_string(safe_x));
++  set("present_safe_area_y", std::to_string(safe_y));
++  set("present_zoom_percent", std::to_string(zoom));
++  if (at_startup) {
++    // Never at runtime: the guest read the mode at boot and is drawing into
++    // render targets sized from it.
++    set("video_mode_width", std::to_string(video_w));
++    set("video_mode_height", std::to_string(video_h));
++  }
++
++  // Write the game's OWN screen settings for the player -- the chosen picture is
++  // our crop PLUS the in-game SCREEN LETTERBOX / SCREEN RATIO pair, and nobody
++  // should have to find that menu. Resolved through dlsym exactly as
++  // GeInjectLookDelta and GeInGameplay are (the game module is linked in, but
++  // this file must not depend on it). The guest side stores the request and
++  // performs it on the next guest frame that has the settings struct.
++  {
++    using SetScreenFn = void (*)(int, int);
++    static SetScreenFn set_screen = nullptr;
++    if (!set_screen) {
++      set_screen = reinterpret_cast<SetScreenFn>(dlsym(RTLD_DEFAULT, "GeSetScreenSettings"));
++    }
++    if (set_screen) {
++      // letterbox: FULL = 0, WIDE = 1. ratio: 16:9 = 2, always -- the frame is
++      // 16:9 whatever we do with it at the edges.
++      // LETTERBOX FULL=0 / WIDE=1; RATIO 16:9=1 (bench 2026-09-10 -- the game's
++      // ratio encoding is NORMAL=0, 16:9=1, 21:9=2, not the menu's order).
++      set_screen(want_wide ? 1 : 0, 1);
++    } else {
++      REXLOG_ERROR(
++          "screen fill: GeSetScreenSettings not found -- the game's own screen settings are "
++          "left as the player last saved them");
++    }
++  }
++
++  REXLOG_INFO(
++      "screen fill: mode={} surface={}x{} aspect={:.4f} -> overscan={} safe_x={} safe_y={} "
++      "zoom={} game_letterbox={} video_mode={}x{}{}",
++      mode, surface_w, surface_h, display_aspect, overscan ? "true" : "false", safe_x, safe_y,
++      zoom, want_wide ? "wide" : "full",
++      at_startup ? video_w : rex::cvar::Query<int32_t>("video_mode_width"),
++      at_startup ? video_h : rex::cvar::Query<int32_t>("video_mode_height"),
++      at_startup ? "" : " (runtime: video mode untouched)");
++}
++
++// Cheap poll shared by the display-link tick: re-applies only when the mode or
++// the surface actually changed.
++void PollScreenFill(UIView* view) {
++  static std::string last_mode;
++  static uint32_t last_w = 0, last_h = 0;
++  const CGFloat scale = view.contentScaleFactor > 0 ? view.contentScaleFactor : (CGFloat)2.0;
++  const CGSize size = view.bounds.size;
++  const uint32_t w = uint32_t(std::lround(size.width * scale));
++  const uint32_t h = uint32_t(std::lround(size.height * scale));
++  const std::string mode = REXCVAR_GET(screen_fill);
++  if (mode == last_mode && w == last_w && h == last_h) {
++    return;
++  }
++  last_mode = mode;
++  last_w = w;
++  last_h = h;
++  if (w == 0 || h == 0) {
++    return;
++  }
++  ApplyScreenFill(w, h, false);
++}
++
+ constexpr uint16_t kBtnB = 0x2000;
+ constexpr uint16_t kBtnX = 0x4000;
+ constexpr uint16_t kBtnY = 0x8000;
+@@ -167,10 +350,12 @@
+ // Issue #1 (Kode-Z): a second FIRE under the LEFT thumb while AIM is held. In
+ // aim mode the player cannot move, so the stick's half of the screen is idle,
+ // and the right thumb is busy holding AIM and dragging the crosshair. The
+-// button exists only while AIM is down (let go of AIM and it is gone), takes
+-// precedence over the floating stick, is never in the editor and is never
+-// persisted: it sits exactly where FIRE would be if the screen were mirrored,
+-// so a custom FIRE placement carries across for free. unit_x/unit_y unused.
++// button exists only while AIM is down (let go of AIM and it is gone) and
++// takes precedence over the floating stick. By default it sits exactly where
++// FIRE would be if the screen were mirrored, so a custom FIRE placement carries
++// across for free; the editor can also place it explicitly (reported on device, 2026-09-10),
++// drawn with a fainter yellow ring there to say "temporary, aim-mode only".
++// unit_x/unit_y unused: the default is derived, not tabled.
+ const ButtonSpec kLeftFire = {"FIRE_L", "scope", kTriggerRight, 0.0f, 0.0f, 46.0f};
+ 
+ // Layout persistence (the editor's output). Unit coordinates of the FULL view
+@@ -349,14 +534,16 @@
+   _savedUnit = [NSMutableDictionary dictionary];
+   {
+     NSUserDefaults* d = NSUserDefaults.standardUserDefaults;
+-    for (const auto& spec : kButtons) {
++    auto load = [&](const ButtonSpec& spec) {
+       NSNumber* x = [d objectForKey:GePosKey(spec.label, "x")];
+       NSNumber* y = [d objectForKey:GePosKey(spec.label, "y")];
+       if (x && y) {
+         _savedUnit[@(spec.label)] =
+             [NSValue valueWithCGPoint:CGPointMake(x.doubleValue, y.doubleValue)];
+       }
+-    }
++    };
++    for (const auto& spec : kButtons) load(spec);
++    load(kLeftFire);
+     if (_savedUnit.count) {
+       // One line per button, so a customised layout can be read back over the
+       // bridge and baked into the defaults table (the user's layouts ARE the
+@@ -483,14 +670,20 @@
+   return kStickRadius * [self buttonScale];
+ }
+ 
+-// The aim-mode left FIRE: shown only while AIM is held and never in the
+-// editor, mirrored across the vertical centre line from wherever FIRE is
+-// (table default or the player's own placement). kButtons[0] is FIRE.
++// The aim-mode left FIRE: shown while AIM is held, and in the editor so it can
++// be placed. A saved position wins; otherwise it mirrors wherever FIRE is
++// (table default or the player's own placement) across the vertical centre
++// line. kButtons[0] is FIRE.
+ - (BOOL)leftFireVisible {
+-  return !_editing && [_heldButtons containsObject:@"AIM"];
++  return _editing || [_heldButtons containsObject:@"AIM"];
+ }
+ 
+ - (CGPoint)centreForLeftFire {
++  NSValue* saved = _savedUnit[@(kLeftFire.label)];
++  if (saved) {
++    const CGPoint u = saved.CGPointValue;
++    return CGPointMake(u.x * self.bounds.size.width, u.y * self.bounds.size.height);
++  }
+   const CGPoint fire = [self centreForButton:kButtons[0]];
+   return CGPointMake(self.bounds.size.width - fire.x, fire.y);
+ }
+@@ -529,7 +722,11 @@
+   if (_editing) {
+     CGPoint p = [[touches anyObject] locationInView:self];
+     NSString* label = [self buttonLabelAtPoint:p];
+-    if (label) {
++    if ([label isEqualToString:@(kLeftFire.label)]) {
++      CGPoint c = [self centreForLeftFire];
++      _dragLabel = label;
++      _dragOffset = CGSizeMake(c.x - p.x, c.y - p.y);
++    } else if (label) {
+       for (const auto& spec : kButtons) {
+         if (![label isEqualToString:@(spec.label)]) continue;
+         CGPoint c = [self centreForButton:spec];
+@@ -703,6 +900,8 @@
+     [d removeObjectForKey:GePosKey(spec.label, "x")];
+     [d removeObjectForKey:GePosKey(spec.label, "y")];
+   }
++  [d removeObjectForKey:GePosKey(kLeftFire.label, "x")];
++  [d removeObjectForKey:GePosKey(kLeftFire.label, "y")];
+   [_savedUnit removeAllObjects];
+   rex::cvar::SetFlagByName("touch_button_scale", "1.0");
+   rex::ui::PersistSettings();
+@@ -734,6 +933,12 @@
+       REXLOG_INFO("touch layout: {} at table default", spec.label);
+     }
+   }
++  if (NSValue* v = _savedUnit[@(kLeftFire.label)]) {
++    const CGPoint u = v.CGPointValue;
++    REXLOG_INFO("touch layout: saved {} at ({:.3f}, {:.3f})", kLeftFire.label, u.x, u.y);
++  } else {
++    REXLOG_INFO("touch layout: {} mirrors FIRE", kLeftFire.label);
++  }
+ 
+   UIView* bar = [[UIView alloc] initWithFrame:CGRectZero];
+   bar.translatesAutoresizingMaskIntoConstraints = NO;
+@@ -844,6 +1049,22 @@
+   // Nothing here has to run while the settings page is up, and the page is
+   // heavy enough on a thermally clamped phone without the overlay repainting
+   // underneath it.
++  // Screen fill: mode or bounds changed (a rotation, or the settings segment
++  // moved). Two integer compares and a string compare per tick; the work only
++  // happens when something actually changed. Ahead of the settings-visible
++  // return below so switching fit<->crop lands the moment the page closes.
++  PollScreenFill(self);
++  // Other-app audio policy: SDL re-sets the session category when it opens
++  // the device (after boot's apply), so re-assert ours about once a second.
++  {
++    static CFTimeInterval last_audio_poll = 0;
++    const CFTimeInterval now_t = CACurrentMediaTime();
++    if (now_t - last_audio_poll >= 1.0) {
++      last_audio_poll = now_t;
++      rex::ui::PollAudioSessionMode();
++    }
++  }
++
+   if (rex::ui::SettingsVisible()) {
+     _hud.hidden = YES;
+     return;
+@@ -1111,10 +1332,10 @@
+ 
+   // The glyph, tinted like the old text labels were. SF Symbol images carry
+   // their own aspect ratio; scale to fit a box proportional to the circle.
+-  auto glyph = [&](const char* name, CGPoint c, CGFloat r) {
++  auto glyph = [&](const char* name, CGPoint c, CGFloat r, CGFloat dim) {
+     UIImage* img = [UIImage systemImageNamed:@(name)];
+     if (!img) return;
+-    const CGFloat ga = _editing ? 0.95 : std::min(alpha * 2.2, 1.0);
++    const CGFloat ga = (_editing ? 0.95 : std::min(alpha * 2.2, 1.0)) * dim;
+     img = [img imageByApplyingSymbolConfiguration:
+                    [UIImageSymbolConfiguration
+                        configurationWithPointSize:std::max(r * 0.62, 10.0)
+@@ -1140,16 +1361,24 @@
+     } else {
+       stroke(c, r, held ? alpha * 2.0 : alpha, held);
+     }
+-    glyph(spec.glyph, c, r);
++    glyph(spec.glyph, c, r, 1.0);
+   }
+ 
+-  // Aim mode: the mirrored FIRE for the left thumb.
++  // Aim mode: the mirrored FIRE for the left thumb. In the editor it is drawn
++  // in a fainter yellow than the permanent buttons: placeable, but temporary.
+   if ([self leftFireVisible]) {
+     const CGPoint c = [self centreForLeftFire];
+     const CGFloat r = [self radiusFor:kLeftFire];
+     const BOOL held = [_heldButtons containsObject:@(kLeftFire.label)];
+-    stroke(c, r, held ? alpha * 2.0 : alpha, held);
+-    glyph(kLeftFire.glyph, c, r);
++    if (_editing) {
++      CGContextSetLineWidth(ctx, 2.5);
++      CGContextSetStrokeColorWithColor(
++          ctx, [UIColor colorWithRed:1 green:0.85 blue:0.4 alpha:0.45].CGColor);
++      CGContextStrokeEllipseInRect(ctx, CGRectMake(c.x - r, c.y - r, r * 2, r * 2));
++    } else {
++      stroke(c, r, held ? alpha * 2.0 : alpha, held);
++    }
++    glyph(kLeftFire.glyph, c, r, _editing ? 0.5 : 1.0);
+   }
+ 
+   // Always-on crosshair (off by default): drawn at the screen centre, where
+@@ -1327,6 +1556,15 @@
+   // The other-app audio policy wants its category in place before SDL's first
+   // session activation -- this is the earliest point after config load.
+   ApplyAudioSessionMode();
++  // Same window: ge.toml has been read, the screen size is known, and the
++  // guest has not booted yet -- so VdQueryVideoMode has not been called and
++  // the video-mode cvars pinned here are the ones the title will see.
++  {
++    const CGFloat scale = parent.contentScaleFactor > 0 ? parent.contentScaleFactor : (CGFloat)2.0;
++    const CGSize size = parent.bounds.size;
++    ApplyScreenFill(uint32_t(std::lround(size.width * scale)),
++                    uint32_t(std::lround(size.height * scale)), true);
++  }
+   REXLOG_INFO("touch overlay: attached");
+ }
+ 

@@ -1,0 +1,99 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -1464,12 +1464,96 @@
+                              .count();
+   if (now_ns - stamped > 1000000000LL) return 0;  // >1 s without a present
+   return 1;
++}
++
++// ===========================================================================
++// The game's own screen settings, written for the player.
++//
++// The best picture on a 2.17:1 phone is the host-side width crop PLUS the
++// game's own SCREEN LETTERBOX = WIDE and SCREEN RATIO = 16:9 (WIDE draws the
++// picture into a ~2.38:1 band inside the 16:9 frame and moves the HUD in with
++// it, so the host crop trims surround rather than picture). Nobody should have
++// to go find that menu, so the host's "Screen" setting writes the pair here.
++//
++// The host (touch_overlay_uikit.mm, ApplyScreenFill) calls GeSetScreenSettings
++// from the UIKit thread; it only records the request. The write itself happens
++// on the guest thread from the per-frame present hook, where `base` is live and
++// the settings struct can be dereferenced safely.
++namespace {
++// The settings struct pointer -- the same one ge_mouse_camera pokes for the
++// auto-aim / look-ahead bitflags (GE_SETTINGS_PTR / +0x298, declared again down
++// there where the mouse-look block keeps its address table).
++constexpr uint32_t GESCR_SETTINGS_PTR = 0x83088228u;
++
++// Bench, 2026-09-10 (an iPhone over the :8773 bridge, GEPEEK/GEPOKE):
++// both settings are bit fields in the SAME u32 as the auto-aim / look-ahead
++// flags, settings+0x298. Four readings:
++//   WIDE  + 16:9   0x00041562
++//   FULL  + NORMAL 0x00040162
++//   CINEMA+ NORMAL 0x00040962
++//   FULL  + 21:9   0x00042162
++// so LETTERBOX = bits 10-11 (FULL=0, WIDE=1, CINEMA=2) and RATIO = bits 12-13
++// (NORMAL=0, 16:9=1, 21:9=2 -- NOT the menu's display order). A GEPOKE of the
++// byte holding those bits flipped the watch menu live without a relaunch.
++constexpr uint32_t GE_OFF_SCREEN_FLAGS = 0x298u;
++constexpr uint32_t GE_LETTERBOX_SHIFT = 10;
++constexpr uint32_t GE_RATIO_SHIFT = 12;
++constexpr uint32_t GE_SCREEN_MASK = 0x3C00u;
++
++std::atomic<int> g_scr_letterbox{-1};  // -1 = leave alone
++std::atomic<int> g_scr_ratio{-1};
++std::atomic<bool> g_scr_pending{false};
++std::atomic<uint32_t> g_scr_last_sp{0};
++
++// Guest thread, from the present hook.
++void ge_screen_settings_tick(uint8_t* base) {
++  const uint32_t sp = LD32(base, GESCR_SETTINGS_PTR);
++
++  // Enforced EVERY frame, not once: a one-shot write at boot landed, and the
++  // game then loaded its saved profile into the same struct (pointer
++  // unchanged) and put the old values back -- 1.0.0.4 on device read
++  // FULL+NORMAL with the app on Fill width, hence "still some in-game
++  // cropping" (the presenter was cropping a FULL frame). While the host has
++  // asked for a value, the field follows it; the watch menu's own row is
++  // therefore overridden for as long as the app setting owns it. A u32 compare
++  // per frame; the store and the log only happen on a difference.
++  (void)g_scr_last_sp;
++  (void)g_scr_pending;
++  if (!sp) return;
++
++  const int want_letterbox = g_scr_letterbox.load(std::memory_order_relaxed);
++  const int want_ratio = g_scr_ratio.load(std::memory_order_relaxed);
++  if (want_letterbox < 0 && want_ratio < 0) return;
++
++  const uint32_t addr = sp + GE_OFF_SCREEN_FLAGS;
++  const uint32_t was = LD32(base, addr);
++  uint32_t now = was;
++  if (want_letterbox >= 0) {
++    now = (now & ~(3u << GE_LETTERBOX_SHIFT)) | ((uint32_t(want_letterbox) & 3u) << GE_LETTERBOX_SHIFT);
++  }
++  if (want_ratio >= 0) {
++    now = (now & ~(3u << GE_RATIO_SHIFT)) | ((uint32_t(want_ratio) & 3u) << GE_RATIO_SHIFT);
++  }
++  if (now == was) return;
++  ST32(base, addr, now);
++  REXKRNL_INFO("GESCREEN: flags {:#x} -> {:#x} (letterbox {} ratio {})", was, now,
++               (now >> GE_LETTERBOX_SHIFT) & 3u, (now >> GE_RATIO_SHIFT) & 3u);
++}
++}  // namespace
++
++// Host-callable (dlsym'd by the touch overlay exactly as GeInjectLookDelta is).
++// -1 for either argument means "leave that one alone".
++extern "C" void GeSetScreenSettings(int letterbox, int ratio) {
++  g_scr_letterbox.store(letterbox, std::memory_order_relaxed);
++  g_scr_ratio.store(ratio, std::memory_order_relaxed);
++  g_scr_pending.store(true, std::memory_order_relaxed);
+ }
+ 
+ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
+   PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx; (void)base;
+   g_ui_guest_base.store(base, std::memory_order_relaxed);
+   ge_gameplay_state_tick(base);
++  ge_screen_settings_tick(base);
+   (void)r30;
+   uint32_t a1 = r31.u32;
+   auto* cpp = ge_cp();

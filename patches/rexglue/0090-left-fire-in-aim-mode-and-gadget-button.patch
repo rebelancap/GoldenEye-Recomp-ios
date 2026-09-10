@@ -1,0 +1,293 @@
+--- a/src/ui/touch_overlay_uikit.mm
++++ b/src/ui/touch_overlay_uikit.mm
+@@ -155,10 +155,23 @@
+     {"CROUCH", "arrow.down", kBtnLThumb, 0.9443f, 0.9175f, 28.0f},
+     {"RELOAD", "arrow.triangle.2.circlepath", kBtnX, 0.8521f, 0.5119f, 28.0f},
+     {"SWAP", "arrow.left.arrow.right", kBtnY, 0.9554f, 0.7214f, 28.0f},
++    // Gadgets (issue #1): B cycles the watch gadgets. Parked just above RELOAD
++    // and AIM, clear of the fire/aim thumb path. (M-089 saw a B pulse land on
++    // "unarmed" -- that is the gadget cycle passing through the empty slot.)
++    {"GADGET", "briefcase.fill", kBtnB, 0.8918f, 0.3800f, 28.0f},
+     // The ≡ glyph, not a pause bar: the same button is START in the front-end
+     // menus, and ≡ is the family's established "menu" mark (quake ports).
+     {"START", "line.3.horizontal", kBtnStart, 0.9400f, 0.0992f, 20.0f},
+ };
++
++// Issue #1 (Kode-Z): a second FIRE under the LEFT thumb while AIM is held. In
++// aim mode the player cannot move, so the stick's half of the screen is idle,
++// and the right thumb is busy holding AIM and dragging the crosshair. The
++// button exists only while AIM is down (let go of AIM and it is gone), takes
++// precedence over the floating stick, is never in the editor and is never
++// persisted: it sits exactly where FIRE would be if the screen were mirrored,
++// so a custom FIRE placement carries across for free. unit_x/unit_y unused.
++const ButtonSpec kLeftFire = {"FIRE_L", "scope", kTriggerRight, 0.0f, 0.0f, 46.0f};
+ 
+ // Layout persistence (the editor's output). Unit coordinates of the FULL view
+ // bounds, one pair per button label, NSUserDefaults -- the same shape as the
+@@ -194,6 +207,9 @@
+   // pixels (the ghost-ring bug). CGRectNull when nothing was drawn.
+   CGRect _stickPrevDirty;
+   CGPoint _stickCurrent;
++  // Same idea for the aim-mode left FIRE: it appears and disappears with AIM,
++  // and its old pixels must be repainted when it goes.
++  CGRect _leftFirePrevDirty;
+ 
+   UITouch* _lookTouch;
+   CGPoint _lookLast;
+@@ -260,6 +276,12 @@
+ // game underneath ever produced a frame.
+ - (void)writeSelftest {
+   [self writeSelftestNamed:@"touch-overlay.png"];
++  // Once more in aim mode, so the gate photographs the left FIRE button that
++  // exists only while AIM is held.
++  [_heldButtons addObject:@"AIM"];
++  [self writeSelftestNamed:@"touch-overlay-aim.png"];
++  [_heldButtons removeObject:@"AIM"];
++  [self setNeedsDisplay];
+ }
+ 
+ - (void)writeSelftestNamed:(NSString*)filename {
+@@ -271,6 +293,11 @@
+   fmt.opaque = YES;  // over an opaque dark backdrop, since the game is not drawing here
+   UIGraphicsImageRenderer* renderer =
+       [[UIGraphicsImageRenderer alloc] initWithSize:size format:fmt];
++  // Rasterise the CURRENT state first: renderInContext draws whatever the layer
++  // last cached, and the aim-mode frame below is taken right after a state
++  // change without a run-loop turn in between.
++  [self.layer setNeedsDisplay];
++  [self.layer displayIfNeeded];
+   UIImage* image = [renderer imageWithActions:^(UIGraphicsImageRendererContext* c) {
+     CGContextSetFillColorWithColor(c.CGContext, [UIColor colorWithWhite:0.1 alpha:1.0].CGColor);
+     CGContextFillRect(c.CGContext, CGRectMake(0, 0, size.width, size.height));
+@@ -318,6 +345,7 @@
+   _buttonTouches = [NSMutableDictionary dictionary];
+   _heldButtons = [NSMutableSet set];
+   _stickPrevDirty = CGRectNull;
++  _leftFirePrevDirty = CGRectNull;
+   _savedUnit = [NSMutableDictionary dictionary];
+   {
+     NSUserDefaults* d = NSUserDefaults.standardUserDefaults;
+@@ -408,6 +436,18 @@
+     [self setNeedsDisplayInRect:stick_dirty];
+   }
+   _stickPrevDirty = stick_now;
++  // The left FIRE is on the far side of the screen from the cluster: its own
++  // rect, not a union with the cluster's, or every invalidation would span the
++  // whole width and the partial-repaint optimisation would be gone.
++  CGRect lf_now = CGRectNull;
++  if ([self leftFireVisible]) {
++    const CGPoint c = [self centreForLeftFire];
++    const CGFloat br = [self radiusFor:kLeftFire] + 4.0;
++    lf_now = CGRectMake(c.x - br, c.y - br, br * 2, br * 2);
++  }
++  CGRect lf_dirty = CGRectUnion(lf_now, _leftFirePrevDirty);
++  if (!CGRectIsNull(lf_dirty)) [self setNeedsDisplayInRect:lf_dirty];
++  _leftFirePrevDirty = lf_now;
+   // The button cluster's bounding box, from the same table the buttons draw
+   // from, so the two cannot drift apart.
+   CGRect cluster = CGRectNull;
+@@ -443,7 +483,27 @@
+   return kStickRadius * [self buttonScale];
+ }
+ 
++// The aim-mode left FIRE: shown only while AIM is held and never in the
++// editor, mirrored across the vertical centre line from wherever FIRE is
++// (table default or the player's own placement). kButtons[0] is FIRE.
++- (BOOL)leftFireVisible {
++  return !_editing && [_heldButtons containsObject:@"AIM"];
++}
++
++- (CGPoint)centreForLeftFire {
++  const CGPoint fire = [self centreForButton:kButtons[0]];
++  return CGPointMake(self.bounds.size.width - fire.x, fire.y);
++}
++
+ - (NSString*)buttonLabelAtPoint:(CGPoint)p {
++  // Checked first: while it is up it supersedes the floating stick, which
++  // shares its half of the screen (no moving in aim mode anyway).
++  if ([self leftFireVisible]) {
++    const CGPoint c = [self centreForLeftFire];
++    const CGFloat dx = p.x - c.x, dy = p.y - c.y;
++    const CGFloat hit = [self radiusFor:kLeftFire] * 1.25f;
++    if (dx * dx + dy * dy <= hit * hit) return @(kLeftFire.label);
++  }
+   for (const auto& spec : kButtons) {
+     CGPoint c = [self centreForButton:spec];
+     CGFloat dx = p.x - c.x, dy = p.y - c.y;
+@@ -579,6 +639,14 @@
+       _aimDragTouch = nil;
+     }
+   }
++  if (![_heldButtons containsObject:@"AIM"] && [_heldButtons containsObject:@"FIRE_L"]) {
++    // The left FIRE lives only in aim mode: letting go of AIM releases it too,
++    // finger still on the glass or not -- an invisible button must not fire.
++    [_heldButtons removeObject:@"FIRE_L"];
++    for (NSValue* k in _buttonTouches.allKeys) {
++      if ([_buttonTouches[k] isEqualToString:@"FIRE_L"]) [_buttonTouches removeObjectForKey:k];
++    }
++  }
+   [self invalidateControls];
+ }
+ 
+@@ -988,6 +1056,10 @@
+   // every tick regardless of which path consumed them.
+   _lookAccumX = _lookAccumY = 0.0f;
+ 
++  // The left FIRE is not in the table; it counts only while AIM is held.
++  if ([_heldButtons containsObject:@"FIRE_L"] && [_heldButtons containsObject:@"AIM"]) {
++    state.right_trigger = 255;
++  }
+   for (NSString* label in _heldButtons) {
+     for (const auto& spec : kButtons) {
+       if (![label isEqualToString:@(spec.label)]) continue;
+@@ -1037,6 +1109,22 @@
+   // Drawing it here marked the whole full-screen view dirty every tick, which
+   // cost 2.5 fps of a 37 fps frame rate on device (M-059).
+ 
++  // The glyph, tinted like the old text labels were. SF Symbol images carry
++  // their own aspect ratio; scale to fit a box proportional to the circle.
++  auto glyph = [&](const char* name, CGPoint c, CGFloat r) {
++    UIImage* img = [UIImage systemImageNamed:@(name)];
++    if (!img) return;
++    const CGFloat ga = _editing ? 0.95 : std::min(alpha * 2.2, 1.0);
++    img = [img imageByApplyingSymbolConfiguration:
++                   [UIImageSymbolConfiguration
++                       configurationWithPointSize:std::max(r * 0.62, 10.0)
++                                           weight:UIImageSymbolWeightSemibold]];
++    img = [img imageWithTintColor:[UIColor colorWithWhite:1.0 alpha:ga]
++                    renderingMode:UIImageRenderingModeAlwaysOriginal];
++    const CGSize is = img.size;
++    [img drawInRect:CGRectMake(c.x - is.width / 2, c.y - is.height / 2, is.width, is.height)];
++  };
++
+   for (const auto& spec : kButtons) {
+     CGPoint c = [self centreForButton:spec];
+     NSString* label = @(spec.label);
+@@ -1052,21 +1140,16 @@
+     } else {
+       stroke(c, r, held ? alpha * 2.0 : alpha, held);
+     }
++    glyph(spec.glyph, c, r);
++  }
+ 
+-    // The glyph, tinted like the old text labels were. SF Symbol images carry
+-    // their own aspect ratio; scale to fit a box proportional to the circle.
+-    UIImage* img = [UIImage systemImageNamed:@(spec.glyph)];
+-    if (img) {
+-      const CGFloat ga = _editing ? 0.95 : std::min(alpha * 2.2, 1.0);
+-      img = [img imageByApplyingSymbolConfiguration:
+-                     [UIImageSymbolConfiguration
+-                         configurationWithPointSize:std::max(r * 0.62, 10.0)
+-                                             weight:UIImageSymbolWeightSemibold]];
+-      img = [img imageWithTintColor:[UIColor colorWithWhite:1.0 alpha:ga]
+-                      renderingMode:UIImageRenderingModeAlwaysOriginal];
+-      const CGSize is = img.size;
+-      [img drawInRect:CGRectMake(c.x - is.width / 2, c.y - is.height / 2, is.width, is.height)];
+-    }
++  // Aim mode: the mirrored FIRE for the left thumb.
++  if ([self leftFireVisible]) {
++    const CGPoint c = [self centreForLeftFire];
++    const CGFloat r = [self radiusFor:kLeftFire];
++    const BOOL held = [_heldButtons containsObject:@(kLeftFire.label)];
++    stroke(c, r, held ? alpha * 2.0 : alpha, held);
++    glyph(kLeftFire.glyph, c, r);
+   }
+ 
+   // Always-on crosshair (off by default): drawn at the screen centre, where
+@@ -1186,38 +1269,6 @@
+   });
+ }
+ 
+-void* ExportTouchLayout() {
+-  // Composed from NSUserDefaults directly rather than the overlay's mirror,
+-  // so it works even if the overlay never attached this session.
+-  NSUserDefaults* d = NSUserDefaults.standardUserDefaults;
+-  NSMutableString* text = [NSMutableString
+-      stringWithFormat:@"GoldenEye touch layout (%@)\nscale %.3f\n",
+-                       NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"],
+-                       std::clamp(REXCVAR_GET(touch_button_scale), 0.5, 2.0)];
+-  for (const auto& spec : kButtons) {
+-    NSNumber* x = [d objectForKey:GePosKey(spec.label, "x")];
+-    NSNumber* y = [d objectForKey:GePosKey(spec.label, "y")];
+-    if (x && y) {
+-      [text appendFormat:@"%s %.4f %.4f\n", spec.label, x.doubleValue, y.doubleValue];
+-    } else {
+-      [text appendFormat:@"%s (table default)\n", spec.label];
+-    }
+-  }
+-  // Side effects: the bridge's log window and the Files app both get a copy.
+-  for (NSString* line in [text componentsSeparatedByString:@"\n"]) {
+-    if (line.length) REXLOG_INFO("layout export: {}", line.UTF8String);
+-  }
+-  auto path = rex::filesystem::GetDocumentsFolder() / "touch-layout.txt";
+-  NSError* err = nil;
+-  if (![text writeToFile:@(path.string().c_str())
+-              atomically:YES
+-                encoding:NSUTF8StringEncoding
+-                   error:&err]) {
+-    REXLOG_ERROR("layout export: write failed: {}", err.description.UTF8String ?: "?");
+-  }
+-  return (__bridge_retained void*)text;
+-}
+-
+ void AttachTouchOverlay(void* parent_view) {
+   UIView* parent = (__bridge UIView*)parent_view;
+   if (!parent) {
+--- a/src/ui/settings_uikit.mm
++++ b/src/ui/settings_uikit.mm
+@@ -388,27 +388,9 @@
+                    dispatch_get_main_queue(), ^{ rex::ui::BeginTouchLayoutEdit(); });
+   };
+ 
+-  // One tap turns the saved layout into text: share sheet + clipboard +
+-  // Documents/touch-layout.txt + the console bridge's log, all at once --
+-  // no re-nudging, no racing the log window (the user, 2026-08-08).
+-  __weak __typeof(self) weakExportSelf = self;
+-  RexSettingsRow* exportLayout = [RexSettingsRow new];
+-  exportLayout.kind = RexRowAction;
+-  exportLayout.title = @"Export Touch Layout…";
+-  exportLayout.action = ^{
+-    __typeof(self) strong = weakExportSelf;
+-    if (!strong) return;
+-    NSString* text = (__bridge_transfer NSString*)rex::ui::ExportTouchLayout();
+-    UIPasteboard.generalPasteboard.string = text;
+-    UIActivityViewController* share =
+-        [[UIActivityViewController alloc] initWithActivityItems:@[ text ]
+-                                          applicationActivities:nil];
+-    // iPad/visionOS present popovers from a rect; anchor to the view centre.
+-    share.popoverPresentationController.sourceView = strong.view;
+-    share.popoverPresentationController.sourceRect =
+-        CGRectMake(CGRectGetMidX(strong.view.bounds), CGRectGetMidY(strong.view.bounds), 1, 1);
+-    [strong presentViewController:share animated:YES completion:nil];
+-  };
++  // (The "Export Touch Layout" row is gone, 2026-09-10: players never needed
++  // it, and a customised layout is already readable over the bridge -- every
++  // saved position is logged at attach and again when the editor opens.)
+ 
+   [self addSection:@"Controls"
+             footer:@"A long swipe turns exactly as far as several short ones."
+@@ -443,7 +425,6 @@
+                             labels:@[ @"Off", @"Cross", @"Circle" ]
+                             values:@[ @"off", @"cross", @"circle" ]],
+                 customize,
+-                exportLayout,
+               ]];
+ 
+   // --- Audio ---
+--- a/include/rex/ui/touch_controls.h
++++ b/include/rex/ui/touch_controls.h
+@@ -73,14 +73,6 @@
+ /// does not exist. Defined in touch_overlay_uikit.mm.
+ void BeginTouchLayoutEdit();
+ 
+-/// The current touch layout as human-readable text (an NSString*, bridged as
+-/// void* to keep this header C++-clean): one line per button, unit coords of
+-/// the screen, plus the scale. Also logs every line and writes
+-/// Documents/touch-layout.txt as side effects, so the same tap serves the
+-/// share sheet, the Files app, and the console bridge. Defined in
+-/// touch_overlay_uikit.mm.
+-void* ExportTouchLayout();
+-
+ /// The deadzone and curve constants, exposed for tests and for the settings UI.
+ inline constexpr float kStickDeadzone = 0.15f;
+ inline constexpr float kStickLinearWeight = 0.4f;
