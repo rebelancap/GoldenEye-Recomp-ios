@@ -1,0 +1,519 @@
+--- a/src/ui/touch_overlay_uikit.mm
++++ b/src/ui/touch_overlay_uikit.mm
+@@ -65,25 +65,12 @@
+                       "game's own crosshair appears in aim mode regardless.")
+     .allowed({"off", "cross", "circle"})
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+-REXCVAR_DEFINE_STRING(screen_fill, "height", "GPU",
+-                      "Which way the game's frame is made to fill the screen. width = fill "
+-                      "the screen's width: a little is trimmed off the top and bottom, and "
+-                      "the game's own SCREEN LETTERBOX is put into WIDE (which draws into a "
+-                      "~2.38:1 band) so that what is trimmed is the band's surround rather "
+-                      "than the picture. height = fill the screen's height: the whole 16:9 "
+-                      "frame with bars at the sides, game letterbox FULL. A third mode, wide "
+-                      "(report the screen's own aspect as the video mode), was tried and "
+-                      "removed: bean does not render a non-16:9 mode, it squeezes the frame "
+-                      "(D-030). The former fit/crop values are gone -- a ge.toml carrying "
+-                      "one fails the allowed-values check in SetFlagByName, is not applied, "
+-                      "and the compiled default (width) stands. 21:9 = the game's own "
+-                      "anamorphic SCREEN RATIO = 21:9 (a 21:9 view squeezed into the 16:9 "
+-                      "frame), stretched back out across a 21:9-ish phone screen, or shown "
+-                      "as a 21:9 band with bars on a 16:9 / 4:3 display (issue #1 follow-up, "
+-                      "D-032)."
+-                      )
+-    .allowed({"width", "height", "21:9"})
+-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(screen_player_set, false, "GPU",
++                    "Set once the player has changed the game's own SCREEN LETTERBOX / "
++                    "SCREEN RATIO rows themselves. Until then every launch seeds the pair "
++                    "to FULL + 21:9 during the boot window, so a fresh install comes up "
++                    "filling the phone (D-033). The app never writes the pair otherwise; "
++                    "it follows whatever the game says.");
+ REXCVAR_DEFINE_BOOL(ge_n64_graphics, false, "GPU",
+                     "The player's remembered graphics choice: true = the original N64 look, "
+                     "false = remastered. The settings switch writes it and presses the game's "
+@@ -128,33 +115,46 @@
+ // XInput button bits, named here so the layout table below reads as controls
+ // rather than as magic numbers.
+ constexpr uint16_t kBtnA = 0x1000;
+-// --- screen fill ---------------------------------------------------------
++// --- screen presentation ---------------------------------------------------
+ //
+-// The game's frame is 16:9. A modern phone is not (an iPhone Air is ~19.5:9,
+-// an iPhone 17 Pro Max ~2.17:1), so something has to give. `screen_fill` is the
+-// player's choice of WHICH axis fills the screen, and this is the only place
+-// that turns it into runtime state:
++// The app FOLLOWS the game's own SCREEN LETTERBOX / SCREEN RATIO (D-033). The
++// player picks them in the game's front-end or watch menu, exactly as on the
++// Xbox; the guest hook samples the pair every frame (GeGetScreenSettings) and
++// this code derives the best presentation of the 1280x720 frame for it:
+ //
+-//   width   fill the screen's width. The presenter trims the top and bottom of
+-//           the frame, and -- because a bare width crop on a 2.17:1 screen
+-//           still leaves the game's own black surround visible -- the game's
+-//           SCREEN LETTERBOX is put into WIDE, which draws the picture into a
+-//           ~2.38:1 band inside the 16:9 frame and moves the HUD in with it.
+-//           The presenter then scales that BAND to the screen's height (see
+-//           the zoom below), so what gets trimmed is the surround, not the
+-//           picture, and no bars are left.
+-//   height  fill the screen's height: the whole 16:9 frame, bars at the sides,
+-//           game letterbox FULL. Nothing is trimmed.
++//   RATIO 21:9         anamorphic: a 21:9 view squeezed into the 16:9 frame,
++//                      meant for a display that stretches it back out. The
++//                      presenter is told the frame's true shape is 21:9; on a
++//                      screen within 10% of that it stretches (the whole phone,
++//                      nothing trimmed, no bars -- the 1.0.0 toml recipe from
++//                      issue #1); elsewhere it fits a correct 21:9 band. On
++//                      Vision Pro the window itself is re-requested at 21:9, so
++//                      the fit is exact and there are no bars either.
++//   LETTERBOX WIDE     (ratio 16:9 / normal) the game draws gameplay into a
++//                      ~2.38:1 band inside the frame and moves the HUD in with
++//                      it. On a phone the presenter trims the frame to the
++//                      screen's width and, in ACTIVE gameplay only, zooms the
++//                      band to the screen's height -- the band fills the screen
++//                      edge to edge. Menus and the watch are full-frame, so the
++//                      zoom is off there (1.0.0.3 zoomed always and took 19% off
++//                      them, D-031); they keep the width trim only.
++//   LETTERBOX CINEMA   as WIDE without the zoom (the band's shape is unmeasured).
++//   LETTERBOX FULL     (ratio 16:9 / normal) the whole 16:9 frame, bars at the
++//                      sides. Nothing is trimmed.
+ //
+-// There was a "wide" mode (video_mode_width = 720 * screen aspect, so the game
+-// itself would render the wider frame). On the phone it came up as a squeezed,
+-// near-square image in the middle of the screen: the title does not honour a
+-// non-16:9 video mode (seen on device, 1.0.0.2, 2026-09-10; D-030). Removed. The
+-// video-mode cvars are still pinned to 1280x720 at startup so a ge.toml left
++// A fresh install is seeded to FULL + 21:9 during the boot window (see
++// screen_player_set and GeSetScreenSeed); the first time the player changes the
++// pair, the flag is persisted and no launch seeds again.
++//
++// There was a "wide" video mode (video_mode_width = 720 * screen aspect, so
++// the game itself would render the wider frame). On the phone it came up as a
++// squeezed, near-square image in the middle of the screen: the title does not
++// honour a non-16:9 video mode (seen on device, 1.0.0.2, 2026-09-10; D-030).
++// The video-mode cvars are pinned to 1280x720 at startup so a ge.toml left
+ // over from that build boots normally.
+ //
+-// present_* are set unconditionally for the chosen mode rather than only when
+-// non-default: leaving a previous mode's values behind is how a "height" launch
++// present_* are set unconditionally for the derived look rather than only when
++// non-default: leaving a previous look's values behind is how a FULL launch
+ // would come up cropped.
+ 
+ // The aspect of the band the game draws into with SCREEN LETTERBOX = WIDE, as a
+@@ -164,77 +164,78 @@
+ // of the frame; the picture occupied rows ~40..880, i.e. (840 / 921) * 590
+ // ~= 538 guest lines of the 1280-wide frame -> 1280 / 538 ~= 2.38.
+ constexpr double kGameWideBandAspect = 2.38;
++constexpr double kUltrawideAspect = 21.0 / 9.0;
+ 
+-void ApplyScreenFill(uint32_t surface_w, uint32_t surface_h, bool at_startup) {
+-  // Orientation-proof: this runs from -loadView, where UIScreen.bounds can
++// The game's encodings (bench 2026-09-10, D-031).
++constexpr int kGameLetterboxFull = 0, kGameLetterboxWide = 1, kGameLetterboxCinema = 2;
++constexpr int kGameRatioNormal = 0, kGameRatio169 = 1, kGameRatio219 = 2;
++// What a fresh install is seeded to.
++constexpr int kSeedLetterbox = kGameLetterboxFull;
++constexpr int kSeedRatio = kGameRatio219;
++
++
++#if TARGET_OS_VISION
++extern "C" void RexRequestVisionWindowSize(void* ui_window_scene, double width, double height);  // window_uikit.mm
++#endif
++
++using GetScreenFn = int (*)(int*, int*);
++using SeedScreenFn = void (*)(int, int);
++using SeedOpenFn = int (*)(void);
++using InGameplayQueryFn = int (*)(void);
++
++GetScreenFn ScreenGetFn() {
++  static GetScreenFn fn = reinterpret_cast<GetScreenFn>(dlsym(RTLD_DEFAULT, "GeGetScreenSettings"));
++  return fn;
++}
++SeedOpenFn ScreenSeedOpenFn() {
++  static SeedOpenFn fn = reinterpret_cast<SeedOpenFn>(dlsym(RTLD_DEFAULT, "GeScreenSeedWindowOpen"));
++  return fn;
++}
++
++void ApplyScreenPresentation(uint32_t surface_w, uint32_t surface_h, int game_letterbox,
++                             int game_ratio, bool gameplay, bool at_startup, UIView* view) {
++  // Orientation-proof: this can run from -loadView, where UIScreen.bounds can
+   // still be reported portrait even though the app is landscape-only.
+   const uint32_t long_side = std::max<uint32_t>(1, std::max(surface_w, surface_h));
+   const uint32_t short_side = std::max<uint32_t>(1, std::min(surface_w, surface_h));
+   const double display_aspect = double(long_side) / double(short_side);
+   const double guest_aspect = 16.0 / 9.0;
+ 
+-  const std::string mode = REXCVAR_GET(screen_fill);
+-  const bool ultrawide = (mode == "21:9");
+-  const bool fill_width = (mode != "height");
+-
+   bool overscan = false;
+   int32_t safe_x = 90, safe_y = 90;  // the cvars' own defaults
+   int32_t zoom = 100;                // present_zoom_percent, 100 = fit/crop rect
+-  bool want_wide = false;            // ask the guest for SCREEN LETTERBOX = WIDE
+-  int game_ratio = 1;                // SCREEN RATIO: NORMAL=0, 16:9=1, 21:9=2
+   int32_t aspect_ox = 0, aspect_oy = 0;  // present_aspect_override_*, 0 = off
+   bool present_letterbox = true;     // false = stretch the fitted rect over the surface
+   const int32_t video_w = 1280, video_h = 720;
++  const char* look = "full frame, bars at the sides";
+ 
+-  // Within 1% of 16:9 (a Vision Pro window) there is nothing to fill: both
+-  // modes are the same picture, so neither trims a pixel.
+-  const bool worth_it = std::abs(display_aspect - guest_aspect) > guest_aspect * 0.01;
++  // Within 1% of 16:9 (a Vision Pro window at its default shape) there is
++  // nothing to trim for the 16:9 looks.
++  const bool wider_than_frame = display_aspect > guest_aspect * 1.01;
+ 
+-  if (ultrawide) {
+-    // 21:9 -- the recipe a player used on 1.0.0 (issue #1, 2026-09-10): the
+-    // game's SCREEN RATIO = 21:9 draws a 21:9 view horizontally squeezed into
+-    // the 16:9 frame (anamorphic, for ultrawide TVs), and present_letterbox=false
+-    // in ge.toml stretched that frame across the whole phone. Proportions come
+-    // out right to within the screen-vs-21:9 difference (a 2.17:1 iPhone: ~7%
+-    // narrower than true, nothing cropped, no bars). The presenter is told the
+-    // frame's true shape is 21:9; on a screen within 10% of that it stretches
+-    // (the recipe exactly), on anything else -- a 16:9 Vision Pro window, a 4:3
+-    // iPad -- it fits a correct 21:9 band with bars, since stretching there
+-    // would visibly squeeze.
+-    game_ratio = 2;
++  if (game_ratio == kGameRatio219) {
+     aspect_ox = 21;
+     aspect_oy = 9;
+-    present_letterbox = std::abs(display_aspect - 21.0 / 9.0) > (21.0 / 9.0) * 0.10;
+-  } else if (display_aspect > guest_aspect) {
+-    // The screen is WIDER than the frame. Filling the height is what the
+-    // presenter does by default (bars at the sides); filling the width means
+-    // cropping Y.
+-    if (fill_width && worth_it) {
+-      overscan = true;
+-      want_wide = true;
+-      // How much of the frame's height the presenter is allowed to crop away.
+-      // Floor, so the margin can never round the other way and reintroduce a
+-      // hairline bar. NOTE this only ever lets the presenter crop DOWN to the
+-      // fill-width rectangle -- see the zoom below for the rest.
+-      safe_y = int32_t(std::floor(100.0 * guest_aspect / display_aspect));
+-      safe_y = std::clamp(safe_y, 1, 99);
+-      // No extra zoom to the WIDE band (1.0.0.3 tried zoom = band / display,
+-      // ~110% here). The band only exists in GAMEPLAY: the front-end menus
+-      // and the watch are drawn across the whole frame, and the zoom took ~19%
+-      // off the top and bottom of them (reported on device, 2026-09-10: "crops it quite a
+-      // bit"). The thin bars the band leaves in gameplay are the price of
+-      // menus that stay whole; kGameWideBandAspect is kept for a possible
+-      // gameplay-only zoom keyed on GeInGameplay (D-031).
+-      (void)kGameWideBandAspect;
++    present_letterbox = std::abs(display_aspect - kUltrawideAspect) > kUltrawideAspect * 0.10;
++    look = present_letterbox ? "21:9 band, bars" : "21:9 stretched over the screen";
++  } else if (wider_than_frame &&
++             (game_letterbox == kGameLetterboxWide || game_letterbox == kGameLetterboxCinema)) {
++    // Trim the frame's top and bottom to the screen's width. Floor, so the
++    // margin can never round the other way and reintroduce a hairline bar.
++    overscan = true;
++    safe_y = int32_t(std::floor(100.0 * guest_aspect / display_aspect));
++    safe_y = std::clamp(safe_y, 1, 99);
++    look = "wide band, width trim";
++    if (game_letterbox == kGameLetterboxWide && gameplay &&
++        kGameWideBandAspect > display_aspect) {
++      // Active gameplay: scale the band to the screen's height. Ceil so no
++      // hairline of surround survives; the sides lose ~(band/display - 1)/2.
++      zoom = int32_t(std::ceil(100.0 * kGameWideBandAspect / display_aspect));
++      zoom = std::clamp(zoom, 100, 400);
++      look = "wide band zoomed to the screen";
+     }
+-  } else {
+-    // The screen is TALLER than the frame (a 4:3 iPad). Filling the width is
+-    // the presenter's default here; filling the height means cropping X.
+-    if (!fill_width && worth_it) {
+-      overscan = true;
+-      safe_x = int32_t(std::floor(100.0 * display_aspect / guest_aspect));
+-      safe_x = std::clamp(safe_x, 1, 99);
+-    }
++  } else if (game_letterbox != kGameLetterboxFull) {
++    look = "game's own band inside the frame";
+   }
+ 
+   auto set = [](const char* name, const std::string& value) {
+@@ -243,7 +244,7 @@
+     // guest has booted, is applied for real. The console bridge's separate
+     // refusal of restart cvars is a bridge-side policy and does not reach here.
+     if (!rex::cvar::SetFlagByName(name, value)) {
+-      REXLOG_ERROR("screen fill: could not set {} = {}", name, value);
++      REXLOG_ERROR("screen: could not set {} = {}", name, value);
+     }
+   };
+   set("present_allow_overscan_cutoff", overscan ? "true" : "false");
+@@ -260,62 +261,98 @@
+     set("video_mode_height", std::to_string(video_h));
+   }
+ 
+-  // Write the game's OWN screen settings for the player -- the chosen picture is
+-  // our crop PLUS the in-game SCREEN LETTERBOX / SCREEN RATIO pair, and nobody
+-  // should have to find that menu. Resolved through dlsym exactly as
+-  // GeInjectLookDelta and GeInGameplay are (the game module is linked in, but
+-  // this file must not depend on it). The guest side stores the request and
+-  // performs it on the next guest frame that has the settings struct.
++#if TARGET_OS_VISION
++  // The window is aspect-locked (rx-0079). Ask for the shape the game is
++  // drawing for, so the fit is exact and no bars appear: 21:9 for the
++  // anamorphic ratio, 16:9 otherwise. Re-requested only when the ratio changes.
+   {
+-    using SetScreenFn = void (*)(int, int);
+-    static SetScreenFn set_screen = nullptr;
+-    if (!set_screen) {
+-      set_screen = reinterpret_cast<SetScreenFn>(dlsym(RTLD_DEFAULT, "GeSetScreenSettings"));
++    static int last_ratio = -1;
++    if (view && game_ratio != last_ratio) {
++      last_ratio = game_ratio;
++      UIWindowScene* scene = view.window.windowScene;
++      if (scene) {
++        RexRequestVisionWindowSize((__bridge void*)scene, game_ratio == kGameRatio219 ? 1680 : 1280,
++                                   720);
++      }
+     }
+-    if (set_screen) {
+-      // LETTERBOX FULL=0 / WIDE=1; RATIO 16:9=1, 21:9=2 (bench 2026-09-10 --
+-      // the game's ratio encoding is NORMAL=0, 16:9=1, 21:9=2, not the menu's
+-      // order). Width/height modes use 16:9; the 21:9 mode uses 21:9 with FULL.
+-      set_screen(want_wide ? 1 : 0, game_ratio);
+-    } else {
+-      REXLOG_ERROR(
+-          "screen fill: GeSetScreenSettings not found -- the game's own screen settings are "
+-          "left as the player last saved them");
+-    }
+   }
++#else
++  (void)view;
++#endif
+ 
+   REXLOG_INFO(
+-      "screen fill: mode={} surface={}x{} aspect={:.4f} -> overscan={} safe_x={} safe_y={} "
+-      "zoom={} aspect_override={}:{} letterbox={} game_letterbox={} game_ratio={} "
++      "screen: game letterbox={} ratio={} gameplay={} surface={}x{} aspect={:.4f} -> {} "
++      "(overscan={} safe_x={} safe_y={} zoom={} aspect_override={}:{} letterbox={}) "
+       "video_mode={}x{}{}",
+-      mode, surface_w, surface_h, display_aspect, overscan ? "true" : "false", safe_x, safe_y,
+-      zoom, aspect_ox, aspect_oy, present_letterbox ? "true" : "false",
+-      want_wide ? "wide" : "full", game_ratio,
++      game_letterbox, game_ratio, gameplay ? 1 : 0, surface_w, surface_h, display_aspect, look,
++      overscan ? "true" : "false", safe_x, safe_y, zoom, aspect_ox, aspect_oy,
++      present_letterbox ? "true" : "false",
+       at_startup ? video_w : rex::cvar::Query<int32_t>("video_mode_width"),
+       at_startup ? video_h : rex::cvar::Query<int32_t>("video_mode_height"),
+       at_startup ? "" : " (runtime: video mode untouched)");
+ }
+ 
+-// Cheap poll shared by the display-link tick: re-applies only when the mode or
+-// the surface actually changed.
+-void PollScreenFill(UIView* view) {
+-  static std::string last_mode;
++// What the presentation assumes before the guest has reported the pair: the
++// seed on a launch that seeds, else FULL + 16:9 (the game's own look until the
++// profile is in). The poll corrects it on the first sampled frame.
++void AssumedScreenSettings(int* letterbox, int* ratio) {
++  if (REXCVAR_GET(screen_player_set)) {
++    *letterbox = kGameLetterboxFull;
++    *ratio = kGameRatio169;
++  } else {
++    *letterbox = kSeedLetterbox;
++    *ratio = kSeedRatio;
++  }
++}
++
++// Cheap poll shared by the display-link tick: re-applies only when the game's
++// pair, the gameplay state or the surface actually changed.
++void PollScreenPresentation(UIView* view, bool gameplay) {
++  static int last_letterbox = -1, last_ratio = -1;
++  static bool last_gameplay = false;
+   static uint32_t last_w = 0, last_h = 0;
+   const CGFloat scale = view.contentScaleFactor > 0 ? view.contentScaleFactor : (CGFloat)2.0;
+   const CGSize size = view.bounds.size;
+   const uint32_t w = uint32_t(std::lround(size.width * scale));
+   const uint32_t h = uint32_t(std::lround(size.height * scale));
+-  const std::string mode = REXCVAR_GET(screen_fill);
+-  if (mode == last_mode && w == last_w && h == last_h) {
++
++  int letterbox = 0, ratio = 0;
++  bool sampled = false;
++  if (GetScreenFn get = ScreenGetFn()) {
++    sampled = get(&letterbox, &ratio) != 0;
++  }
++  if (!sampled) {
++    AssumedScreenSettings(&letterbox, &ratio);
++  }
++
++  // The player has changed the pair themselves: once the boot seed window is
++  // closed, a sampled pair that is not the seed can only be theirs (or a late
++  // profile load carrying an earlier choice of theirs -- same answer). Persist
++  // the flag so no later launch seeds over it.
++  if (sampled && !REXCVAR_GET(screen_player_set)) {
++    SeedOpenFn open = ScreenSeedOpenFn();
++    const bool window_closed = open && open() == 0;
++    if (window_closed && (letterbox != kSeedLetterbox || ratio != kSeedRatio)) {
++      rex::cvar::SetFlagByName("screen_player_set", "true");
++      rex::ui::PersistSettings();
++      REXLOG_INFO("screen: the player set letterbox={} ratio={} -- no launch seeds the pair again",
++                  letterbox, ratio);
++    }
++  }
++
++  if (letterbox == last_letterbox && ratio == last_ratio && gameplay == last_gameplay &&
++      w == last_w && h == last_h) {
+     return;
+   }
+-  last_mode = mode;
++  last_letterbox = letterbox;
++  last_ratio = ratio;
++  last_gameplay = gameplay;
+   last_w = w;
+   last_h = h;
+   if (w == 0 || h == 0) {
+     return;
+   }
+-  ApplyScreenFill(w, h, false);
++  ApplyScreenPresentation(w, h, letterbox, ratio, gameplay, false, view);
+ }
+ 
+ constexpr uint16_t kBtnB = 0x2000;
+@@ -1076,11 +1113,16 @@
+   // Nothing here has to run while the settings page is up, and the page is
+   // heavy enough on a thermally clamped phone without the overlay repainting
+   // underneath it.
+-  // Screen fill: mode or bounds changed (a rotation, or the settings segment
+-  // moved). Two integer compares and a string compare per tick; the work only
+-  // happens when something actually changed. Ahead of the settings-visible
+-  // return below so switching fit<->crop lands the moment the page closes.
+-  PollScreenFill(self);
++  // Screen presentation: follows the game's own letterbox/ratio pair, the
++  // gameplay state (the WIDE band zoom is gameplay-only) and the bounds. A few
++  // integer compares per tick; the work only happens on a change. Ahead of the
++  // settings-visible return below so a change lands the moment the page closes.
++  {
++    using InGameplayFn = int (*)(void);
++    static InGameplayFn in_gameplay_q =
++        reinterpret_cast<InGameplayFn>(dlsym(RTLD_DEFAULT, "GeInGameplay"));
++    PollScreenPresentation(self, in_gameplay_q && in_gameplay_q() != 0);
++  }
+   // Other-app audio policy: SDL re-sets the session category when it opens
+   // the device (after boot's apply), so re-assert ours about once a second.
+   {
+@@ -1587,10 +1629,24 @@
+   // guest has not booted yet -- so VdQueryVideoMode has not been called and
+   // the video-mode cvars pinned here are the ones the title will see.
+   {
++    // Arm the boot seed unless the player has ever set the pair themselves.
++    static SeedScreenFn seed_fn =
++        reinterpret_cast<SeedScreenFn>(dlsym(RTLD_DEFAULT, "GeSetScreenSeed"));
++    const bool seed = !REXCVAR_GET(screen_player_set);
++    if (seed_fn) {
++      seed_fn(seed ? kSeedLetterbox : -1, seed ? kSeedRatio : -1);
++    } else {
++      REXLOG_ERROR("screen: GeSetScreenSeed not found -- the game's own screen settings are "
++                   "left as the player last saved them");
++    }
++    REXLOG_INFO("screen: boot seed {}", seed ? "armed (FULL + 21:9)" : "off (player has set the pair)");
++    int letterbox = 0, ratio = 0;
++    AssumedScreenSettings(&letterbox, &ratio);
+     const CGFloat scale = parent.contentScaleFactor > 0 ? parent.contentScaleFactor : (CGFloat)2.0;
+     const CGSize size = parent.bounds.size;
+-    ApplyScreenFill(uint32_t(std::lround(size.width * scale)),
+-                    uint32_t(std::lround(size.height * scale)), true);
++    ApplyScreenPresentation(uint32_t(std::lround(size.width * scale)),
++                            uint32_t(std::lround(size.height * scale)), letterbox, ratio, false,
++                            true, parent);
+   }
+   REXLOG_INFO("touch overlay: attached");
+ }
+--- a/src/ui/settings_uikit.mm
++++ b/src/ui/settings_uikit.mm
+@@ -359,16 +359,8 @@
+                                     labels:@[ @"720p", @"1440p (2x)", @"2160p (3x)" ]
+                                     values:@[ @"1", @"2", @"3" ]];
+ 
+-  // Screen: which axis of the game's frame fills the screen. Both are
+-  // presenter-side and instant (the overlay's tick notices the change and
+-  // re-derives the presenter cvars), and both also write the game's OWN screen
+-  // settings so the player never has to find that menu. A "wide" mode was tried
+-  // and removed: the title squeezes a non-16:9 video mode instead of rendering
+-  // it (D-030).
+-  RexSettingsRow* fill = [self segmentedRow:@"Screen"
+-                                       cvar:@"screen_fill"
+-                                     labels:@[ @"Fill width", @"Fill height", @"21:9" ]
+-                                     values:@[ @"width", @"height", @"21:9" ]];
++  // No Screen row: the game's own Screen Letterbox / Screen Ratio rows are the
++  // control, and the app follows them (D-033; touch_overlay_uikit.mm).
+ 
+   [self addSection:@"Graphics"
+             footer:@"The graphics switch is instant and works mid-game -- the same flip the "
+@@ -379,18 +371,11 @@
+                    @"Resolution 1440p renders the whole game at four times the pixels, "
+                    @"2160p (4K) at nine -- sharper, and that many times the fragment work. "
+                    @"2160p holds a 4.5 GB render buffer and is meant for Vision Pro. It "
+-                   @"also takes effect the next time the app is launched.\n"
+-                   @"Fill width trims a little off the top and bottom and sets the game's "
+-                   @"own Screen Letterbox to Wide and Screen Ratio to 16:9 for you. Fill "
+-                   @"height shows the whole frame with bars at the sides and sets Letterbox "
+-                   @"to Full. 21:9 sets the game's Screen Ratio to 21:9 -- a wider view -- "
+-                   @"and stretches it across the whole phone screen, nothing trimmed and no "
+-                   @"bars."
++                   @"also takes effect the next time the app is launched."
+               rows:@[
+                 vtoggle,
+                 aa,
+                 res,
+-                fill,
+               ]];
+ 
+   // --- Controls ---
+--- a/src/ui/window_uikit.mm
++++ b/src/ui/window_uikit.mm
+@@ -76,7 +76,15 @@
+ //
+ // 1280x720 points is the initial size; at the Vision Pro's 2x display scale
+ // that is 2560x1440 pixels, which is also what resolution_scale 2 renders.
++void RexApplyVisionSceneGeometry(UIWindowScene* scene, CGSize size);
+ void RexApplyVisionSceneGeometry(UIWindowScene* scene) {
++  RexApplyVisionSceneGeometry(scene, CGSizeMake(1280, 720));
++}
++// The size argument is the shape the game is drawing for: 1280x720 for its
++// 16:9 frame, 1680x720 when its own SCREEN RATIO is the anamorphic 21:9 (the
++// touch overlay re-requests it when that changes, D-033), so the presenter's
++// fit is exact and the window never shows bars.
++void RexApplyVisionSceneGeometry(UIWindowScene* scene, CGSize size) {
+   if (!scene) return;
+   // Belt: the scene-level restrictions, which the system consults when it
+   // proposes a size of its own.
+@@ -89,7 +97,7 @@
+   // resizing restriction.
+   if (@available(visionOS 1.0, *)) {
+     UIWindowSceneGeometryPreferencesVision* prefs =
+-        [[UIWindowSceneGeometryPreferencesVision alloc] initWithSize:CGSizeMake(1280, 720)];
++        [[UIWindowSceneGeometryPreferencesVision alloc] initWithSize:size];
+     prefs.minimumSize = CGSizeMake(640, 360);
+     prefs.maximumSize = CGSizeMake(3840, 2160);
+     prefs.resizingRestrictions = UIWindowSceneResizingRestrictionsUniform;
+@@ -100,7 +108,8 @@
+                                                       ? error.localizedDescription.UTF8String
+                                                       : "(no description)");
+                                    }];
+-    REXLOG_INFO("visionOS: requested 1280x720 with uniform (aspect-locked) resizing");
++    REXLOG_INFO("visionOS: requested {:.0f}x{:.0f} with uniform (aspect-locked) resizing",
++                size.width, size.height);
+   }
+ }
+ #endif
+@@ -145,6 +154,15 @@
+ }
+ 
+ }  // namespace
++
++#if TARGET_OS_VISION
++// Global entry for the touch overlay (its screen-presentation code lives in a
++// different translation unit's anonymous namespace): re-request the window at
++// the shape the game is drawing for. See RexApplyVisionSceneGeometry above.
++extern "C" void RexRequestVisionWindowSize(void* ui_window_scene, double width, double height) {
++  RexApplyVisionSceneGeometry((__bridge UIWindowScene*)ui_window_scene, CGSizeMake(width, height));
++}
++#endif
+ 
+ // ---------------------------------------------------------------------------
+ // Display link -> DisplayPacer feed (docs/pacing.md)

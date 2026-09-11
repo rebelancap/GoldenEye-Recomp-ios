@@ -1,0 +1,172 @@
+--- a/src/ge_hooks.cpp
++++ b/src/ge_hooks.cpp
+@@ -1467,18 +1467,24 @@
+ }
+ 
+ // ===========================================================================
+-// The game's own screen settings, written for the player.
++// The game's own screen settings: seeded once at boot, then the player's.
+ //
+-// The best picture on a 2.17:1 phone is the host-side width crop PLUS the
+-// game's own SCREEN LETTERBOX = WIDE and SCREEN RATIO = 16:9 (WIDE draws the
+-// picture into a ~2.38:1 band inside the 16:9 frame and moves the HUD in with
+-// it, so the host crop trims surround rather than picture). Nobody should have
+-// to go find that menu, so the host's "Screen" setting writes the pair here.
++// The app does not own SCREEN LETTERBOX / SCREEN RATIO. 1.0.1 held the pair
++// every frame, and the game's own rows then snapped straight back when touched
++// (issue #1 feedback on 1.0.1.1). Two jobs remain, D-033:
+ //
+-// The host (touch_overlay_uikit.mm, ApplyScreenFill) calls GeSetScreenSettings
+-// from the UIKit thread; it only records the request. The write itself happens
+-// on the guest thread from the per-frame present hook, where `base` is live and
+-// the settings struct can be dereferenced safely.
++//  1. SEED. On a launch where the player has never changed the pair themselves
++//     (the host decides that from its persisted flag and calls GeSetScreenSeed),
++//     the requested values are held during a boot WINDOW only: from the first
++//     frame the settings struct exists until the front-end stage has been up
++//     for kSeedWindowNs (or gameplay starts, whichever is first). That outlasts
++//     the saved-profile load, which lands in this same struct after boot and
++//     undid a one-shot write (1.0.0.4, D-031 addendum), and it ends before
++//     anyone can navigate to an options row. Once the window closes the app
++//     never writes the pair again in this launch.
++//  2. SAMPLE. Every frame the pair is read into atomics for the host thread,
++//     which derives the presentation (crop, zoom, stretch, Vision Pro window
++//     shape) from what the game says -- the app follows the game.
+ namespace {
+ // The settings struct pointer -- the same one ge_mouse_camera pokes for the
+ // auto-aim / look-ahead bitflags (GE_SETTINGS_PTR / +0x298, declared again down
+@@ -1498,55 +1504,97 @@
+ constexpr uint32_t GE_OFF_SCREEN_FLAGS = 0x298u;
+ constexpr uint32_t GE_LETTERBOX_SHIFT = 10;
+ constexpr uint32_t GE_RATIO_SHIFT = 12;
+-constexpr uint32_t GE_SCREEN_MASK = 0x3C00u;
+ 
+-std::atomic<int> g_scr_letterbox{-1};  // -1 = leave alone
+-std::atomic<int> g_scr_ratio{-1};
+-std::atomic<bool> g_scr_pending{false};
+-std::atomic<uint32_t> g_scr_last_sp{0};
++constexpr int64_t kSeedWindowNs = 4LL * 1000000000LL;  // after the front-end first shows
+ 
++std::atomic<int> g_seed_letterbox{-1};  // -1 = do not seed that field
++std::atomic<int> g_seed_ratio{-1};
++std::atomic<bool> g_seed_window_open{true};
++int64_t g_seed_title_seen_ns = 0;  // guest thread only
++
++std::atomic<bool> g_scr_sampled{false};
++std::atomic<int> g_scr_letterbox{0};
++std::atomic<int> g_scr_ratio{0};
++
+ // Guest thread, from the present hook.
+ void ge_screen_settings_tick(uint8_t* base) {
+   const uint32_t sp = LD32(base, GESCR_SETTINGS_PTR);
+-
+-  // Enforced EVERY frame, not once: a one-shot write at boot landed, and the
+-  // game then loaded its saved profile into the same struct (pointer
+-  // unchanged) and put the old values back -- 1.0.0.4 on device read
+-  // FULL+NORMAL with the app on Fill width, hence "still some in-game
+-  // cropping" (the presenter was cropping a FULL frame). While the host has
+-  // asked for a value, the field follows it; the watch menu's own row is
+-  // therefore overridden for as long as the app setting owns it. A u32 compare
+-  // per frame; the store and the log only happen on a difference.
+-  (void)g_scr_last_sp;
+-  (void)g_scr_pending;
+   if (!sp) return;
+-
+-  const int want_letterbox = g_scr_letterbox.load(std::memory_order_relaxed);
+-  const int want_ratio = g_scr_ratio.load(std::memory_order_relaxed);
+-  if (want_letterbox < 0 && want_ratio < 0) return;
+-
+   const uint32_t addr = sp + GE_OFF_SCREEN_FLAGS;
+-  const uint32_t was = LD32(base, addr);
+-  uint32_t now = was;
+-  if (want_letterbox >= 0) {
+-    now = (now & ~(3u << GE_LETTERBOX_SHIFT)) | ((uint32_t(want_letterbox) & 3u) << GE_LETTERBOX_SHIFT);
+-  }
+-  if (want_ratio >= 0) {
+-    now = (now & ~(3u << GE_RATIO_SHIFT)) | ((uint32_t(want_ratio) & 3u) << GE_RATIO_SHIFT);
++
++  if (g_seed_window_open.load(std::memory_order_relaxed)) {
++    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                               std::chrono::steady_clock::now().time_since_epoch())
++                               .count();
++    const uint32_t stage = LD32(base, GEUI_CURRENT_STAGE);
++    if (stage == GEUI_TITLE_STAGE && g_seed_title_seen_ns == 0) {
++      g_seed_title_seen_ns = now_ns;
++    }
++    const bool title_timed_out =
++        g_seed_title_seen_ns != 0 && (now_ns - g_seed_title_seen_ns) > kSeedWindowNs;
++    const bool in_gameplay = g_ui_in_gameplay.load(std::memory_order_relaxed) != 0;
++    if (title_timed_out || in_gameplay) {
++      g_seed_window_open.store(false, std::memory_order_relaxed);
++      REXKRNL_INFO("GESCREEN: seed window closed ({}), word {:#x} -- the game's own rows own "
++                   "the pair from here",
++                   in_gameplay ? "gameplay" : "front-end up 4 s", LD32(base, addr));
++    } else {
++      const int want_letterbox = g_seed_letterbox.load(std::memory_order_relaxed);
++      const int want_ratio = g_seed_ratio.load(std::memory_order_relaxed);
++      if (want_letterbox >= 0 || want_ratio >= 0) {
++        const uint32_t was = LD32(base, addr);
++        uint32_t now = was;
++        if (want_letterbox >= 0) {
++          now = (now & ~(3u << GE_LETTERBOX_SHIFT)) |
++                ((uint32_t(want_letterbox) & 3u) << GE_LETTERBOX_SHIFT);
++        }
++        if (want_ratio >= 0) {
++          now = (now & ~(3u << GE_RATIO_SHIFT)) | ((uint32_t(want_ratio) & 3u) << GE_RATIO_SHIFT);
++        }
++        if (now != was) {
++          ST32(base, addr, now);
++          REXKRNL_INFO("GESCREEN: seed {:#x} -> {:#x} (letterbox {} ratio {}, stage {})", was, now,
++                       (now >> GE_LETTERBOX_SHIFT) & 3u, (now >> GE_RATIO_SHIFT) & 3u, stage);
++        }
++      }
++    }
+   }
+-  if (now == was) return;
+-  ST32(base, addr, now);
+-  REXKRNL_INFO("GESCREEN: flags {:#x} -> {:#x} (letterbox {} ratio {})", was, now,
+-               (now >> GE_LETTERBOX_SHIFT) & 3u, (now >> GE_RATIO_SHIFT) & 3u);
++
++  const uint32_t word = LD32(base, addr);
++  const int letterbox = int((word >> GE_LETTERBOX_SHIFT) & 3u);
++  const int ratio = int((word >> GE_RATIO_SHIFT) & 3u);
++  const bool first = !g_scr_sampled.load(std::memory_order_relaxed);
++  if (first || letterbox != g_scr_letterbox.load(std::memory_order_relaxed) ||
++      ratio != g_scr_ratio.load(std::memory_order_relaxed)) {
++    REXKRNL_INFO("GESCREEN: game letterbox {} ratio {} (word {:#x})", letterbox, ratio, word);
++  }
++  g_scr_letterbox.store(letterbox, std::memory_order_relaxed);
++  g_scr_ratio.store(ratio, std::memory_order_relaxed);
++  g_scr_sampled.store(true, std::memory_order_relaxed);
+ }
+ }  // namespace
+ 
+ // Host-callable (dlsym'd by the touch overlay exactly as GeInjectLookDelta is).
+-// -1 for either argument means "leave that one alone".
+-extern "C" void GeSetScreenSettings(int letterbox, int ratio) {
+-  g_scr_letterbox.store(letterbox, std::memory_order_relaxed);
+-  g_scr_ratio.store(ratio, std::memory_order_relaxed);
+-  g_scr_pending.store(true, std::memory_order_relaxed);
++// Arms the boot seed; -1 for either argument leaves that field alone. Call it
++// before the guest boots -- after the window has closed it does nothing.
++extern "C" void GeSetScreenSeed(int letterbox, int ratio) {
++  g_seed_letterbox.store(letterbox, std::memory_order_relaxed);
++  g_seed_ratio.store(ratio, std::memory_order_relaxed);
++}
++
++// 1 while the boot seed window is still open (the pair may still be rewritten).
++extern "C" int GeScreenSeedWindowOpen(void) {
++  return g_seed_window_open.load(std::memory_order_relaxed) ? 1 : 0;
++}
++
++// The game's current SCREEN LETTERBOX (FULL 0 / WIDE 1 / CINEMA 2) and SCREEN
++// RATIO (NORMAL 0 / 16:9 1 / 21:9 2), as sampled on the last guest frame.
++// Returns 0 (outputs untouched) until the settings struct has been seen.
++extern "C" int GeGetScreenSettings(int* letterbox, int* ratio) {
++  if (!g_scr_sampled.load(std::memory_order_relaxed)) return 0;
++  if (letterbox) *letterbox = g_scr_letterbox.load(std::memory_order_relaxed);
++  if (ratio) *ratio = g_scr_ratio.load(std::memory_order_relaxed);
++  return 1;
+ }
+ 
+ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {

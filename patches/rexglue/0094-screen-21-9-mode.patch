@@ -1,0 +1,219 @@
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -60,6 +60,22 @@
+                      "Zoom of the guest output rectangle about the surface centre, percent "
+                      "(100 = the plain fit/crop rectangle)")
+     .range(100, 400)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// Override of the guest frame's display aspect (what the fit/crop math below
++// treats as the picture's true shape). 0 = the frame's own aspect. bean's
++// SCREEN RATIO = 21:9 is anamorphic: it draws a 21:9 view horizontally squeezed
++// into the 16:9 frame and expects the display to stretch it back out -- so with
++// the pair set to 21/9 the presenter fits a 21:9 rectangle (bars on a 16:9 or
++// 4:3 surface) or, with present_letterbox off, stretches it across the surface,
++// which is the community's Xenia recipe for that setting. Read live.
++REXCVAR_DEFINE_INT32(present_aspect_override_x, 0, "UI/Presenter",
++                     "Treat the guest frame as this W:H aspect (numerator); 0 = frame's own")
++    .range(0, 64)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(present_aspect_override_y, 0, "UI/Presenter",
++                     "Treat the guest frame as this W:H aspect (denominator); 0 = frame's own")
++    .range(0, 64)
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+@@ -926,12 +942,25 @@
+                    old_scale);
+   };
+ 
++  // The aspect the fit/crop math works from: the frame's own unless overridden
++  // (present_aspect_override_*, an anamorphic guest mode such as bean's 21:9).
++  uint32_t aspect_x = properties.display_aspect_ratio_x;
++  uint32_t aspect_y = properties.display_aspect_ratio_y;
++  {
++    const int32_t ox = REXCVAR_GET(present_aspect_override_x);
++    const int32_t oy = REXCVAR_GET(present_aspect_override_y);
++    if (ox > 0 && oy > 0) {
++      aspect_x = uint32_t(ox);
++      aspect_y = uint32_t(oy);
++    }
++  }
++
+   // Final output location and dimensions.
+   // All host location calculations are DPI-independent, conceptually depending
+   // only on the aspect ratios, not the absolute values.
+   uint32_t output_width, output_height;
+-  if (uint64_t(surface_width_in_paint_connection_) * properties.display_aspect_ratio_y >
+-      uint64_t(surface_height_in_paint_connection_) * properties.display_aspect_ratio_x) {
++  if (uint64_t(surface_width_in_paint_connection_) * aspect_y >
++      uint64_t(surface_height_in_paint_connection_) * aspect_x) {
+     // The window is wider that the source - crop along Y to preserve the aspect
+     // ratio while stretching throughout the entire surface's width, then limit
+     // the Y cropping via letterboxing or stretching along X.
+@@ -949,8 +978,8 @@
+     // Scale the desired width by the H:W aspect ratio (inverse of W:H) to get
+     // the height.
+     output_height =
+-        rescale_unsigned(surface_width_in_paint_connection_, properties.display_aspect_ratio_y,
+-                         properties.display_aspect_ratio_x);
++        rescale_unsigned(surface_width_in_paint_connection_, aspect_y,
++                         aspect_x);
+     bool letterbox = false;
+     if (output_height * present_safe_area > surface_height_in_paint_connection_ * 100) {
+       // Don't crop out more than the safe area margin - letterbox or stretch.
+@@ -959,8 +988,8 @@
+     }
+     if (letterbox && REXCVAR_GET(present_letterbox)) {
+       output_width = rescale_unsigned(surface_height_in_paint_connection_ * 100,
+-                                      properties.display_aspect_ratio_x,
+-                                      properties.display_aspect_ratio_y * present_safe_area);
++                                      aspect_x,
++                                      aspect_y * present_safe_area);
+       // output_width might have been rounded up already by rescale_unsigned, so
+       // rounding down in this division.
+       flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
+@@ -988,8 +1017,8 @@
+     }
+     // Scale the desired height by the W:H aspect ratio to get the width.
+     output_width =
+-        rescale_unsigned(surface_height_in_paint_connection_, properties.display_aspect_ratio_x,
+-                         properties.display_aspect_ratio_y);
++        rescale_unsigned(surface_height_in_paint_connection_, aspect_x,
++                         aspect_y);
+     bool letterbox = false;
+     if (output_width * present_safe_area > surface_width_in_paint_connection_ * 100) {
+       // Don't crop out more than the safe area margin - letterbox or stretch.
+@@ -998,8 +1027,8 @@
+     }
+     if (letterbox && REXCVAR_GET(present_letterbox)) {
+       output_height = rescale_unsigned(surface_width_in_paint_connection_ * 100,
+-                                       properties.display_aspect_ratio_y,
+-                                       properties.display_aspect_ratio_x * present_safe_area);
++                                       aspect_y,
++                                       aspect_x * present_safe_area);
+       // output_height might have been rounded up already by rescale_unsigned,
+       // so rounding down in this division.
+       flow.output_y = (int32_t(surface_height_in_paint_connection_) - int32_t(output_height)) / 2;
+--- a/src/ui/touch_overlay_uikit.mm
++++ b/src/ui/touch_overlay_uikit.mm
+@@ -76,9 +76,13 @@
+                       "removed: bean does not render a non-16:9 mode, it squeezes the frame "
+                       "(D-030). The former fit/crop values are gone -- a ge.toml carrying "
+                       "one fails the allowed-values check in SetFlagByName, is not applied, "
+-                      "and the compiled default (width) stands."
++                      "and the compiled default (width) stands. 21:9 = the game's own "
++                      "anamorphic SCREEN RATIO = 21:9 (a 21:9 view squeezed into the 16:9 "
++                      "frame), stretched back out across a 21:9-ish phone screen, or shown "
++                      "as a 21:9 band with bars on a 16:9 / 4:3 display (issue #1 follow-up, "
++                      "D-032)."
+                       )
+-    .allowed({"width", "height"})
++    .allowed({"width", "height", "21:9"})
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(ge_n64_graphics, false, "GPU",
+                     "The player's remembered graphics choice: true = the original N64 look, "
+@@ -170,19 +174,38 @@
+   const double guest_aspect = 16.0 / 9.0;
+ 
+   const std::string mode = REXCVAR_GET(screen_fill);
++  const bool ultrawide = (mode == "21:9");
+   const bool fill_width = (mode != "height");
+ 
+   bool overscan = false;
+   int32_t safe_x = 90, safe_y = 90;  // the cvars' own defaults
+   int32_t zoom = 100;                // present_zoom_percent, 100 = fit/crop rect
+   bool want_wide = false;            // ask the guest for SCREEN LETTERBOX = WIDE
++  int game_ratio = 1;                // SCREEN RATIO: NORMAL=0, 16:9=1, 21:9=2
++  int32_t aspect_ox = 0, aspect_oy = 0;  // present_aspect_override_*, 0 = off
++  bool present_letterbox = true;     // false = stretch the fitted rect over the surface
+   const int32_t video_w = 1280, video_h = 720;
+ 
+   // Within 1% of 16:9 (a Vision Pro window) there is nothing to fill: both
+   // modes are the same picture, so neither trims a pixel.
+   const bool worth_it = std::abs(display_aspect - guest_aspect) > guest_aspect * 0.01;
+ 
+-  if (display_aspect > guest_aspect) {
++  if (ultrawide) {
++    // 21:9 -- the recipe a player used on 1.0.0 (issue #1, 2026-09-10): the
++    // game's SCREEN RATIO = 21:9 draws a 21:9 view horizontally squeezed into
++    // the 16:9 frame (anamorphic, for ultrawide TVs), and present_letterbox=false
++    // in ge.toml stretched that frame across the whole phone. Proportions come
++    // out right to within the screen-vs-21:9 difference (a 2.17:1 iPhone: ~7%
++    // narrower than true, nothing cropped, no bars). The presenter is told the
++    // frame's true shape is 21:9; on a screen within 10% of that it stretches
++    // (the recipe exactly), on anything else -- a 16:9 Vision Pro window, a 4:3
++    // iPad -- it fits a correct 21:9 band with bars, since stretching there
++    // would visibly squeeze.
++    game_ratio = 2;
++    aspect_ox = 21;
++    aspect_oy = 9;
++    present_letterbox = std::abs(display_aspect - 21.0 / 9.0) > (21.0 / 9.0) * 0.10;
++  } else if (display_aspect > guest_aspect) {
+     // The screen is WIDER than the frame. Filling the height is what the
+     // presenter does by default (bars at the sides); filling the width means
+     // cropping Y.
+@@ -227,6 +250,9 @@
+   set("present_safe_area_x", std::to_string(safe_x));
+   set("present_safe_area_y", std::to_string(safe_y));
+   set("present_zoom_percent", std::to_string(zoom));
++  set("present_aspect_override_x", std::to_string(aspect_ox));
++  set("present_aspect_override_y", std::to_string(aspect_oy));
++  set("present_letterbox", present_letterbox ? "true" : "false");
+   if (at_startup) {
+     // Never at runtime: the guest read the mode at boot and is drawing into
+     // render targets sized from it.
+@@ -247,11 +273,10 @@
+       set_screen = reinterpret_cast<SetScreenFn>(dlsym(RTLD_DEFAULT, "GeSetScreenSettings"));
+     }
+     if (set_screen) {
+-      // letterbox: FULL = 0, WIDE = 1. ratio: 16:9 = 2, always -- the frame is
+-      // 16:9 whatever we do with it at the edges.
+-      // LETTERBOX FULL=0 / WIDE=1; RATIO 16:9=1 (bench 2026-09-10 -- the game's
+-      // ratio encoding is NORMAL=0, 16:9=1, 21:9=2, not the menu's order).
+-      set_screen(want_wide ? 1 : 0, 1);
++      // LETTERBOX FULL=0 / WIDE=1; RATIO 16:9=1, 21:9=2 (bench 2026-09-10 --
++      // the game's ratio encoding is NORMAL=0, 16:9=1, 21:9=2, not the menu's
++      // order). Width/height modes use 16:9; the 21:9 mode uses 21:9 with FULL.
++      set_screen(want_wide ? 1 : 0, game_ratio);
+     } else {
+       REXLOG_ERROR(
+           "screen fill: GeSetScreenSettings not found -- the game's own screen settings are "
+@@ -261,9 +286,11 @@
+ 
+   REXLOG_INFO(
+       "screen fill: mode={} surface={}x{} aspect={:.4f} -> overscan={} safe_x={} safe_y={} "
+-      "zoom={} game_letterbox={} video_mode={}x{}{}",
++      "zoom={} aspect_override={}:{} letterbox={} game_letterbox={} game_ratio={} "
++      "video_mode={}x{}{}",
+       mode, surface_w, surface_h, display_aspect, overscan ? "true" : "false", safe_x, safe_y,
+-      zoom, want_wide ? "wide" : "full",
++      zoom, aspect_ox, aspect_oy, present_letterbox ? "true" : "false",
++      want_wide ? "wide" : "full", game_ratio,
+       at_startup ? video_w : rex::cvar::Query<int32_t>("video_mode_width"),
+       at_startup ? video_h : rex::cvar::Query<int32_t>("video_mode_height"),
+       at_startup ? "" : " (runtime: video mode untouched)");
+--- a/src/ui/settings_uikit.mm
++++ b/src/ui/settings_uikit.mm
+@@ -367,8 +367,8 @@
+   // it (D-030).
+   RexSettingsRow* fill = [self segmentedRow:@"Screen"
+                                        cvar:@"screen_fill"
+-                                     labels:@[ @"Fill width", @"Fill height" ]
+-                                     values:@[ @"width", @"height" ]];
++                                     labels:@[ @"Fill width", @"Fill height", @"21:9" ]
++                                     values:@[ @"width", @"height", @"21:9" ]];
+ 
+   [self addSection:@"Graphics"
+             footer:@"The graphics switch is instant and works mid-game -- the same flip the "
+@@ -383,7 +383,9 @@
+                    @"Fill width trims a little off the top and bottom and sets the game's "
+                    @"own Screen Letterbox to Wide and Screen Ratio to 16:9 for you. Fill "
+                    @"height shows the whole frame with bars at the sides and sets Letterbox "
+-                   @"to Full."
++                   @"to Full. 21:9 sets the game's Screen Ratio to 21:9 -- a wider view -- "
++                   @"and stretches it across the whole phone screen, nothing trimmed and no "
++                   @"bars."
+               rows:@[
+                 vtoggle,
+                 aa,

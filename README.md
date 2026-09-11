@@ -93,6 +93,14 @@ aim with one hand and shoot with the other. Every button can be moved — Settin
 → Controls → *Customize Touch Layout*. Look sensitivity, invert axes (separately
 for each), button opacity, haptics and the crosshair style are all in Settings.
 
+**Screen shape** is the game's own: Screen Letterbox and Screen Ratio in the
+watch or the front-end options, exactly as on the Xbox. The app follows them.
+*21:9* (what a fresh install starts on) fills the whole phone screen with a wider
+view; *16:9* with Letterbox *Wide* fills the screen edge to edge in gameplay;
+*16:9* with Letterbox *Full* shows the whole frame with bars at the sides.
+**Other App Audio** picks what
+happens to Music or a podcast while you play, from stopping it to muting the game.
+
 **On Apple Vision Pro**, a paired controller is strongly recommended. Without one,
 the touch overlay is driven by pinch: a pinch anywhere in the left half of the
 window raises the move stick, and pinching the buttons presses them.
